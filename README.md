@@ -4,9 +4,10 @@ Forge is a single-binary trace database for LLM applications. It ingests OpenTel
 stores them as Vortex segments on local disk or object storage, keeps its catalog in SQLite, and serves
 trace lookups, SQL and full-text search.
 
-**Status: M2 (read path).** OTLP spans are normalized, written to a WAL (acked after fsync), and flushed to L0
-Vortex segments plus the SQLite catalog; the WAL replays after a crash. Acknowledged spans are queryable at once
-(memtable + segments, merged per span): trace trees, a runs list and SQL. Compaction and search land later.
+**Status: M3 (compaction and lifecycle).** OTLP spans are normalized, written to a WAL (acked after fsync), and
+flushed to L0 Vortex segments plus the SQLite catalog; the WAL replays after a crash. Acknowledged spans are
+queryable at once (memtable + segments, merged per span): trace trees, a runs list and SQL. L0 segments are
+compacted into hourly L1 segments, retention and GC run in the background. Search lands later.
 
 ## Build and test
 
@@ -74,6 +75,30 @@ can exceed 2^53, which JavaScript numbers cannot represent exactly.
 pruning and by the runs list. Deep runs pages re-read every segment that overlaps the window (bounded by M3's
 compaction). The trace and runs fast paths are not behind the SQL concurrency limit; they reserve their input
 against `query.memory_limit` per call. A merge of a whole project (`SELECT *`) is bounded by the memory limit.
+
+## Compaction, retention and GC
+
+The server compacts and collects in the background (`[compaction]` in `forge.example.toml`):
+- **Compaction.** Every `interval` (default 10s) a picker merges the oldest L0 segments into hour-partitioned L1
+  segments of about `target_segment` (256 MiB) once `l0_trigger` (4) L0s exist or the oldest is `l0_max_age` (10m)
+  old, folding small hours into the same job. Hours with overlapping L1 runs are rewritten newest runs first.
+  Up to `concurrency` (2) jobs run at once. Queries see the same answers before and after a job.
+- **Memory bound.** A job holds up to about 3 x `slice_bytes` (128 MiB) of decoded rows plus its open writers'
+  buffers, about 0.9 GiB at the defaults, per job. On small hosts lower `max_job_bytes` (512 MiB), `slice_bytes`
+  and `concurrency`, for example `max_job_bytes = "128MiB"`, `slice_bytes = "32MiB"`, `concurrency = 1`.
+- **Retention.** Per project, set when it is created: `POST /v1/projects {"id": "p", "name": "p",
+  "retention_days": 30}` (omit `retention_days` to keep forever). Every `gc_interval` (10m) whole hours older than
+  the retention are deleted (L1 by partition hour; an L0 once all its rows are older than the cutoff).
+- **GC.** Deleted segments' objects are removed `gc_grace` (1h) after deletion; objects the catalog does not know
+  (cut uploads) after `orphan_grace` (24h). A compaction job older than half of `orphan_grace` cannot commit.
+- `interval = "0s"` / `gc_interval = "0s"` turn the background tasks off.
+
+Offline tools (they refuse with exit code 3 while a server holds the data dir; stop the server first):
+- `forge compact --project P [--data-dir D] [--format table|json]` runs up to 64 jobs of one project with the triggers
+  off (run it again if the output says capped). Exit 1 on an unknown project or a failed job.
+- `forge gc [--data-dir D] [--dry-run] [--gc-grace 0s] [--orphan-grace 0s] [--format table|json]` runs one retention
+  + purge + orphan pass. Blobs are skipped while the WAL holds unflushed records (start and stop the server once to
+  flush them).
 
 ## Configuration
 
