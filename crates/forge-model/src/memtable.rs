@@ -3,7 +3,6 @@
 //! forge-ingest owns the writer side (`MemtableSet`, which stores each memtable in an [`AppendLog`]);
 //! forge-query only sees `Arc<dyn MemtableView>` and [`MemtableSnapshot`].
 use arrow::record_batch::RecordBatch;
-use std::ops::RangeInclusive;
 use std::sync::{Arc, OnceLock};
 
 /// Implemented by forge-ingest's memtable set; consumed by forge-query.
@@ -109,17 +108,14 @@ impl LogView {
 /// One memtable in a snapshot.
 #[derive(Clone, Debug)]
 pub struct MemtablePart {
-    /// Frozen = being flushed: its rows may ALSO be in a segment committed after the snapshot was taken.
+    /// Being flushed: its rows may ALSO be in a segment committed after the snapshot was taken (invariant 1).
     pub frozen: bool,
-    /// Inclusive WAL seq range (contiguous, invariant 7). Parts in a snapshot are never empty.
-    pub seqs: RangeInclusive<u64>,
-    /// Inclusive version range of the rows (versions follow seqs, invariant 9).
-    pub versions: RangeInclusive<u64>,
-    /// spans_schema batches, unsorted, may hold several versions per key.
+    /// spans_schema batches, unsorted, may hold several versions per key. Never empty in a snapshot.
     pub batches: LogView,
 }
 
-/// The memtables at one instant, oldest first (frozen, then active). Parts are seq- and version-disjoint.
+/// The memtables at one instant, oldest first (frozen, then active). M4 adds seq / version ranges together with
+/// their first reader.
 #[derive(Clone, Debug, Default)]
 pub struct MemtableSnapshot {
     pub parts: Vec<MemtablePart>,
@@ -137,17 +133,6 @@ impl MemtableSnapshot {
     }
     pub fn num_rows(&self) -> usize {
         self.parts.iter().map(|p| p.batches.num_rows()).sum()
-    }
-    /// Highest version in the snapshot (0 when empty).
-    pub fn max_version(&self) -> u64 {
-        self.parts.last().map_or(0, |p| *p.versions.end())
-    }
-    /// Drops the parts whose every seq is <= `flushed_seq`: a checkpoint read AFTER the snapshot proves those rows
-    /// are in committed segments that a segment listing taken after that read includes. Exact dedupe for
-    /// readers that count rows without a version merge; merge readers may skip it (L6: duplicates are harmless).
-    pub fn without_flushed(mut self, flushed_seq: u64) -> Self {
-        self.parts.retain(|p| *p.seqs.end() > flushed_seq);
-        self
     }
 }
 

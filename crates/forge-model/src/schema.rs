@@ -48,10 +48,32 @@ pub const JSON_COLUMNS: [&str; 5] = [col::METADATA, col::ATTRIBUTES, col::EVENTS
 
 /// Every column, in spans_schema order (`ScanRequest.projection` needs `&'static str`).
 pub const ALL_COLUMNS: [&str; 26] = [
-    col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID, col::PARENT_SPAN_ID, col::DOTTED_ORDER, col::NAME, col::RUN_TYPE,
-    col::START_TIME, col::END_TIME, col::STATUS, col::ERROR, col::MODEL, col::PROVIDER, col::PROMPT_TOKENS,
-    col::COMPLETION_TOKENS, col::TOTAL_TOKENS, col::COST_USD, col::SESSION_ID, col::TAGS, col::METADATA,
-    col::ATTRIBUTES, col::EVENTS, col::INPUTS, col::OUTPUTS, col::VERSION, col::DELETED,
+    col::PROJECT_ID,
+    col::TRACE_ID,
+    col::SPAN_ID,
+    col::PARENT_SPAN_ID,
+    col::DOTTED_ORDER,
+    col::NAME,
+    col::RUN_TYPE,
+    col::START_TIME,
+    col::END_TIME,
+    col::STATUS,
+    col::ERROR,
+    col::MODEL,
+    col::PROVIDER,
+    col::PROMPT_TOKENS,
+    col::COMPLETION_TOKENS,
+    col::TOTAL_TOKENS,
+    col::COST_USD,
+    col::SESSION_ID,
+    col::TAGS,
+    col::METADATA,
+    col::ATTRIBUTES,
+    col::EVENTS,
+    col::INPUTS,
+    col::OUTPUTS,
+    col::VERSION,
+    col::DELETED,
 ];
 
 pub fn timestamp_type() -> DataType {

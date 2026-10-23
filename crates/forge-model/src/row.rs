@@ -3,8 +3,8 @@ use crate::error::{ModelError, Result};
 use crate::ids::{ProjectId, SpanId, TraceId};
 use crate::schema::{TIMEZONE, col, spans_schema, tags_item_field};
 use arrow::array::*;
-use arrow::record_batch::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 /// One upsert of one span, as produced by normalization. `None` = "this upsert does not set the

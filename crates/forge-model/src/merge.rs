@@ -21,9 +21,10 @@
 //! - Cost is per post: a post computes `cost_usd` only from its own model and tokens. M3/M6 recompute it after the
 //!   merge.
 //! - `total_tokens` holds only a producer-sent total, never a derived one (master decision 15), so the per-field
-//!   rule stays pure. Readers compute `COALESCE(total_tokens, prompt_tokens + completion_tokens)` AFTER the merge
-//!   (M2, one shared helper; either count may be null there). Known limit: a stored producer total from an older
-//!   post is not updated when a later post changes only a count.
+//!   rule stays pure. Readers compute the effective total AFTER the merge with the 4-branch rule: the producer
+//!   total if set, else prompt + completion if both are set, else whichever count is set, else null
+//!   (`derived::effective_total_tokens`; not a literal `COALESCE(t, p + c)`). Known limit: a stored producer total
+//!   from an older post is not updated when a later post changes only a count.
 //! - **M4** (L8): the FTS builder must skip values that are blob refs (`blob::parse_blob_ref`). Blob-backed
 //!   payloads are not searchable in v1.
 //!
@@ -39,31 +40,66 @@ use arrow::compute::{SortOptions, interleave, take_record_batch};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Always present in a merge input/output: the key, version, deleted.
 pub const MERGE_COLUMNS: [&str; 5] = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID, col::VERSION, col::DELETED];
 
-/// Cooperative cancellation for CPU work on the blocking pool (D8). `never()` costs nothing.
-#[derive(Clone, Debug, Default)]
-pub struct Cancel(Option<Arc<AtomicBool>>);
+/// Cooperative cancellation for CPU work on the blocking pool (D8). No `Default`: pick `never()` or `new()`
+/// explicitly (a `never()` inside an exec would silently disable cancellation).
+#[derive(Clone, Debug)]
+pub struct Cancel(Option<Arc<CancelState>>);
+
+#[derive(Debug)]
+pub struct CancelState {
+    cancelled: AtomicBool,
+    checks: AtomicU64,
+    /// `check()` fails from this call on (test-util `after`); u64::MAX otherwise.
+    fail_from: u64,
+}
+
 impl Cancel {
+    /// `check()` is always Ok; no allocation.
     pub fn never() -> Self {
         Self(None)
     }
+    #[allow(clippy::new_without_default)] // deliberate: see the type doc
     pub fn new() -> Self {
-        Self(Some(Arc::default()))
+        Self::failing_from(u64::MAX)
+    }
+    fn failing_from(fail_from: u64) -> Self {
+        Self(Some(Arc::new(CancelState {
+            cancelled: AtomicBool::new(false),
+            checks: AtomicU64::new(0),
+            fail_from,
+        })))
     }
     pub fn cancel(&self) {
-        if let Some(f) = &self.0 {
-            f.store(true, Ordering::Relaxed)
+        if let Some(s) = &self.0 {
+            s.cancelled.store(true, Ordering::Relaxed)
         }
     }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
+    }
+    /// `Err(Cancelled)` once cancelled.
     pub fn check(&self) -> Result<()> {
-        match &self.0 {
-            Some(f) if f.load(Ordering::Relaxed) => Err(ModelError::Cancelled),
-            _ => Ok(()),
+        let Some(s) = &self.0 else { return Ok(()) };
+        let n = s.checks.fetch_add(1, Ordering::Relaxed);
+        if n >= s.fail_from || s.cancelled.load(Ordering::Relaxed) {
+            return Err(ModelError::Cancelled);
         }
+        Ok(())
+    }
+    /// `check()` fails from its k-th call on (k = 0: the first call fails). Pins every checkpoint.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn after(k: u64) -> Self {
+        Self::failing_from(k)
+    }
+    /// Number of `check()` calls so far.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn checks(&self) -> u64 {
+        self.0.as_ref().map_or(0, |s| s.checks.load(Ordering::Relaxed))
     }
 }
 /// Sets the flag when dropped: hold it in the future/stream that a timeout drops.
@@ -109,12 +145,7 @@ pub fn merge_versions_chunked(
 }
 
 /// One batch (possibly empty) of `schema`; queries over bounded inputs.
-pub fn merge_projected(
-    schema: &SchemaRef,
-    b: &[RecordBatch],
-    t: Tombstones,
-    cancel: &Cancel,
-) -> Result<RecordBatch> {
+pub fn merge_projected(schema: &SchemaRef, b: &[RecordBatch], t: Tombstones, cancel: &Cancel) -> Result<RecordBatch> {
     Ok(merge_versions_projected(schema, b, t, usize::MAX, cancel)?
         .pop()
         .unwrap_or_else(|| RecordBatch::new_empty(schema.clone())))
@@ -223,10 +254,7 @@ pub fn merge_versions_projected(
     // 4. The groups to emit: Drop skips keys whose newest row is a tombstone.
     let mut keep: Vec<usize> = (0..groups.len()).collect();
     if tombstones == Tombstones::Drop {
-        let deleted: Vec<_> = batches
-            .iter()
-            .map(|b| b.column(del).as_boolean())
-            .collect();
+        let deleted: Vec<_> = batches.iter().map(|b| b.column(del).as_boolean()).collect();
         keep.retain(|&g| !deleted[newest[g].0].value(newest[g].1));
     }
 
@@ -561,34 +589,79 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_merge_returns_cancelled() {
-        let rows = g1(1, 50);
+    fn projection_errors() {
+        let b = batch_from_rows(&g1(1, 20));
+        let no_version = crate::schema::projected_schema(&[col::SPAN_ID, col::PROJECT_ID, col::TRACE_ID, col::DELETED]);
+        let r = merge_projected(
+            &no_version,
+            &[proj(&b, &no_version)],
+            Tombstones::Keep,
+            &Cancel::never(),
+        );
+        assert!(matches!(r, Err(ModelError::Schema(_))), "{r:?}");
+        // version as Utf8: not a spans_schema field.
+        let mut fields: Vec<arrow::datatypes::Field> =
+            spans_schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields[col_idx(col::VERSION)] = arrow::datatypes::Field::new(col::VERSION, DataType::Utf8, false);
+        let bad: SchemaRef = Arc::new(arrow::datatypes::Schema::new(fields));
+        let r = merge_projected(&bad, &[], Tombstones::Keep, &Cancel::never());
+        assert!(matches!(r, Err(ModelError::Schema(_))), "{r:?}");
+    }
+
+    /// Every checkpoint fails the merge when cancellation hits it; one past the last one does not.
+    #[test]
+    fn cancel_checkpoints() {
+        let input = chunked(&g1(3, 200), 7);
+        let run = |c: &Cancel| merge_versions_projected(&spans_schema(), &input, Tombstones::Drop, 2048, c);
+        let probe = Cancel::after(u64::MAX);
+        let want = run(&probe).unwrap();
+        let n = probe.checks();
+        assert!(n >= 4, "{n} checkpoints");
+        for k in 0..n {
+            assert!(
+                matches!(run(&Cancel::after(k)), Err(ModelError::Cancelled)),
+                "checkpoint {k}"
+            );
+        }
+        assert_eq!(run(&Cancel::after(n)).unwrap(), want);
+        assert_eq!(run(&Cancel::never()).unwrap(), want);
         let c = Cancel::new();
-        c.cancel();
-        let e = merge_versions_projected(&spans_schema(), &[batch_from_rows(&rows)], Tombstones::Keep, usize::MAX, &c);
-        assert!(matches!(e, Err(ModelError::Cancelled)));
-        let s = crate::schema::projected_schema(&[col::SPAN_ID, col::PROJECT_ID]);
-        assert!(matches!(merge_projected(&s, &[], Tombstones::Keep, &Cancel::never()), Err(ModelError::Schema(_))));
+        assert!(!c.is_cancelled());
+        let g = CancelOnDrop(c.clone());
+        drop(g);
+        assert!(c.is_cancelled() && matches!(run(&c), Err(ModelError::Cancelled)));
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+        /// Any projection in any column order, any input batch order, plus a merged chunk next to its own raw
+        /// rows (the snapshot window: equal versions) == the projected full merge.
         #[test]
         fn merge_projected_matches_full_merge(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40,
-                                              mask in 0u32..(1 << 21), drop in proptest::bool::ANY, max in 64usize..100_000) {
+                                              mask in 0u32..(1 << 21), drop in proptest::bool::ANY, max in 64usize..100_000,
+                                              window in 0usize..300) {
             let rows = generate(g, seed, n);
+            let mut r = Rng(seed ^ 0x5DEECE66D);
             let others: Vec<&str> = crate::schema::ALL_COLUMNS.iter().copied().filter(|c| !MERGE_COLUMNS.contains(c)).collect();
-            let mut cols: Vec<&str> = MERGE_COLUMNS.to_vec();
-            cols.extend(others.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, c)| *c));
-            let full_idx: std::collections::BTreeSet<usize> = cols.iter().map(|c| col_idx(c)).collect();
-            let names: Vec<&str> = full_idx.iter().map(|&i| crate::schema::ALL_COLUMNS[i]).collect();
+            let mut names: Vec<&str> = MERGE_COLUMNS.to_vec();
+            names.extend(others.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, c)| *c));
+            for i in (1..names.len()).rev() {
+                names.swap(i, r.below(i as u64 + 1) as usize);
+            }
             let schema = crate::schema::projected_schema(&names);
             let t = if drop { Tombstones::Drop } else { Tombstones::Keep };
-            let input = chunked(&rows, chunk);
+            let mut input = chunked(&rows, chunk);
+            let w = window.min(rows.len());
+            if w > 0 {
+                input.push(merge_versions(&[batch_from_rows(&rows[..w])], Tombstones::Keep).unwrap());
+            }
+            for i in (1..input.len()).rev() {
+                input.swap(i, r.below(i as u64 + 1) as usize);
+            }
             let pin: Vec<RecordBatch> = input.iter().map(|b| proj(b, &schema)).collect();
             let got = merge_versions_projected(&schema, &pin, t, max, &Cancel::never()).unwrap();
             let got = arrow::compute::concat_batches(&schema, &got).unwrap();
-            let want = proj(&merge_versions(&input, t).unwrap(), &schema);
+            let want = proj(&merge_versions(&chunked(&rows, chunk), t).unwrap(), &schema);
             let sort = |b: &RecordBatch| -> RecordBatch {
                 let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID].iter().map(|c| b.column(b.schema().index_of(c).unwrap()).clone()).collect();
                 let conv = RowConverter::new(cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()).unwrap();

@@ -9,7 +9,7 @@ use arrow::compute::{max, min};
 use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use forge_model::catalog::{SegmentId, SegmentMeta, SegmentState, TraceRange, paths};
+use forge_model::catalog::{SegmentMeta, SegmentState, TraceRange, paths};
 use forge_model::error::ModelError;
 use forge_model::ids::TraceId;
 use forge_model::row::validate_batch;
@@ -44,7 +44,6 @@ pub struct VortexSegmentStore {
     /// spans_schema as a Vortex dtype, converted once.
     dtype: DType,
     strategy: Arc<dyn LayoutStrategy>,
-    footers: Option<moka::future::Cache<SegmentId, vortex::file::Footer>>,
 }
 
 impl std::fmt::Debug for VortexSegmentStore {
@@ -70,35 +69,7 @@ impl VortexSegmentStore {
             session,
             dtype,
             strategy,
-            footers: None,
         }
-    }
-    /// Caches decoded footers up to `bytes` (by `Footer::approx_byte_size`). 0 = off.
-    pub fn with_footer_cache(mut self, bytes: u64) -> Self {
-        self.footers = (bytes > 0).then(|| {
-            moka::future::Cache::builder()
-                .max_capacity(bytes)
-                .weigher(|_: &SegmentId, f: &vortex::file::Footer| {
-                    f.approx_byte_size().unwrap_or(64 << 10).min(u32::MAX as usize) as u32
-                })
-                .build()
-        });
-        self
-    }
-    async fn open(&self, seg: &SegmentMeta) -> StorageResult<vortex::file::VortexFile> {
-        let cached = match &self.footers {
-            Some(c) => c.get(&seg.id).await,
-            None => None,
-        };
-        let mut o = self.session.open_options().with_file_size(seg.byte_size);
-        if let Some(f) = cached.clone() {
-            o = o.with_footer(f);
-        }
-        let file = o.open_object_store(&self.store, Path::from(seg.path.as_str())).await?;
-        if let (Some(c), None) = (&self.footers, cached) {
-            c.insert(seg.id, file.footer().clone()).await;
-        }
-        Ok(file)
     }
     /// Some(absolute root) for file:// stores.
     pub fn local_root(&self) -> Option<&std::path::Path> {
@@ -324,7 +295,12 @@ impl SegmentStore for VortexSegmentStore {
                 r.start, r.end, seg.id, seg.row_count
             )));
         }
-        let file = self.open(seg).await?;
+        let file = self
+            .session
+            .open_options()
+            .with_file_size(seg.byte_size)
+            .open_object_store(&self.store, Path::from(seg.path.as_str()))
+            .await?;
         let mut sb = file.scan()?;
         let schema = match req.projection {
             Some(cols) => {

@@ -1,7 +1,8 @@
 /// A Copy enum stored as fixed strings: `as_str`, `ALL`, Display, strict FromStr and serde, all from one table.
+/// `Ord` follows declaration order.
 macro_rules! str_enum {
     ($(#[$m:meta])* $name:ident, $what:literal, { $($v:ident => $s:literal),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
         $(#[$m])*
         pub enum $name { $(#[serde(rename = $s)] $v),+ }
         impl $name {
@@ -64,6 +65,12 @@ mod tests {
             "bad".parse::<SpanStatus>(),
             Err(ModelError::UnknownEnum { what: "status", .. })
         ));
+    }
+
+    #[test]
+    fn ord_follows_declaration_order() {
+        assert!(RunType::ALL.windows(2).all(|w| w[0] < w[1]));
+        assert!(SpanStatus::ALL.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

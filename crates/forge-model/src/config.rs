@@ -121,9 +121,14 @@ pub struct CompactionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueryConfig {
+    /// Per query (SQL) and per fast-path call.
     pub memory_limit: ByteSize,
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Concurrent `/v1/sql` queries; 0 = max(2, cpus / 2).
+    pub sql_concurrency: usize,
+    /// `/v1/sql` stops writing rows (and sets `truncated`) once the body passes this.
+    pub max_response_bytes: ByteSize,
 }
 
 /// Accepts str/int/float/bool (figment types env and TOML values) and yields a String.
@@ -285,6 +290,8 @@ impl Default for QueryConfig {
         Self {
             memory_limit: ByteSize::gib(2),
             timeout: Duration::from_secs(30),
+            sql_concurrency: 0,
+            max_response_bytes: ByteSize::mib(64),
         }
     }
 }

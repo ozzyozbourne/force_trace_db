@@ -3,11 +3,8 @@
 //! Inserts come ONLY from the WAL writer thread (after fsync, in seq order) and from replay (in seq
 //! order), so every memtable holds a contiguous run of WAL seqs and `Frozen::last_seq` is a valid
 //! watermark (invariant 7). `insert` enforces contiguity instead of trusting it.
-use arrow::array::AsArray;
-use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
 use forge_model::memtable::{AppendLog, MemtablePart};
-use forge_model::schema::{col, col_idx};
 use forge_model::{MemtableSnapshot, MemtableView};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -35,12 +32,8 @@ pub struct Frozen {
     pub part: MemtablePart,
     /// Accounted bytes (sum of `accounted_bytes`).
     pub bytes: usize,
-}
-
-impl Frozen {
-    pub fn last_seq(&self) -> u64 {
-        *self.part.seqs.end()
-    }
+    /// Flush watermark: every seq <= this is in this or an earlier memtable.
+    pub last_seq: u64,
 }
 
 #[derive(Debug)]
@@ -51,8 +44,6 @@ struct Active {
     created: Instant,
     /// Due regardless of size and age (`mark_due`); cleared by `freeze` (a fresh `Active`).
     due: bool,
-    first_seq: u64,
-    versions: (u64, u64),
 }
 
 impl Active {
@@ -62,25 +53,14 @@ impl Active {
             bytes: 0,
             created: Instant::now(),
             due: false,
-            first_seq: 0,
-            versions: (u64::MAX, 0),
         }
     }
-    fn part(&self, last_seq: u64, frozen: bool) -> Option<MemtablePart> {
+    fn part(&self, frozen: bool) -> Option<MemtablePart> {
         (!self.log.is_empty()).then(|| MemtablePart {
             frozen,
-            seqs: self.first_seq..=last_seq,
-            versions: self.versions.0..=self.versions.1,
             batches: self.log.view(),
         })
     }
-}
-
-fn version_range(b: &RecordBatch) -> (u64, u64) {
-    let v = b.column(col_idx(col::VERSION)).as_primitive::<Int64Type>();
-    let lo = arrow::compute::min(v).unwrap_or(0);
-    let hi = arrow::compute::max(v).unwrap_or(0);
-    (lo.max(0) as u64, hi.max(0) as u64)
 }
 
 #[derive(Debug)]
@@ -130,7 +110,6 @@ impl MemtableSet {
 
     /// `bytes` = `accounted_bytes(&batch)`, computed by the caller off the WAL thread.
     pub fn insert(&self, seq: u64, batch: RecordBatch, bytes: usize) -> Result<(), InsertError> {
-        let (vlo, vhi) = version_range(&batch);
         let mut s = self.lock();
         if seq != s.last_seq + 1 {
             return Err(InsertError::NotContiguous {
@@ -142,9 +121,7 @@ impl MemtableSet {
         let a = &mut s.active;
         if a.log.is_empty() {
             a.created = Instant::now();
-            a.first_seq = seq;
         }
-        a.versions = (a.versions.0.min(vlo), a.versions.1.max(vhi));
         a.bytes += bytes;
         a.log.push(batch);
         let full = a.bytes >= self.flush_bytes;
@@ -195,9 +172,13 @@ impl MemtableSet {
         if let Some(f) = &s.frozen {
             return Some(f.clone());
         }
-        let part = s.active.part(s.last_seq, true)?;
+        let part = s.active.part(true)?;
         let a = std::mem::replace(&mut s.active, Active::new());
-        let f = Arc::new(Frozen { part, bytes: a.bytes });
+        let f = Arc::new(Frozen {
+            part,
+            bytes: a.bytes,
+            last_seq: s.last_seq,
+        });
         s.frozen = Some(f.clone());
         Some(f)
     }
@@ -222,7 +203,7 @@ impl MemtableView for MemtableSet {
         let s = self.lock();
         let mut parts = Vec::with_capacity(2);
         parts.extend(s.frozen.as_ref().map(|f| f.part.clone()));
-        parts.extend(s.active.part(s.last_seq, false));
+        parts.extend(s.active.part(false));
         MemtableSnapshot { parts }
     }
 }

@@ -37,7 +37,6 @@ impl FromStr for SegmentId {
 }
 
 str_enum!(
-    #[derive(PartialOrd, Ord)]
     #[repr(u8)]
     Level, "level", { L0 => "L0", L1 => "L1" }
 );

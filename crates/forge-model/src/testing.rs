@@ -305,6 +305,165 @@ impl crate::memtable::MemtableView for FixedMemtable {
         if log.is_empty() {
             return MemtableSnapshot::default();
         }
-        MemtableSnapshot { parts: vec![MemtablePart { frozen: false, seqs: 1..=1, versions: 0..=u64::MAX, batches: log.view() }] }
+        MemtableSnapshot {
+            parts: vec![MemtablePart {
+                frozen: false,
+                batches: log.view(),
+            }],
+        }
     }
+}
+
+/// Parent of a generated span; spans are numbered `0..n` (ids `sid(n)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parent {
+    Root,
+    Span(u64),
+    /// A parent id that is not in the trace.
+    Missing,
+}
+
+impl Parent {
+    pub fn id(self, missing: u64) -> Option<SpanId> {
+        match self {
+            Parent::Root => None,
+            Parent::Span(s) => Some(sid(s)),
+            Parent::Missing => Some(sid(missing)),
+        }
+    }
+}
+
+/// Parent map of one trace of `n >= 9` spans (D4 trees). The last 9 spans are forced: a 2-cycle, a 3-cycle with a
+/// 2-node tail hanging off it, and an orphan with a child. Each other span: another span of the trace 60 %, a
+/// missing id 10 %, itself 3 %, root otherwise.
+pub fn tree_parents(r: &mut Rng, n: u64) -> Vec<Parent> {
+    assert!(n >= 9, "tree_parents needs n >= 9");
+    let k = n - 9;
+    let mut v: Vec<Parent> = (0..k)
+        .map(|i| match r.below(100) {
+            0..60 => Parent::Span(r.below(n)),
+            60..70 => Parent::Missing,
+            70..73 => Parent::Span(i),
+            _ => Parent::Root,
+        })
+        .collect();
+    v.extend([
+        Parent::Span(k + 1), // 2-cycle k <-> k+1
+        Parent::Span(k),
+        Parent::Span(k + 3), // 3-cycle k+2 -> k+3 -> k+4 -> k+2
+        Parent::Span(k + 4),
+        Parent::Span(k + 2),
+        Parent::Span(k + 2), // tail k+6 -> k+5 -> k+2
+        Parent::Span(k + 5),
+        Parent::Missing, // orphan k+7 with child k+8
+        Parent::Span(k + 7),
+    ]);
+    v
+}
+
+/// The D4 sibling key: (start µs NULLS LAST, span_id bytes).
+pub fn sibling_key(r: &SpanRow) -> (bool, i64, SpanId) {
+    (
+        r.start_time_ns.is_none(),
+        r.start_time_ns.map_or(0, |s| s.div_euclid(1000)),
+        r.span_id,
+    )
+}
+
+/// One span of a reference tree, in preorder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefNode {
+    pub span: SpanId,
+    pub depth: u32,
+    pub orphan: bool,
+    pub cycle: bool,
+}
+
+/// Naive D4 oracle over the merged rows of ONE trace: null parent = true root; self parent = extra root (cycle);
+/// missing parent = extra root (orphan); every parent cycle is broken at its member with the minimal sibling key
+/// (extra root, cycle). Roots = true roots ++ extra roots, each by sibling key; children by sibling key.
+pub fn ref_tree(rows: &[SpanRow]) -> Vec<RefNode> {
+    use std::collections::{BTreeSet, HashMap};
+    let by_id: HashMap<SpanId, &SpanRow> = rows.iter().map(|r| (r.span_id, r)).collect();
+    assert_eq!(by_id.len(), rows.len(), "one row per span");
+    let link =
+        |r: &SpanRow| -> Option<SpanId> { r.parent_span_id.filter(|p| *p != r.span_id && by_id.contains_key(p)) };
+    // The cycle through `r`, if `r` is on one: follow links until `r` comes back (at most n steps).
+    let cycle_of = |r: &SpanRow| -> Option<Vec<SpanId>> {
+        let mut members = vec![r.span_id];
+        let mut cur = link(r)?;
+        for _ in 0..rows.len() {
+            if cur == r.span_id {
+                return Some(members);
+            }
+            members.push(cur);
+            cur = link(by_id[&cur])?;
+        }
+        None
+    };
+    let breakers: BTreeSet<SpanId> = rows
+        .iter()
+        .filter_map(cycle_of)
+        .map(|c| *c.iter().min_by_key(|s| sibling_key(by_id[*s])).unwrap())
+        .collect();
+    let parent_of = |r: &SpanRow| if breakers.contains(&r.span_id) { None } else { link(r) };
+    let orphan = |r: &SpanRow| r.parent_span_id.is_some_and(|p| !by_id.contains_key(&p));
+    let cycle = |r: &SpanRow| r.parent_span_id == Some(r.span_id) || breakers.contains(&r.span_id);
+    let mut sorted: Vec<&SpanRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| sibling_key(r));
+    let roots: Vec<&SpanRow> = sorted
+        .iter()
+        .filter(|r| r.parent_span_id.is_none())
+        .chain(
+            sorted
+                .iter()
+                .filter(|r| r.parent_span_id.is_some() && parent_of(r).is_none()),
+        )
+        .copied()
+        .collect();
+    fn emit<'a>(
+        r: &'a SpanRow,
+        depth: u32,
+        sorted: &[&'a SpanRow],
+        parent_of: &dyn Fn(&SpanRow) -> Option<SpanId>,
+        flags: &dyn Fn(&SpanRow) -> (bool, bool),
+        out: &mut Vec<RefNode>,
+    ) {
+        let (orphan, cycle) = flags(r);
+        out.push(RefNode {
+            span: r.span_id,
+            depth,
+            orphan,
+            cycle,
+        });
+        for c in sorted.iter().filter(|c| parent_of(c) == Some(r.span_id)) {
+            emit(c, depth + 1, sorted, parent_of, flags, out);
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for r in roots {
+        emit(r, 0, &sorted, &parent_of, &|r| (orphan(r), cycle(r)), &mut out);
+    }
+    assert_eq!(out.len(), rows.len(), "every span exactly once");
+    out
+}
+
+/// Decision 15, plain Rust: the producer total, else prompt + completion if both, else whichever count is set.
+pub fn ref_effective_total(r: &SpanRow) -> Option<i64> {
+    r.total_tokens.or(match (r.prompt_tokens, r.completion_tokens) {
+        (Some(a), Some(b)) => Some(a.wrapping_add(b)),
+        (a, b) => a.or(b),
+    })
+}
+
+/// What every read path returns: the merged rows, tombstones dropped, the effective total_tokens.
+pub fn reference(all: &[SpanRow]) -> Vec<SpanRow> {
+    reference_merge(all)
+        .into_iter()
+        .filter(|r| !r.deleted)
+        .map(|mut r| {
+            r.total_tokens = ref_effective_total(&r);
+            r
+        })
+        .collect()
 }

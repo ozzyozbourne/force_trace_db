@@ -21,7 +21,6 @@ async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-moka.workspace = true
 
 [dev-dependencies]
 forge-model = { workspace = true, features = ["test-util"] }

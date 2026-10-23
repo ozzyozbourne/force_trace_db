@@ -697,3 +697,49 @@ async fn flush_merges_in_bounded_batches() {
     got.sort_by_key(forge_model::testing::physical_key);
     assert_eq!(got, want);
 }
+
+/// Parts follow freeze and release: `[active]`, then `[frozen, active]`, then `[active]`; a snapshot taken before
+/// the release still yields the frozen rows.
+#[test]
+fn snapshot_parts_track_freeze_and_release() {
+    use forge_model::MemtableView;
+    let m = forge_ingest::memtable::MemtableSet::new(0, 1 << 30, Duration::MAX);
+    let insert = |seq: u64| {
+        let b = batch_from_rows(&[start("alpha", 1, seq)]);
+        let bytes = forge_ingest::memtable::accounted_bytes(&b);
+        m.insert(seq, b, bytes).unwrap();
+    };
+    let shape = |s: &forge_model::MemtableSnapshot| -> Vec<(bool, usize)> {
+        s.parts.iter().map(|p| (p.frozen, p.batches.num_rows())).collect()
+    };
+    assert!(m.snapshot().is_empty());
+    insert(1);
+    insert(2);
+    assert_eq!(shape(&m.snapshot()), [(false, 2)]);
+    let f = m.freeze().unwrap();
+    assert_eq!(f.last_seq, 2);
+    insert(3);
+    let before = m.snapshot();
+    assert_eq!(shape(&before), [(true, 2), (false, 1)]);
+    m.release(&f);
+    assert_eq!(shape(&m.snapshot()), [(false, 1)]);
+    assert_eq!(before.num_rows(), 3, "an older snapshot keeps the released rows");
+    assert_eq!(before.to_vec().len(), 3);
+}
+
+/// A snapshot copies block pointers, not batches: fast even with 30k batches.
+#[test]
+fn snapshot_is_pointer_only() {
+    use forge_model::MemtableView;
+    let m = forge_ingest::memtable::MemtableSet::new(0, 1 << 40, Duration::MAX);
+    let b = batch_from_rows(&[start("alpha", 1, 1)]);
+    let bytes = forge_ingest::memtable::accounted_bytes(&b);
+    for seq in 1..=30_000 {
+        m.insert(seq, b.clone(), bytes).unwrap();
+    }
+    let t = std::time::Instant::now();
+    let s = m.snapshot();
+    let took = t.elapsed();
+    assert_eq!(s.batches().count(), 30_000);
+    assert!(took < Duration::from_millis(1), "snapshot took {took:?}");
+}

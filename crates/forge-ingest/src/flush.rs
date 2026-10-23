@@ -115,7 +115,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
     let commit = FlushCommit {
         node_id: cx.node_id.clone(),
         segments: written,
-        flushed_wal_seq: f.last_seq(),
+        flushed_wal_seq: f.last_seq,
         max_version: cx.versions.high_water(),
     };
     retry("commit_flush", cx.backoff, || cx.meta.commit_flush(commit.clone())).await;
@@ -124,7 +124,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
     // 4. Visible as a segment now; drop from the memtable view (invariant 1), then the WAL.
     cx.mem.release(&f);
     let wal = cx.wal.clone();
-    let watermark = f.last_seq();
+    let watermark = f.last_seq;
     let deleted = match tokio::task::spawn_blocking(move || wal.truncate(watermark)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {

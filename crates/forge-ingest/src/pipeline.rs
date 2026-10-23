@@ -271,7 +271,8 @@ impl Pipeline {
         while self.flush_now().await?.is_some() {}
         Ok(())
     }
-    /// A snapshot keeps a released memtable's batches alive until dropped (not counted by backpressure).
+    /// The query side of the memtable. A snapshot keeps a released memtable's batches alive until the query drops
+    /// it, and backpressure does not count them; the query timeout bounds that.
     pub fn memtable_view(&self) -> Arc<dyn forge_model::MemtableView> {
         self.mem.clone()
     }
