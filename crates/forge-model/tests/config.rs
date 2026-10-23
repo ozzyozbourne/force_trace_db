@@ -50,6 +50,16 @@ fn example_file_loads_with_spec_values() {
         assert_eq!(c.cache.disk_dir, Path::new("/var/lib/forge/cache"));
         assert_eq!(c.compaction.target_segment, ByteSize::mib(256));
         assert_eq!(c.compaction.concurrency, 2);
+        // The example's [compaction] keys are the defaults.
+        assert_eq!(c.compaction, forge_model::config::CompactionConfig::default());
+        assert_eq!(c.compaction.interval, Duration::from_secs(10));
+        assert_eq!(c.compaction.l0_trigger, 4);
+        assert_eq!(c.compaction.l0_max_age, Duration::from_secs(600));
+        assert_eq!(c.compaction.max_job_bytes, ByteSize::mib(512));
+        assert_eq!(c.compaction.slice_bytes, ByteSize::mib(128));
+        assert_eq!(c.compaction.gc_interval, Duration::from_secs(600));
+        assert_eq!(c.compaction.gc_grace, Duration::from_secs(3600));
+        assert_eq!(c.compaction.orphan_grace, Duration::from_secs(86_400));
         assert_eq!(c.query.memory_limit, ByteSize::gib(2));
         assert_eq!(c.query.timeout, Duration::from_secs(30));
         Ok(())
@@ -67,7 +77,11 @@ fn env_overrides_file() {
         jail.set_env("FORGE_SERVER__ADMIN_ADDR", "127.0.0.1:0");
         jail.set_env("FORGE_COMPACTION__TARGET_SEGMENT", "512MiB");
         jail.set_env("FORGE_SERVER__SHUTDOWN_GRACE", "1s");
+        jail.set_env("FORGE_COMPACTION__INTERVAL", "0s");
+        jail.set_env("FORGE_COMPACTION__GC_GRACE", "200ms");
         let c = ForgeConfig::load(None)?;
+        assert_eq!(c.compaction.interval, Duration::ZERO);
+        assert_eq!(c.compaction.gc_grace, Duration::from_millis(200));
         assert_eq!(c.storage.url, "memory://");
         assert_eq!(c.memtable.flush_bytes, ByteSize::mib(128));
         assert_eq!(c.query.timeout, Duration::from_secs(90));

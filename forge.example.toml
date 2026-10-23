@@ -23,7 +23,15 @@ disk_dir = "/var/lib/forge/cache"
 
 [compaction]
 target_segment = "256MiB"
-concurrency = 2
+concurrency = 2           # jobs at once; each needs up to ~0.9 GiB (3 x slice_bytes + open writers)
+interval = "10s"          # picker tick; "0s" = no background compaction
+l0_trigger = 4            # compact once this many L0 segments exist ...
+l0_max_age = "10m"        # ... or the oldest is this old
+max_job_bytes = "512MiB"  # input bytes per job (lower it on small hosts)
+slice_bytes = "128MiB"    # decoded bytes merged at once
+gc_interval = "10m"       # retention + purge + orphan sweep; "0s" = none (forge gc still works)
+gc_grace = "1h"           # deleted segments' objects are kept this long
+orphan_grace = "24h"      # unreferenced objects are kept this long
 
 [query]
 memory_limit = "2GiB"

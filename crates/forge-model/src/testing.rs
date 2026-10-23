@@ -141,6 +141,39 @@ pub fn random_row(r: &mut Rng, project: &str, trace: u64, span: u64, version: u6
     }
 }
 
+/// Naive dotted_order oracle (plans/phase-4 D5), written apart from `dotted.rs`: per key (one row each; the last
+/// wins), an existing dotted_order wins; otherwise a root with a start is `dotted_order(None, start, span)`, and a
+/// child with a start whose parent row exists and resolves is `parent value + "." + segment`. Cycles without an
+/// existing value, missing parents and null starts give None.
+pub fn ref_dotted(rows: &[SpanRow]) -> std::collections::BTreeMap<RowKey, Option<String>> {
+    use std::collections::BTreeMap;
+    let by_key: BTreeMap<RowKey, &SpanRow> = rows.iter().map(|r| (row_key(r), r)).collect();
+    fn value(k: &RowKey, by_key: &BTreeMap<RowKey, &SpanRow>, seen: &mut Vec<RowKey>) -> Option<String> {
+        let r = by_key.get(k)?;
+        if let Some(d) = &r.dotted_order {
+            return Some(d.clone());
+        }
+        if seen.contains(k) {
+            return None;
+        }
+        let start = r.start_time_ns?;
+        let segment = crate::dotted::dotted_segment(start, r.span_id);
+        match r.parent_span_id {
+            None => Some(segment),
+            Some(p) => {
+                seen.push(k.clone());
+                let pv = value(&(k.0.clone(), k.1, p), by_key, seen);
+                seen.pop();
+                Some(format!("{}.{segment}", pv?))
+            }
+        }
+    }
+    by_key
+        .keys()
+        .map(|k| (k.clone(), value(k, &by_key, &mut Vec::new())))
+        .collect()
+}
+
 /// Naive reference: per key, versions DESC, each field = first Some.
 pub fn reference_merge(rows: &[SpanRow]) -> Vec<SpanRow> {
     use std::collections::BTreeMap;

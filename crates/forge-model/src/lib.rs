@@ -17,8 +17,9 @@
 //!    selections, where "matches any version" is acceptable and documented, may be pushed into `ScanRequest.filter`
 //!    or the selection. Time pruning happens only at segment level, and only when `start_time_nulls == 0`
 //!    (`SegmentMeta::may_overlap_time`).
-//! 5. **Tombstones** may be dropped by compaction only when the job's inputs include every visible segment that
-//!    holds the affected trace (M3 defines the check). Otherwise use `Tombstones::Keep`.
+//! 5. **Tombstones.** M3 keeps every tombstone (`Tombstones::Keep`). M6 adds barrier semantics
+//!    (`tombstone_version`) and the "job holds every visible segment of the trace, memtable has none" check before
+//!    any drop.
 //! 6. **Commit points:** objects are written first and the metastore commit comes second. Nothing is visible
 //!    before the commit. The WAL is truncated only after the commit.
 //! 7. **WAL watermark.** `FlushCommit.flushed_wal_seq` is a watermark: every WAL record with seq ≤ it is in a
@@ -31,8 +32,14 @@
 //!    already-committed rows can never duplicate (key, version).
 //! 9. **Version order = WAL order.** The WAL writer thread assigns versions in seq order, so memtables and L0 flushes
 //!    are version-disjoint and ordered. The per-field merge is associative only across such parts: M2 may merge
-//!    segments + memtable freely; M3 compaction must merge a key's segments as a contiguous run in flush order (or
-//!    include every newer segment holding the key).
+//!    segments + memtable freely; compaction must merge a key's rows as a contiguous run in version order. M3: L0
+//!    inputs are the oldest-first prefix by `min_version` (one L0 job per project); an L0 job folds an hour whole;
+//!    an L1 job takes a newest version suffix of one hour (invariant 10, plans/phase-4 §3).
+//! 10. **Sticky L1 placement.** All L1 rows of a span key are in ONE `partition_hour` (sticky, else hour(start),
+//!     else the orphan run of hour(end), else the trace's earliest L1 hour, else the newest input L0's hour). L1
+//!     segments of different `(project, partition_hour)` are therefore key-disjoint; the query merge-skip relies on
+//!     it, for parts that come from one metastore read. An L0 job folds ALL visible L1 segments of an hour or none;
+//!     an L1 job takes a newest version suffix of one hour.
 
 pub mod blob;
 pub mod catalog;

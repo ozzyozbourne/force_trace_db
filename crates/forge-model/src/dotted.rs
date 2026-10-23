@@ -39,111 +39,54 @@ pub fn depth(dotted: &str) -> usize {
     dotted.bytes().filter(|&b| b == b'.').count() + 1
 }
 
-// ---- resolving a batch: dotted_order is computed when the whole ancestor chain is in the batch (ending at a
-// root); otherwise it stays null (compaction fills it). ----
+// ---- resolving: one walk for ingest and compaction (plans/phase-4 D5). An ancestor's existing dotted_order is the
+// prefix; a value is computed when the chain ends at a root or at such an ancestor, otherwise it stays null. ----
 
-type Key = (ProjectId, TraceId, SpanId);
+/// A node of the walk: (parent key, start_time ns, existing dotted_order).
+pub type Node<K> = (Option<K>, Option<i64>, Option<String>);
 
-/// Sets `dotted_order` on every row that lacks one and whose ancestor chain is complete in `rows`. Keys are
-/// `(project, trace, span)`; for duplicates (start + end post of one span) the last occurrence defines the node;
-/// cycles resolve to null.
-pub fn resolve_dotted_orders(rows: &mut [SpanRow]) {
-    // Last occurrence wins for duplicates (start + end post of one span in one batch).
-    let mut nodes: HashMap<Key, (Option<SpanId>, Option<i64>)> = HashMap::with_capacity(rows.len());
-    for r in rows.iter() {
-        let Some(p) = &r.project_id else { continue };
-        nodes.insert((p.clone(), r.trace_id, r.span_id), (r.parent_span_id, r.start_time_ns));
-    }
-    let mut memo: HashMap<Key, Option<String>> = HashMap::with_capacity(rows.len());
-    for r in rows.iter_mut() {
-        if r.dotted_order.is_some() {
-            continue; // already set by the producer (LangSmith runs API)
-        }
-        let Some(p) = &r.project_id else { continue };
-        let key = (p.clone(), r.trace_id, r.span_id);
-        r.dotted_order = resolve(&key, &nodes, &mut memo);
-    }
-}
-
-fn resolve(
-    key: &Key,
-    nodes: &HashMap<Key, (Option<SpanId>, Option<i64>)>,
-    memo: &mut HashMap<Key, Option<String>>,
-) -> Option<String> {
-    if let Some(m) = memo.get(key) {
-        return m.clone(); // resolved earlier as someone's ancestor
-    }
-    // Walk up until a memoized node, a root, a parent outside the batch, or a cycle.
-    // `prefix`: Some(None) = root, Some(Some(p)) = memoized prefix, None = unknown.
-    let mut chain: Vec<(Key, Option<i64>)> = Vec::new();
-    let mut cur = key.clone();
-    let mut prefix: Option<Option<String>> = loop {
-        if let Some(m) = memo.get(&cur) {
-            break m.clone().map(Some);
-        }
-        let Some(&(parent, start)) = nodes.get(&cur) else {
-            break None;
-        };
-        chain.push((cur.clone(), start));
-        if chain.len() > nodes.len() {
-            break None; // cycle
-        }
-        match parent {
-            None => break Some(None),
-            Some(ps) => cur = (cur.0.clone(), cur.1, ps),
-        }
-    };
-    for (k, start) in chain.into_iter().rev() {
-        let v = match (&prefix, start) {
-            (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.2)),
-            _ => None,
-        };
-        memo.insert(k, v.clone());
-        prefix = v.map(Some);
-    }
-    prefix.flatten()
-}
-
-/// Compaction backfill (CR §4): `nodes` has every known node of one trace slice as (parent, start_ns, existing
-/// dotted). Returns the dotted_order for each key in `want` whose own dotted is null and whose chain resolves.
-#[allow(clippy::type_complexity)]
-pub fn resolve_with_known(
-    nodes: &HashMap<(TraceId, SpanId), (Option<SpanId>, Option<i64>, Option<String>)>,
-    want: impl IntoIterator<Item = (TraceId, SpanId)>,
-) -> HashMap<(TraceId, SpanId), String> {
-    let mut memo: HashMap<(TraceId, SpanId), Option<String>> = nodes
+/// The dotted_order of each key in `want` that has no existing value and whose chain resolves. Cycles resolve to
+/// null unless they pass through a node with an existing value.
+fn walk<K: Clone + Eq + std::hash::Hash>(
+    nodes: &HashMap<K, Node<K>>,
+    want: impl IntoIterator<Item = K>,
+    span: impl Fn(&K) -> SpanId,
+) -> HashMap<K, String> {
+    let mut memo: HashMap<K, Option<String>> = nodes
         .iter()
-        .filter_map(|(k, (_, _, d))| d.clone().map(|d| (*k, Some(d))))
+        .filter_map(|(k, n)| n.2.clone().map(|d| (k.clone(), Some(d))))
         .collect();
     let mut out = HashMap::new();
     for key in want {
         if memo.get(&key).is_some_and(Option::is_some) {
-            continue; // already has one
+            continue; // already has one (or resolved as someone's ancestor and recorded then)
         }
-        let mut chain = Vec::new();
+        // Walk up until a memoized node, a root, a parent that is not a node, or a cycle.
+        // `prefix`: Some(None) = root, Some(Some(p)) = memoized prefix, None = unknown.
+        let mut chain: Vec<(K, Option<i64>)> = Vec::new();
         let mut cur = key;
         let mut prefix: Option<Option<String>> = loop {
             if let Some(m) = memo.get(&cur) {
                 break m.clone().map(Some);
             }
-            let Some(&(parent, start, _)) = nodes.get(&cur) else {
+            let Some((parent, start, _)) = nodes.get(&cur) else {
                 break None;
             };
-            chain.push((cur, start));
+            chain.push((cur.clone(), *start));
             if chain.len() > nodes.len() {
                 break None; // cycle
             }
             match parent {
                 None => break Some(None),
-                Some(p) => cur = (cur.0, p),
+                Some(p) => cur = p.clone(),
             }
         };
         for (k, start) in chain.into_iter().rev() {
             let v = match (&prefix, start) {
-                (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.1)),
+                (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, span(&k))),
                 _ => None,
             };
-            memo.insert(k, v.clone());
+            memo.insert(k.clone(), v.clone());
             if let Some(d) = &v {
                 out.insert(k, d.clone());
             }
@@ -151,6 +94,41 @@ pub fn resolve_with_known(
         }
     }
     out
+}
+
+type Key = (ProjectId, TraceId, SpanId);
+
+/// Ingest: sets `dotted_order` on every row that lacks one, whose key has no producer value in `rows`, and whose
+/// ancestor chain resolves within `rows` (to a root, or to an ancestor with a dotted_order). For duplicates (the
+/// start and end posts of one span) the last occurrence defines parent and start, and the last non-null
+/// dotted_order is the key's existing value.
+pub fn resolve_dotted_orders(rows: &mut [SpanRow]) {
+    let mut nodes: HashMap<Key, Node<Key>> = HashMap::with_capacity(rows.len());
+    for r in rows.iter() {
+        let Some(p) = &r.project_id else { continue };
+        let parent = r.parent_span_id.map(|ps| (p.clone(), r.trace_id, ps));
+        let e = nodes.entry((p.clone(), r.trace_id, r.span_id)).or_default();
+        *e = (parent, r.start_time_ns, r.dotted_order.clone().or(e.2.take()));
+    }
+    let want: Vec<Key> = rows
+        .iter()
+        .filter(|r| r.dotted_order.is_none())
+        .filter_map(|r| Some((r.project_id.clone()?, r.trace_id, r.span_id)))
+        .collect();
+    let resolved = walk(&nodes, want, |k| k.2);
+    for r in rows.iter_mut().filter(|r| r.dotted_order.is_none()) {
+        let Some(p) = &r.project_id else { continue };
+        r.dotted_order = resolved.get(&(p.clone(), r.trace_id, r.span_id)).cloned();
+    }
+}
+
+/// Compaction backfill (CR §4): `nodes` has every known node of one trace slice (merged job rows + context).
+/// Returns the dotted_order for each key in `want` whose own dotted is null and whose chain resolves.
+pub fn resolve_with_known(
+    nodes: &HashMap<(TraceId, SpanId), Node<(TraceId, SpanId)>>,
+    want: impl IntoIterator<Item = (TraceId, SpanId)>,
+) -> HashMap<(TraceId, SpanId), String> {
+    walk(nodes, want, |k| k.1)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use arrow::datatypes::TimestampNanosecondType;
 use arrow::record_batch::RecordBatch;
 use forge_meta::{CompactionCommit, CompactionJob, NewSegment};
 use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, TraceRange, paths};
-use forge_model::dotted::resolve_with_known;
+use forge_model::dotted::{Node, resolve_with_known};
 use forge_model::error::{Classify, ErrorKind};
 use forge_model::failpoint;
 use forge_model::ids::{ProjectId, SpanId, TraceId};
@@ -480,10 +480,9 @@ fn fill(m: &RecordBatch, ctx: &Context) -> Result<(RecordBatch, usize, usize), I
             s
         })
         .collect();
-    type Node = (Option<SpanId>, Option<i64>, Option<String>);
-    let mut nodes: HashMap<Key, Node> = ctx
+    let mut nodes: HashMap<Key, Node<Key>> = ctx
         .iter()
-        .map(|(k, v)| (*k, (v.parent, v.start_ns, v.dotted.clone())))
+        .map(|(k, v)| (*k, (v.parent.map(|p| (k.0, p)), v.start_ns, v.dotted.clone())))
         .collect();
     let mut want = Vec::new();
     for (i, k) in ks.iter().enumerate() {
@@ -496,7 +495,7 @@ fn fill(m: &RecordBatch, ctx: &Context) -> Result<(RecordBatch, usize, usize), I
         if d.is_none() {
             want.push(*k);
         }
-        nodes.insert(*k, (p, starts[i], d));
+        nodes.insert(*k, (p.map(|p| (k.0, p)), starts[i], d));
     }
     let resolved = resolve_with_known(&nodes, want);
     let new_dotted: StringArray = (0..m.num_rows())

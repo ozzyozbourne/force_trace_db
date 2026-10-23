@@ -110,3 +110,44 @@ fn producer_dotted_order_is_kept() {
     resolve_dotted_orders(&mut rows);
     assert_eq!(rows[0].dotted_order.as_deref(), Some("producer"));
 }
+
+/// plans/phase-4 D5: the one walk (an ancestor's existing value is the prefix) equals the naive `ref_dotted` over
+/// `tree_parents` trees (cycles, missing parents) with producer values on about 10 % of nodes and some null starts.
+#[test]
+fn resolve_equals_ref_dotted_with_producer_values() {
+    use forge_model::testing::{ref_dotted, tree_parents};
+    let mut seeded_children = 0;
+    for seed in 1..=300u64 {
+        let mut r = Rng(seed);
+        let mut rows = Vec::new();
+        for (p, t) in [("a", 1u64), ("a", 2), ("b", 1)] {
+            let n = 9 + r.below(12);
+            for (s, parent) in tree_parents(&mut r, n).into_iter().enumerate() {
+                let (ns, tag) = (1_700_000_000_000_000_000 + r.below(1_000_000) as i64, r.below(1000));
+                rows.push(SpanRow {
+                    project_id: Some(pid(p)),
+                    trace_id: tid(t),
+                    span_id: sid(s as u64),
+                    parent_span_id: parent.id(1000),
+                    start_time_ns: r.opt(90, ns),
+                    dotted_order: r.opt(10, format!("producer{tag}")),
+                    ..Default::default()
+                });
+            }
+        }
+        for i in (1..rows.len()).rev() {
+            rows.swap(i, r.below(i as u64 + 1) as usize);
+        }
+        let want = ref_dotted(&rows);
+        resolve_dotted_orders(&mut rows);
+        for row in &rows {
+            assert_eq!(row.dotted_order, want[&key(row)], "seed {seed} {:?}", key(row));
+            seeded_children += usize::from(
+                row.dotted_order
+                    .as_ref()
+                    .is_some_and(|d| d.starts_with("producer") && d.contains('.')),
+            );
+        }
+    }
+    assert!(seeded_children > 0, "no child used a producer prefix");
+}

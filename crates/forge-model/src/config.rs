@@ -114,9 +114,11 @@ pub struct CacheConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompactionConfig {
+    /// L1 output size; also the fold limit (an hour is folded into a kind-A job while below half of it).
     pub target_segment: ByteSize,
+    /// Compaction jobs at once.
     pub concurrency: usize,
-    /// Compaction picker tick.
+    /// Compaction picker tick. Zero: no ticker (no background compaction).
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
     /// Kind-A trigger: this many visible L0 segments.
@@ -124,17 +126,18 @@ pub struct CompactionConfig {
     /// Kind-A trigger: the oldest L0 is older than this (wall clock).
     #[serde(with = "humantime_serde")]
     pub l0_max_age: Duration,
-    /// Input byte_size per kind-A job.
+    /// Input byte_size per job: the L0 prefix plus folded hours (kind A), or the suffix (kind B).
     pub max_job_bytes: ByteSize,
     /// Decoded bytes per merge slice.
     pub slice_bytes: ByteSize,
-    /// Retention + purge + orphan sweep pass. Zero disables the background pass (`forge gc` still works).
+    /// Retention + purge + orphan sweep pass. Zero: no ticker (`forge gc` still works).
     #[serde(with = "humantime_serde")]
     pub gc_interval: Duration,
     /// Objects of deleted (compacted-away or expired) segments are kept this long for in-flight readers.
     #[serde(with = "humantime_serde")]
     pub gc_grace: Duration,
-    /// Objects unknown to the metastore (failed uploads, lost leases) are kept this long (spec: 24 h).
+    /// Objects unknown to the metastore (failed uploads) are kept this long (spec: 24 h). A compaction job older
+    /// than half of it cannot commit.
     #[serde(with = "humantime_serde")]
     pub orphan_grace: Duration,
 }
