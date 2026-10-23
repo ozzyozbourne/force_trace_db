@@ -14,7 +14,7 @@ fn cfg(dir: &std::path::Path, interval: Duration, gc_interval: Duration) -> Forg
     c.compaction.interval = interval;
     c.compaction.l0_trigger = 1;
     c.compaction.gc_interval = gc_interval;
-    c.compaction.gc_grace = Duration::from_secs(1);
+    c.compaction.gc_grace = Duration::from_millis(100);
     c
 }
 
@@ -36,7 +36,7 @@ async fn six_flushes(f: &forge_server::Forge) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_compacts_and_purges() {
     let d = tempfile::tempdir().unwrap();
-    let f = forge_server::Forge::open(cfg(d.path(), Duration::from_millis(200), Duration::from_secs(1)))
+    let f = forge_server::Forge::open(cfg(d.path(), Duration::from_millis(200), Duration::from_millis(200)))
         .await
         .unwrap();
     six_flushes(&f).await;
@@ -91,7 +91,8 @@ async fn zero_intervals_start_no_ticker() {
         .unwrap();
     let lc = forge_server::lifecycle::start(f.clone());
     six_flushes(&f).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // With zero intervals no ticker exists at all: a short wait proves as much as a long one.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
     assert_eq!(
         segs.iter().filter(|s| s.level == Level::L0).count(),

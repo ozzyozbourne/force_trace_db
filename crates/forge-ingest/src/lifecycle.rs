@@ -13,7 +13,7 @@ use forge_model::config::CompactionConfig;
 use forge_model::ids::ProjectId;
 use forge_model::time::Clocks;
 use forge_storage::delete_all;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::collections::HashSet;
@@ -23,6 +23,8 @@ use std::time::Duration;
 const BATCH: usize = 1000;
 /// Blobs deleted per write-lock hold of the `BlobGuard` (no HEAD under the lock; RA m11).
 const BLOB_CHUNK: usize = 64;
+/// Concurrent HEADs of the blob sweep's re-check.
+const HEAD_CONCURRENCY: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
@@ -86,7 +88,13 @@ async fn expire(meta: &dyn Metastore, data_now_ms: i64, dry_run: bool) -> Result
             if !done.is_empty() {
                 tracing::info!(project = %p.id, segments = done.len(), days, "retention: segments expired");
             }
-            if !done.iter().any(|s| s.level == Level::L1) {
+            // Fewer than BATCH L1 hours: none is left (the L0 rule already ran in full).
+            let hours: HashSet<_> = done
+                .iter()
+                .filter(|s| s.level == Level::L1)
+                .map(|s| s.partition_hour)
+                .collect();
+            if hours.len() < BATCH {
                 break;
             }
         }
@@ -192,16 +200,28 @@ async fn sweep_orphans(
         if old.is_empty() {
             continue;
         }
-        let refs = meta.blob_refs(&p).await?;
-        // Re-check each candidate (no lock held): ingest refreshes an old blob it reuses (`put_blobs`).
-        let mut doomed: Vec<ObjectMeta> = Vec::new();
-        for m in old.into_iter().filter(|m| !refs.contains(m.location.as_ref())) {
-            match store.head(&m.location).await {
-                Ok(h) if h.last_modified < cutoff => doomed.push(m),
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(e.into()),
+        let paths: Vec<String> = old.iter().map(|m| m.location.to_string()).collect();
+        let refs = meta.referenced_blobs(&p, &paths).await?;
+        let unreferenced: Vec<ObjectMeta> = old
+            .into_iter()
+            .filter(|m| !refs.contains(m.location.as_ref()))
+            .collect();
+        let doomed: Vec<ObjectMeta> = if blobs.exclusive {
+            unreferenced
+        } else {
+            // Re-check each candidate (no lock held): ingest refreshes an old blob it reuses (`put_blobs`).
+            let heads: Vec<_> = unreferenced.iter().map(|m| store.head(&m.location)).collect();
+            let heads: Vec<_> = futures::stream::iter(heads).buffered(HEAD_CONCURRENCY).collect().await;
+            let mut doomed = Vec::new();
+            for (m, h) in unreferenced.into_iter().zip(heads) {
+                match h {
+                    Ok(h) if h.last_modified < cutoff => doomed.push(m),
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
-        }
+            doomed
+        };
         if o.dry_run {
             r.orphan_blobs += doomed.len();
             r.freed_bytes += doomed.iter().map(|m| m.size).sum::<u64>();
@@ -221,8 +241,7 @@ async fn sweep_orphans(
 
 /// One full pass: retention (data clock), purge and orphan sweep (wall clock), job pruning; each clock is read once.
 /// `blobs` guards the blob sweep against concurrent `put_blobs` (the server passes its pipeline's guard). Offline
-/// callers pass `&BlobGuard::default()`: they hold every WAL lock, so no other writer exists and the guard never
-/// filters anything.
+/// callers pass `&BlobGuard::exclusive()`: they hold every WAL lock, so no other writer exists.
 pub async fn run_gc(
     meta: &dyn Metastore,
     store: &dyn ObjectStore,

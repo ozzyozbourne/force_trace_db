@@ -5,18 +5,19 @@ use crate::IngestError;
 use crate::sink::SegmentSink;
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampNanosecondArray, UInt32Array};
 use arrow::compute::{concat_batches, take_record_batch};
-use arrow::datatypes::TimestampNanosecondType;
+use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use forge_meta::{CompactionCommit, CompactionJob, NewSegment};
 use forge_model::catalog::{HourBucket, JobKind, JobStatus, Level, SegmentId, SegmentMeta, TraceRange};
-use forge_model::dotted::{Node, resolve_with_known};
+use forge_model::dotted::{Map, Node, resolve_with_known};
 use forge_model::failpoint;
 use forge_model::ids::{ProjectId, SpanId, TraceId};
-use forge_model::merge::{Tombstones, merge_versions_projected, sort_physical};
+use forge_model::merge::{Cancel, Tombstones, merge_versions_projected, sort_physical};
 use forge_model::retry::{Backoff, retry_bounded};
 use forge_model::row::span_keys;
 use forge_model::schema::{TIMEZONE, col, col_idx, projected_schema, spans_schema};
 use forge_storage::{RowSelection, ScanRequest, SegmentSpec, SegmentStore, coalesce_ranges};
+use futures::{StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +42,12 @@ const COMMIT_BACKOFF: Backoff = Backoff {
     max: Duration::from_millis(100),
 };
 
+/// Concurrent reads (inputs, context ranges, trace lists); results stay in request order.
+const READ_CONCURRENCY: usize = 4;
+
 type Key = (TraceId, SpanId);
 /// What the job knows about a key from L1 rows it does not rewrite: (parent, start, dotted_order).
-type Context = HashMap<Key, Node<Key>>;
+type Context<'a> = Map<Key, Node<'a, Key>>;
 
 /// The job's traces, cut into slices one at a time with the latest measured ratio (RA M3). A slice is whole traces,
 /// so every version of a key is in one slice, and one contiguous row range per input.
@@ -183,7 +187,8 @@ struct Writers {
     store: Arc<dyn SegmentStore>,
     project: ProjectId,
     open: BTreeMap<Run, Writer>,
-    done: Vec<NewSegment>,
+    /// Finished outputs, in output order; their uploads go on until `finish`.
+    closing: Vec<SegmentSink>,
     /// Every object of every output started (deleted when the job fails before its commit).
     objects: Vec<object_store::path::Path>,
     tick: u64,
@@ -195,7 +200,7 @@ impl Writers {
             store,
             project,
             open: BTreeMap::new(),
-            done: Vec::new(),
+            closing: Vec::new(),
             objects: Vec::new(),
             tick: 0,
         }
@@ -223,15 +228,13 @@ impl Writers {
             .get(&run)
             .is_some_and(|w| w.bytes > 0 && w.bytes + size > limit)
         {
-            let w = self.open.remove(&run).expect("present");
-            self.done.push(w.sink.finish().await?);
+            self.close(run);
             stats.rotated += 1;
         }
         if !self.open.contains_key(&run) {
             if self.open.len() >= MAX_OPEN_WRITERS {
                 let lru = *self.open.iter().min_by_key(|(_, w)| w.fed).expect("open").0;
-                let w = self.open.remove(&lru).expect("present");
-                self.done.push(w.sink.finish().await?);
+                self.close(lru);
                 stats.writer_cap += 1;
             }
             let w = self.start(run)?;
@@ -244,16 +247,29 @@ impl Writers {
         w.sink.push(b).await
     }
 
-    async fn finish(&mut self) -> Result<Vec<NewSegment>, IngestError> {
-        for (_, w) in std::mem::take(&mut self.open) {
-            self.done.push(w.sink.finish().await?);
-        }
-        Ok(std::mem::take(&mut self.done))
+    /// Ends `run`'s output; its upload completes in the background.
+    fn close(&mut self, run: Run) {
+        let mut w = self.open.remove(&run).expect("present");
+        w.sink.close();
+        self.closing.push(w.sink);
     }
 
-    /// Stops the open writers (dropping a sink aborts it) and returns every object the job may have created.
+    /// Ends every output and waits for all uploads; the outputs in order.
+    async fn finish(&mut self) -> Result<Vec<NewSegment>, IngestError> {
+        for (_, w) in std::mem::take(&mut self.open) {
+            self.closing.push(w.sink);
+        }
+        let mut out = Vec::with_capacity(self.closing.len());
+        for sink in std::mem::take(&mut self.closing) {
+            out.push(sink.finish().await?);
+        }
+        Ok(out)
+    }
+
+    /// Stops every writer (dropping a sink aborts it) and returns every object the job may have created.
     fn abort(&mut self) -> Vec<object_store::path::Path> {
         self.open.clear();
+        self.closing.clear();
         std::mem::take(&mut self.objects)
     }
 }
@@ -289,6 +305,7 @@ pub async fn run_job(cx: &CompactCtx, job: CompactionJob) -> Result<JobReport, I
 
 /// The commit: the atomic swap, retried on transient errors.
 async fn commit_job(cx: &CompactCtx, commit: CompactionCommit) -> Result<(), IngestError> {
+    let commit = Arc::new(commit);
     retry_bounded("commit_compaction", COMMIT_BACKOFF, COMMIT_ATTEMPTS, || {
         cx.meta.commit_compaction(commit.clone())
     })
@@ -309,35 +326,40 @@ async fn build(
         folded_hours: plan.folded_hours,
         ..Default::default()
     };
-    let mut inputs = Vec::with_capacity(job.inputs.len());
-    for s in &job.inputs {
-        inputs.push((s.clone(), cx.meta.segment_traces(s.id).await?));
-    }
-    let ctx_schema = projected_schema(&CONTEXT_COLUMNS);
-    let max_chunk = cx.merge_chunk_bytes;
+    let traces = job.inputs.iter().map(|s| cx.meta.segment_traces(s.id));
+    let traces: Vec<Vec<TraceRange>> = in_order(traces.collect()).await?;
+    let inputs: Vec<(SegmentMeta, Vec<TraceRange>)> = job.inputs.iter().cloned().zip(traces).collect();
     let mut ratio = INITIAL_RATIO;
     let mut slices = Slices::new(&inputs);
     while let Some((traces, ranges)) = slices.next(cx.cfg.slice_bytes.as_u64(), ratio) {
         cancel.check()?;
         stats.slices += 1;
-        // 1. Inputs, all columns. sticky: key -> hour from every L1 row (input or context).
-        let mut batches = Vec::new();
-        let mut sticky: HashMap<Key, HourBucket> = HashMap::new();
-        let (mut decoded, mut encoded) = (0u64, 0f64);
-        for (i, rows) in &ranges {
-            let seg = &inputs[*i].0;
+        // 1. Inputs, all columns. `sticky` sources: every L1 row (input or context) with its hour, in read order.
+        let scans = ranges.iter().map(|(i, rows)| {
             let req = ScanRequest {
                 rows: RowSelection::Range(rows.clone()),
                 ..Default::default()
             };
-            for b in cx.segments.scan_all(seg, req).await? {
+            cx.segments.scan_all(&inputs[*i].0, req)
+        });
+        let scans: Vec<Vec<RecordBatch>> = in_order(scans.collect()).await?;
+        let mut x = SliceInput {
+            batches: Vec::new(),
+            ctx_all: Vec::new(),
+            ctx_old: Vec::new(),
+            l1_rows: Vec::new(),
+            fallback: plan.fallback,
+            max_chunk: cx.merge_chunk_bytes,
+        };
+        let (mut decoded, mut encoded) = (0u64, 0f64);
+        for ((i, rows), bs) in ranges.iter().zip(scans) {
+            let seg = &inputs[*i].0;
+            for b in bs {
                 if seg.level == Level::L1 {
-                    for k in span_keys(&b)? {
-                        sticky.insert(k, seg.partition_hour);
-                    }
+                    x.l1_rows.push((seg.partition_hour, b.clone()));
                 }
                 decoded += b.get_array_memory_size() as u64;
-                batches.push(b);
+                x.batches.push(b);
             }
             encoded += (rows.end - rows.start) as f64 * seg.byte_size as f64 / seg.row_count.max(1) as f64;
         }
@@ -345,103 +367,51 @@ async fn build(
             ratio = (decoded as f64 / encoded).max(1.0);
         }
         // 2. Context: the slice traces' non-input L1 locations, from one metastore read.
-        let locs = cx.meta.locate_traces(&job.project_id, &traces).await?;
+        let locs = cx
+            .meta
+            .locate_l1_traces(&job.project_id, &traces, &plan.input_ids)
+            .await?;
         let mut per_seg: BTreeMap<SegmentId, (SegmentMeta, Vec<std::ops::Range<u64>>)> = BTreeMap::new();
         for l in locs.into_values().flatten() {
-            if l.segment.level == Level::L1 && !plan.input_ids.contains(&l.segment.id) {
-                per_seg
-                    .entry(l.segment.id)
-                    .or_insert_with(|| (l.segment.clone(), Vec::new()))
-                    .1
-                    .push(l.rows());
-            }
+            per_seg
+                .entry(l.segment.id)
+                .or_insert_with(|| (l.segment.clone(), Vec::new()))
+                .1
+                .push(l.rows());
         }
-        let (mut ctx_all, mut ctx_old) = (Vec::new(), Vec::new());
-        for (seg, rs) in per_seg.into_values() {
-            for r in coalesce_ranges(rs, 0) {
-                let req = ScanRequest {
-                    projection: Some(CONTEXT_COLUMNS.to_vec()),
-                    rows: RowSelection::Range(r),
-                    ..Default::default()
-                };
-                for b in cx.segments.scan_all(&seg, req).await? {
-                    for k in span_keys(&b)? {
-                        sticky.insert(k, seg.partition_hour);
-                    }
-                    if seg.max_version < plan.older_than {
-                        ctx_old.push(b.clone());
-                    }
-                    ctx_all.push(b);
+        let reads: Vec<(SegmentMeta, std::ops::Range<u64>)> = per_seg
+            .into_values()
+            .flat_map(|(seg, rs)| coalesce_ranges(rs, 0).into_iter().map(move |r| (seg.clone(), r)))
+            .collect();
+        let ctx_scans = reads.iter().map(|(seg, r)| {
+            let req = ScanRequest {
+                projection: Some(CONTEXT_COLUMNS.to_vec()),
+                rows: RowSelection::Range(r.clone()),
+                ..Default::default()
+            };
+            cx.segments.scan_all(seg, req)
+        });
+        let ctx_scans: Vec<Vec<RecordBatch>> = in_order(ctx_scans.collect()).await?;
+        for ((seg, _), bs) in reads.iter().zip(ctx_scans) {
+            for b in bs {
+                x.l1_rows.push((seg.partition_hour, b.clone()));
+                if seg.max_version < plan.older_than {
+                    x.ctx_old.push(b.clone());
                 }
+                x.ctx_all.push(b);
             }
         }
-        // 3. Merge (byte-bounded chunks, re-cut at trace boundaries) + fill + backfill + sort, on the blocking pool.
-        let (c2, s2) = (cancel.clone(), ctx_schema.clone());
-        let (chunks, fills, backfills) = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
-            if failpoint::fires("compact_merge_panic") {
-                panic!("FORGE_FAILPOINT compact_merge_panic hit");
-            }
-            let all = context(&merge_versions_projected(
-                &s2,
-                &ctx_all,
-                Tombstones::Keep,
-                max_chunk,
-                &c2,
-            )?)?;
-            let old = context(&merge_versions_projected(
-                &s2,
-                &ctx_old,
-                Tombstones::Keep,
-                max_chunk,
-                &c2,
-            )?)?;
-            let merged = merge_versions_projected(&spans_schema(), &batches, Tombstones::Keep, max_chunk, &c2)?;
-            drop(batches);
-            let (mut out, mut fills, mut backfills) = (Vec::new(), 0, 0);
-            for m in trace_aligned(merged)? {
-                c2.check()?;
-                let (filled, f, b) = fill(&m, &old, &all)?;
-                c2.check()?;
-                out.push(sort_physical(&filled)?);
-                (fills, backfills) = (fills + f, backfills + b);
-            }
-            Ok((out, fills, backfills))
-        })
-        .await
-        .map_err(|e| IngestError::Internal(format!("compaction merge: {e}")))??;
+        // 3. Merge, fill, backfill, sort and route, on the blocking pool.
+        let c2 = cancel.clone();
+        let (routed, fills, backfills) = tokio::task::spawn_blocking(move || x.run(&c2))
+            .await
+            .map_err(|e| IngestError::Internal(format!("compaction merge: {e}")))??;
         stats.fills += fills;
         stats.backfills += backfills;
-        // 4. Route (D3), chunk by chunk (each holds whole traces).
-        let mut trace_hour: HashMap<TraceId, HourBucket> = HashMap::new();
-        for (k, h) in &sticky {
-            let e = trace_hour.entry(k.0).or_insert(*h);
-            *e = (*e).min(*h);
-        }
+        // 4. Send, chunk by chunk (each holds whole traces).
         let limit = (cx.cfg.target_segment.as_u64() as f64 * ratio) as u64;
-        for slice in chunks {
-            let ks = span_keys(&slice)?;
-            let start = slice
-                .column(col_idx(col::START_TIME))
-                .as_primitive::<TimestampNanosecondType>();
-            let end = slice
-                .column(col_idx(col::END_TIME))
-                .as_primitive::<TimestampNanosecondType>();
-            let mut groups: BTreeMap<Run, Vec<u32>> = BTreeMap::new();
-            for (i, k) in ks.iter().enumerate() {
-                let run = route(
-                    *k,
-                    start.is_valid(i).then(|| start.value(i)),
-                    end.is_valid(i).then(|| end.value(i)),
-                    &sticky,
-                    trace_hour.get(&k.0).copied(),
-                    plan.fallback,
-                );
-                groups.entry(run).or_default().push(i as u32);
-            }
-            for (run, idx) in groups {
-                let b = take_record_batch(&slice, &UInt32Array::from(idx))?;
-                w.send(run, b, limit, &mut stats).await?;
-            }
+        for (run, b) in routed {
+            w.send(run, b, limit, &mut stats).await?;
         }
     }
     let outputs = w.finish().await?;
@@ -509,9 +479,124 @@ fn trace_aligned(chunks: Vec<RecordBatch>) -> Result<Vec<RecordBatch>, IngestErr
     Ok(out)
 }
 
-/// Context from merged CONTEXT_COLUMNS rows.
-fn context(chunks: &[RecordBatch]) -> Result<Context, IngestError> {
-    let mut out = Context::new();
+/// One slice's rows, moved to the blocking pool.
+struct SliceInput {
+    /// The inputs' rows, all columns.
+    batches: Vec<RecordBatch>,
+    /// Context rows (CONTEXT_COLUMNS) of every non-input L1 location, and those older than the job's rows.
+    ctx_all: Vec<RecordBatch>,
+    ctx_old: Vec<RecordBatch>,
+    /// Every L1 row (inputs, then context) with its hour; a later row's hour wins (sticky).
+    l1_rows: Vec<(HourBucket, RecordBatch)>,
+    fallback: HourBucket,
+    max_chunk: usize,
+}
+
+impl SliceInput {
+    /// Merge (byte-bounded chunks, re-cut at trace boundaries) + fill + backfill + sort, then route (D3): the
+    /// output batches in send order, #fills, #backfills.
+    #[allow(clippy::type_complexity)]
+    fn run(self, cancel: &Cancel) -> Result<(Vec<(Run, RecordBatch)>, u64, u64), IngestError> {
+        if failpoint::fires("compact_merge_panic") {
+            panic!("FORGE_FAILPOINT compact_merge_panic hit");
+        }
+        let mut sticky: HashMap<Key, HourBucket> = HashMap::new();
+        for (h, b) in &self.l1_rows {
+            for k in span_keys(b)? {
+                sticky.insert(k, *h);
+            }
+        }
+        let mut trace_hour: HashMap<TraceId, HourBucket> = HashMap::new();
+        for (k, h) in &sticky {
+            let e = trace_hour.entry(k.0).or_insert(*h);
+            *e = (*e).min(*h);
+        }
+        let merge = |b: &[RecordBatch], schema: &SchemaRef| {
+            merge_versions_projected(schema, b, Tombstones::Keep, self.max_chunk, cancel)
+        };
+        let ctx_schema = projected_schema(&CONTEXT_COLUMNS);
+        let all_rows = merge(&self.ctx_all, &ctx_schema)?;
+        let all = context(&all_rows)?;
+        // `ctx_old` is a subsequence of `ctx_all`: the same length means the same rows (the usual kind A).
+        let old_rows = if self.ctx_old.len() == self.ctx_all.len() {
+            Vec::new()
+        } else {
+            merge(&self.ctx_old, &ctx_schema)?
+        };
+        let old_ctx;
+        let old = if self.ctx_old.len() == self.ctx_all.len() {
+            &all
+        } else {
+            old_ctx = context(&old_rows)?;
+            &old_ctx
+        };
+        let merged = merge(&self.batches, &spans_schema())?;
+        drop(self.batches);
+        let (mut out, mut fills, mut backfills) = (Vec::new(), 0, 0);
+        for m in trace_aligned(merged)? {
+            cancel.check()?;
+            let f = fill(&m, old, &all)?;
+            cancel.check()?;
+            (fills, backfills) = (fills + f.fills, backfills + f.backfills);
+            // Merged rows are in physical order; only a filled dotted_order can move a row.
+            let sorted = if f.dotted_filled {
+                sort_physical(&f.batch)?
+            } else {
+                f.batch
+            };
+            route_chunk(&sorted, &sticky, &trace_hour, self.fallback, &mut out)?;
+        }
+        Ok((out, fills, backfills))
+    }
+}
+
+/// Splits one sorted chunk by output run (D3); each part keeps the chunk's row order.
+fn route_chunk(
+    chunk: &RecordBatch,
+    sticky: &HashMap<Key, HourBucket>,
+    trace_hour: &HashMap<TraceId, HourBucket>,
+    fallback: HourBucket,
+    out: &mut Vec<(Run, RecordBatch)>,
+) -> Result<(), IngestError> {
+    let ks = span_keys(chunk)?;
+    let start = chunk
+        .column(col_idx(col::START_TIME))
+        .as_primitive::<TimestampNanosecondType>();
+    let end = chunk
+        .column(col_idx(col::END_TIME))
+        .as_primitive::<TimestampNanosecondType>();
+    let mut groups: BTreeMap<Run, Vec<u32>> = BTreeMap::new();
+    for (i, k) in ks.iter().enumerate() {
+        let run = route(
+            *k,
+            start.is_valid(i).then(|| start.value(i)),
+            end.is_valid(i).then(|| end.value(i)),
+            sticky,
+            trace_hour.get(&k.0).copied(),
+            fallback,
+        );
+        groups.entry(run).or_default().push(i as u32);
+    }
+    for (run, idx) in groups {
+        out.push((run, take_record_batch(chunk, &UInt32Array::from(idx))?));
+    }
+    Ok(())
+}
+
+/// Runs `reads`, `READ_CONCURRENCY` at a time; the results in order.
+async fn in_order<T, E: Into<IngestError>>(
+    reads: Vec<impl std::future::Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, IngestError> {
+    futures::stream::iter(reads)
+        .buffered(READ_CONCURRENCY)
+        .map_err(Into::into)
+        .try_collect()
+        .await
+}
+
+/// Context from merged CONTEXT_COLUMNS rows (borrowing their dotted_order values).
+fn context(chunks: &[RecordBatch]) -> Result<Context<'_>, IngestError> {
+    let mut out = Context::default();
     for m in chunks {
         let s = m.schema();
         let parent = m.column(s.index_of(col::PARENT_SPAN_ID)?).as_binary::<i32>();
@@ -526,24 +611,41 @@ fn context(chunks: &[RecordBatch]) -> Result<Context, IngestError> {
                 None
             };
             let st = start.is_valid(i).then(|| start.value(i));
-            out.insert(k, (p, st, dotted.is_valid(i).then(|| dotted.value(i).to_string())));
+            out.insert(k, (p, st, dotted.is_valid(i).then(|| dotted.value(i))));
         }
     }
     Ok(out)
 }
 
+struct Filled {
+    batch: RecordBatch,
+    fills: u64,
+    backfills: u64,
+    /// Some null dotted_order got a value (the rows may need a re-sort).
+    dotted_filled: bool,
+}
+
 /// Start fill (CR §2.4) and dotted_order (D5): a null start or dotted_order takes the key's value from OLDER
 /// context rows (`old`); then the remaining nulls are backfilled by the one walk over the merged rows plus every
-/// context node (`all`; an ancestor's existing value is the prefix). Returns the new batch, #fills, #backfills.
-fn fill(m: &RecordBatch, old: &Context, all: &Context) -> Result<(RecordBatch, u64, u64), IngestError> {
-    let ks = span_keys(m)?;
+/// context node (`all`; an ancestor's existing value is the prefix).
+fn fill<'a>(m: &'a RecordBatch, old: &Context<'a>, all: &Context<'a>) -> Result<Filled, IngestError> {
     let start = m
         .column(col_idx(col::START_TIME))
         .as_primitive::<TimestampNanosecondType>();
-    let parent = m.column(col_idx(col::PARENT_SPAN_ID)).as_binary::<i32>();
     let dotted = m.column(col_idx(col::DOTTED_ORDER)).as_string::<i32>();
-    let mut nodes = all.clone();
+    if start.null_count() == 0 && dotted.null_count() == 0 {
+        return Ok(Filled {
+            batch: m.clone(),
+            fills: 0,
+            backfills: 0,
+            dotted_filled: false,
+        });
+    }
+    let ks = span_keys(m)?;
+    let parent = m.column(col_idx(col::PARENT_SPAN_ID)).as_binary::<i32>();
     let (mut fills, mut starts, mut dotteds, mut want) = (0u64, Vec::new(), Vec::new(), Vec::new());
+    let mut dotted_from_old = false;
+    let mut rows: Vec<(Key, Node<'a, Key>)> = Vec::with_capacity(ks.len());
     for (i, k) in ks.iter().enumerate() {
         let o = old.get(k);
         let st = if start.is_valid(i) {
@@ -554,9 +656,11 @@ fn fill(m: &RecordBatch, old: &Context, all: &Context) -> Result<(RecordBatch, u
             s
         };
         let d = if dotted.is_valid(i) {
-            Some(dotted.value(i).to_string())
+            Some(dotted.value(i))
         } else {
-            o.and_then(|o| o.2.clone())
+            let d = o.and_then(|o| o.2);
+            dotted_from_old |= d.is_some();
+            d
         };
         let p = if parent.is_valid(i) {
             Some((k.0, SpanId::from_slice(parent.value(i))?))
@@ -566,19 +670,31 @@ fn fill(m: &RecordBatch, old: &Context, all: &Context) -> Result<(RecordBatch, u
         if d.is_none() {
             want.push(*k);
         }
-        nodes.insert(*k, (p, st, d.clone()));
+        rows.push((*k, (p, st, d)));
         starts.push(st);
         dotteds.push(d);
     }
-    let resolved = resolve_with_known(&nodes, want);
+    let resolved = if want.is_empty() {
+        Map::default()
+    } else {
+        let mut nodes = all.clone();
+        nodes.extend(rows);
+        resolve_with_known(&nodes, want)
+    };
+    let dotted_filled = dotted_from_old || !resolved.is_empty();
     let new_dotted: StringArray = dotteds
         .into_iter()
         .zip(&ks)
-        .map(|(d, k)| d.or_else(|| resolved.get(k).cloned()))
+        .map(|(d, k)| d.or_else(|| resolved.get(k).map(String::as_str)))
         .collect();
     let new_start: ArrayRef = Arc::new(TimestampNanosecondArray::from(starts).with_timezone(TIMEZONE));
     let mut cols = m.columns().to_vec();
     cols[col_idx(col::START_TIME)] = new_start;
     cols[col_idx(col::DOTTED_ORDER)] = Arc::new(new_dotted);
-    Ok((RecordBatch::try_new(m.schema(), cols)?, fills, resolved.len() as u64))
+    Ok(Filled {
+        batch: RecordBatch::try_new(m.schema(), cols)?,
+        fills,
+        backfills: resolved.len() as u64,
+        dotted_filled,
+    })
 }

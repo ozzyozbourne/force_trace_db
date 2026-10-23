@@ -119,6 +119,14 @@ impl Metastore for HookedMetastore {
         (self.hook)().await;
         r
     }
+    async fn locate_l1_traces(
+        &self,
+        project: &ProjectId,
+        traces: &[TraceId],
+        exclude: &std::collections::BTreeSet<SegmentId>,
+    ) -> MetaResult<HashMap<TraceId, Vec<TraceLocation>>> {
+        self.inner.locate_l1_traces(project, traces, exclude).await
+    }
     async fn expire_segments(&self, p: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
         self.inner.expire_segments(p, cutoff_ns, max_hours).await
     }
@@ -137,7 +145,7 @@ impl Metastore for HookedMetastore {
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
         self.inner.begin_compaction(r).await
     }
-    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
+    async fn commit_compaction(&self, c: Arc<CompactionCommit>) -> MetaResult<()> {
         self.commit_calls.fetch_add(1, Ordering::SeqCst);
         match self.commit {
             Some((land, err)) => {
@@ -164,7 +172,7 @@ impl Metastore for HookedMetastore {
     async fn set_retention_days(&self, p: &ProjectId, days: Option<u32>) -> MetaResult<()> {
         self.inner.set_retention_days(p, days).await
     }
-    async fn blob_refs(&self, p: &ProjectId) -> MetaResult<std::collections::HashSet<String>> {
-        self.inner.blob_refs(p).await
+    async fn referenced_blobs(&self, p: &ProjectId, paths: &[String]) -> MetaResult<std::collections::HashSet<String>> {
+        self.inner.referenced_blobs(p, paths).await
     }
 }

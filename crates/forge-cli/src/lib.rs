@@ -427,9 +427,9 @@ async fn gc(
     };
     let now = forge_model::time::now_ms();
     let store = o.segments.object_store();
-    // `Offline::open` holds every node's WAL lock: no other writer can put blobs, so an empty guard is exact.
+    // `Offline::open` holds every node's WAL lock: no other writer can put blobs.
     let clocks = forge_model::time::Clocks::at(now, now);
-    let blobs = forge_ingest::blob::BlobGuard::default();
+    let blobs = forge_ingest::blob::BlobGuard::exclusive();
     let mut r = forge_ingest::lifecycle::run_gc(o.meta.as_ref(), store.as_ref(), &clocks, &opts, &blobs).await?;
     if !unflushed.is_empty() {
         r.blobs_skipped = Some(format!("{}: run forge serve once", unflushed.join(", ")));

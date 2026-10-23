@@ -42,9 +42,20 @@ pub fn plan_blobs(rows: &mut [SpanRow], threshold: usize) -> HashMap<String, Byt
 pub struct BlobGuard {
     lock: tokio::sync::RwLock<()>,
     recent: std::sync::Mutex<HashSet<String>>,
+    /// No `put_blobs` can run during a sweep (see `exclusive`).
+    pub(crate) exclusive: bool,
 }
 
 impl BlobGuard {
+    /// For offline callers (`forge gc`) that hold every WAL lock: no ingest runs, so no blob is put or refreshed
+    /// during the sweep and its re-check HEAD is skipped.
+    pub fn exclusive() -> Self {
+        Self {
+            exclusive: true,
+            ..Self::default()
+        }
+    }
+
     /// Sweep start (before listing): forget the paths of earlier puts.
     pub fn clear_recent(&self) {
         self.recent.lock().unwrap().clear();

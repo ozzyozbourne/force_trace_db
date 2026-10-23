@@ -41,17 +41,33 @@ const MAX_POSTS: u64 = 120;
 // ---------------------------------------------------------------------------------------------------------------
 // A segment store whose writes into some hours are slowed (varies the commit order of concurrent jobs, step e).
 
-/// (hour, slow inside the hour?): writes with (partition_hour == hour) == slow_inside sleep.
-type Delay = Arc<Mutex<Option<(HourBucket, bool)>>>;
+/// Writes with (partition_hour == hour) == slow_inside wait until one of the two jobs has returned (`done`), or
+/// 30 ms at most.
+#[derive(Clone)]
+struct Delay {
+    /// (hour, slow inside the hour?)
+    slow: Arc<Mutex<Option<(HourBucket, bool)>>>,
+    done: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for Delay {
+    fn default() -> Self {
+        Self {
+            slow: Arc::default(),
+            done: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+}
 
 fn delay_store(inner: Arc<dyn SegmentStore>, delay: Delay) -> Arc<dyn SegmentStore> {
     Arc::new(HookedSegmentStore::new(
         inner,
         Box::new(move |spec| {
-            let slow = matches!(*delay.lock().unwrap(), Some((h, inside)) if (spec.partition_hour == h) == inside);
+            let slow = matches!(*delay.slow.lock().unwrap(), Some((h, inside)) if (spec.partition_hour == h) == inside);
+            let mut done = delay.done.subscribe();
             Box::pin(async move {
                 if slow {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let _ = tokio::time::timeout(Duration::from_millis(30), done.wait_for(|d| *d)).await;
                 }
                 Ok(())
             })
@@ -772,11 +788,18 @@ impl World {
             }
             self.flush().await;
         }
-        *self.delay.lock().unwrap() = Some((hour, r.chance(50)));
+        self.delay.done.send_replace(false);
+        *self.delay.slow.lock().unwrap() = Some((hour, r.chance(50)));
         let (cfg_a, cfg_b) = (random_cfg(r, 4), random_cfg(r, 4));
         let (cxa, cxb) = (self.ctx(cfg_a), self.ctx(cfg_b));
-        let (ra, rb) = tokio::join!(job::run_job(&cxa, ja), job::run_job(&cxb, jb));
-        *self.delay.lock().unwrap() = None;
+        let done = |j| {
+            self.delay.done.send_replace(true);
+            j
+        };
+        let (ra, rb) = tokio::join!(async { done(job::run_job(&cxa, ja).await) }, async {
+            done(job::run_job(&cxb, jb).await)
+        });
+        *self.delay.slow.lock().unwrap() = None;
         let (ra, rb) = (
             ra.unwrap_or_else(|e| panic!("seed {seed}: kind A failed: {e}")),
             rb.unwrap_or_else(|e| panic!("seed {seed}: kind B failed: {e}")),

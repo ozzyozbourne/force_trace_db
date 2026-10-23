@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["mimalloc"]
+# mimalloc as the global allocator (glibc malloc kept ~5 GiB RSS in the M3 soak; plans/phase-4 §10.5).
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 forge-storage.workspace = true
 forge-model.workspace = true
@@ -24,6 +29,7 @@ reqwest.workspace = true
 serde_json.workspace = true
 forge-ingest.workspace = true
 humantime-serde.workspace = true
+mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 forge-ingest = { workspace = true, features = ["test-util"] }

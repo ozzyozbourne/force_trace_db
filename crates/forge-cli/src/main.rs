@@ -1,4 +1,9 @@
 use clap::Parser;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = forge_cli::run(forge_cli::Cli::parse()).await {

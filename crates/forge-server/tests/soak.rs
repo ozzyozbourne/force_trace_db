@@ -7,6 +7,11 @@
 //! Env: FORGE_SOAK_SECS (default 900), FORGE_SOAK_RATE (spans/s of first posts, default 20000).
 #![allow(clippy::print_stdout)]
 use bytesize::ByteSize;
+
+/// The shipped binary's allocator (forge-cli `mimalloc` feature), so the measured RSS matches what ships.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use forge_ingest::compact::{CompactCtx, L1_MAX_RUNS, compact_project};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
 use forge_ingest::{Ingest, IngestError};

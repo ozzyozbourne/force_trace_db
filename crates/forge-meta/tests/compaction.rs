@@ -4,6 +4,7 @@ use forge_model::catalog::*;
 use forge_model::ids::TraceId;
 use forge_model::testing::{pid, segment_meta};
 use rusqlite::Connection;
+use std::sync::Arc;
 
 fn seg(level: Level, hour: i64, v: (u64, u64), trace: u8) -> NewSegment {
     let t = TraceId([trace; 16]);
@@ -77,12 +78,12 @@ impl Db {
     }
 }
 
-fn commit(job: &CompactionJob, outputs: Vec<NewSegment>) -> CompactionCommit {
-    CompactionCommit {
+fn commit(job: &CompactionJob, outputs: Vec<NewSegment>) -> Arc<CompactionCommit> {
+    Arc::new(CompactionCommit {
         job_id: job.id,
         outputs,
         max_age_ms: 3_600_000,
-    }
+    })
 }
 
 #[tokio::test]
@@ -223,10 +224,11 @@ async fn swap_retry_fail_reset_prune() {
     let j3 = d.begin(JobKind::L0, &[&b]).await.unwrap();
     let o3 = seg(Level::L1, 1, (12, 13), 2);
     let e =
-        d.m.commit_compaction(CompactionCommit {
+        d.m.commit_compaction(Arc::new(CompactionCommit {
+            job_id: j3.id,
+            outputs: vec![o3.clone()],
             max_age_ms: -1,
-            ..commit(&j3, vec![o3.clone()])
-        })
+        }))
         .await
         .unwrap_err();
     assert!(matches!(&e, MetaError::Conflict(m) if m.contains("max age")), "{e:?}");

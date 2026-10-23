@@ -216,6 +216,14 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
         project: &ProjectId,
         traces: &[TraceId],
     ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>>;
+    /// Compaction context: `locate_traces` restricted to L1 segments outside `exclude` (other rows are skipped
+    /// before they are decoded).
+    async fn locate_l1_traces(
+        &self,
+        project: &ProjectId,
+        traces: &[TraceId],
+        exclude: &std::collections::BTreeSet<SegmentId>,
+    ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>>;
 
     // ---- lifecycle (M3): retention, purge, orphan GC ----
 
@@ -245,9 +253,13 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize>;
     /// Object paths (`.vortex`) of every segments row of `project`, any state: the orphan GC's "known" set.
     async fn segment_paths(&self, project: &ProjectId) -> MetaResult<std::collections::HashSet<String>>;
-    /// Blob paths referenced by any segments row of `project` (any state: a deleted segment's blobs are kept until
-    /// its row is forgotten, i.e. after its objects are gone).
-    async fn blob_refs(&self, project: &ProjectId) -> MetaResult<std::collections::HashSet<String>>;
+    /// The blob paths among `paths` that some segments row of `project` references (any state: a deleted segment's
+    /// blobs are kept until its row is forgotten, i.e. after its objects are gone). Looked up in chunks.
+    async fn referenced_blobs(
+        &self,
+        project: &ProjectId,
+        paths: &[String],
+    ) -> MetaResult<std::collections::HashSet<String>>;
     /// Sets (None = keep forever) a project's retention, creating the project if absent. `InvalidInput` for 0.
     async fn set_retention_days(&self, project: &ProjectId, days: Option<u32>) -> MetaResult<()>;
 
@@ -258,7 +270,7 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>>;
     /// The atomic swap (D6). Ok if the job is already done (idempotent retry). Conflict if it is failed, or older
     /// than `max_age_ms`.
-    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()>;
+    async fn commit_compaction(&self, c: Arc<CompactionCommit>) -> MetaResult<()>;
     /// running -> failed, inputs -> live. Returns the job's final status (Done if the commit had landed).
     async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus>;
     /// Startup (one process per data dir): every running job -> failed, its inputs -> live. Returns the count.

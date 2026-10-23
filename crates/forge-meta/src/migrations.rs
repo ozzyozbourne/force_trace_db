@@ -6,6 +6,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 pub const MIGRATIONS: &[(u32, &str, &str)] = &[
     (1, "initial", include_str!("sql/0001_initial.sql")),
     (2, "compaction", include_str!("sql/0002_compaction.sql")),
+    (3, "jobs_finished", include_str!("sql/0003_jobs_finished.sql")),
 ];
 
 /// The binary's schema version.

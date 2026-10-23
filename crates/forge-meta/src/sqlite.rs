@@ -226,6 +226,15 @@ static EXPIRE: LazyLock<String> = LazyLock::new(|| {
          RETURNING {SEGMENT_COLS}"
     )
 });
+/// LOCATE_TRACE for L1 segments only.
+static LOCATE_L1_TRACE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SEGMENT_COLS}, ti_start, ti_count FROM segments JOIN \
+         (SELECT segment_id, row_start AS ti_start, row_count AS ti_count FROM trace_index \
+          WHERE project_id = ?1 AND trace_id = ?2) ON id = segment_id \
+         WHERE state <> 'deleted' AND level = 1 ORDER BY id"
+    )
+});
 static EXPIRE_DRY_RUN: LazyLock<String> =
     LazyLock::new(|| format!("SELECT {SEGMENT_COLS} FROM segments WHERE id IN ({EXPIRE_CANDIDATES})"));
 static PURGE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
@@ -272,27 +281,43 @@ fn read_only_conn(path: &Path, immutable: bool) -> MetaResult<Connection> {
     Ok(c)
 }
 
-/// Runs the LOCATE_TRACE statement for one trace.
+/// Runs a LOCATE_TRACE statement for one trace; rows of segments in `exclude` are skipped undecoded.
 fn locations(
     st: &mut rusqlite::CachedStatement<'_>,
     project: &ProjectId,
     trace: TraceId,
+    exclude: &HashSet<String>,
 ) -> MetaResult<Vec<TraceLocation>> {
-    let rows = st.query_map(params![project.as_str(), trace.as_bytes()], |r| {
-        Ok((
-            segment_from_row(r),
-            r.get::<_, i64>("ti_start")?,
-            r.get::<_, i64>("ti_count")?,
-        ))
-    })?;
+    let mut rows = st.query(params![project.as_str(), trace.as_bytes()])?;
     let mut out = Vec::new();
-    for r in rows {
-        let (seg, start, count) = r?;
+    while let Some(r) = rows.next()? {
+        if !exclude.is_empty() && exclude.contains(&r.get::<_, String>("id")?) {
+            continue;
+        }
         out.push(TraceLocation {
-            segment: seg?,
-            row_start: to_u64("trace_index", start)?,
-            row_count: to_u64("trace_index", count)?,
+            segment: segment_from_row(r)?,
+            row_start: to_u64("trace_index", r.get("ti_start")?)?,
+            row_count: to_u64("trace_index", r.get("ti_count")?)?,
         });
+    }
+    Ok(out)
+}
+
+/// `locations` per trace with one cached statement; traces with none are absent.
+fn locations_of(
+    c: &Connection,
+    sql: &str,
+    project: &ProjectId,
+    traces: Vec<TraceId>,
+    exclude: &HashSet<String>,
+) -> MetaResult<HashMap<TraceId, Vec<TraceLocation>>> {
+    let mut st = c.prepare_cached(sql)?;
+    let mut out = HashMap::new();
+    for t in traces {
+        let locs = locations(&mut st, project, t, exclude)?;
+        if !locs.is_empty() {
+            out.insert(t, locs);
+        }
     }
     Ok(out)
 }
@@ -544,12 +569,8 @@ fn placeholders(n: usize) -> String {
 /// one huge delete (an hour's L1 segment holds ~720k trace rows at 200 traces/s).
 const TRACE_INDEX_PURGE_CHUNK: usize = 20_000;
 
-/// The first column of `sql` (one `?1` = project id) as a set.
-fn string_set(c: &Connection, sql: &str, project: &ProjectId) -> MetaResult<HashSet<String>> {
-    let mut st = c.prepare_cached(sql)?;
-    let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
+/// Ids per dynamic `IN (..)` list.
+const ID_CHUNK: usize = 500;
 
 /// A commit lists each segment once.
 fn unique_segments(segs: &[NewSegment]) -> MetaResult<()> {
@@ -981,7 +1002,7 @@ impl Metastore for SqliteMetastore {
 
     async fn locate_trace(&self, project: &ProjectId, trace: TraceId) -> MetaResult<Vec<TraceLocation>> {
         let project = project.clone();
-        self.read(move |c| locations(&mut c.prepare_cached(&LOCATE_TRACE)?, &project, trace))
+        self.read(move |c| locations(&mut c.prepare_cached(&LOCATE_TRACE)?, &project, trace, &HashSet::new()))
             .await
     }
 
@@ -993,18 +1014,21 @@ impl Metastore for SqliteMetastore {
         let project = project.clone();
         let traces = traces.to_vec();
         // One lock and one blocking task; the cached LOCATE_TRACE statement per id (no generated SQL).
-        self.read(move |c| {
-            let mut st = c.prepare_cached(&LOCATE_TRACE)?;
-            let mut out: HashMap<TraceId, Vec<TraceLocation>> = HashMap::new();
-            for t in traces {
-                let locs = locations(&mut st, &project, t)?;
-                if !locs.is_empty() {
-                    out.insert(t, locs);
-                }
-            }
-            Ok(out)
-        })
-        .await
+        self.read(move |c| locations_of(c, &LOCATE_TRACE, &project, traces, &HashSet::new()))
+            .await
+    }
+
+    async fn locate_l1_traces(
+        &self,
+        project: &ProjectId,
+        traces: &[TraceId],
+        exclude: &BTreeSet<SegmentId>,
+    ) -> MetaResult<HashMap<TraceId, Vec<TraceLocation>>> {
+        let project = project.clone();
+        let traces = traces.to_vec();
+        let exclude: HashSet<String> = exclude.iter().map(ToString::to_string).collect();
+        self.read(move |c| locations_of(c, &LOCATE_L1_TRACE, &project, traces, &exclude))
+            .await
     }
 
     async fn expire_segments(
@@ -1049,32 +1073,41 @@ impl Metastore for SqliteMetastore {
     }
 
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
+        let ids: Arc<Vec<String>> = Arc::new(ids.iter().map(SegmentId::to_string).collect());
+        // Short txns: each deletes <= TRACE_INDEX_PURGE_CHUNK trace rows of deleted segments, filled across
+        // segments (one project per segment); `done` = segments whose trace rows are all gone.
+        let mut done = 0;
+        while done < ids.len() {
+            let ids = ids.clone();
+            done = self
+                .write(move |tx| {
+                    let mut st = tx.prepare_cached(
+                        "DELETE FROM trace_index WHERE segment_id = ?1 AND trace_id IN \
+                         (SELECT trace_id FROM trace_index WHERE segment_id = ?1 LIMIT ?2) \
+                         AND EXISTS (SELECT 1 FROM segments WHERE id = ?1 AND state = 'deleted')",
+                    )?;
+                    let (mut i, mut budget) = (done, TRACE_INDEX_PURGE_CHUNK);
+                    while i < ids.len() && budget > 0 {
+                        let n = st.execute(params![ids[i], budget as i64])?;
+                        if n == budget {
+                            break; // the budget is spent; this segment may have more rows
+                        }
+                        (i, budget) = (i + 1, budget - n);
+                    }
+                    Ok(i)
+                })
+                .await?;
+        }
         let mut removed = 0;
-        let chunk = TRACE_INDEX_PURGE_CHUNK as i64;
-        for id in ids.iter().map(SegmentId::to_string) {
-            // Short txns: each deletes <= chunk trace rows of one deleted segment (one project per segment).
-            loop {
-                let id = id.clone();
-                let n = self
-                    .write(move |tx| {
-                        Ok(tx
-                            .prepare_cached(
-                                "DELETE FROM trace_index WHERE segment_id = ?1 AND trace_id IN \
-                                 (SELECT trace_id FROM trace_index WHERE segment_id = ?1 LIMIT ?2) \
-                                 AND EXISTS (SELECT 1 FROM segments WHERE id = ?1 AND state = 'deleted')",
-                            )?
-                            .execute(params![id, chunk])?)
-                    })
-                    .await?;
-                if (n as i64) < chunk {
-                    break;
-                }
-            }
+        for chunk in ids.chunks(ID_CHUNK) {
+            let chunk = chunk.to_vec();
             removed += self
                 .write(move |tx| {
-                    Ok(tx
-                        .prepare_cached("DELETE FROM segments WHERE id = ?1 AND state = 'deleted'")?
-                        .execute([id])?)
+                    let sql = format!(
+                        "DELETE FROM segments WHERE state = 'deleted' AND id IN ({})",
+                        placeholders(chunk.len())
+                    );
+                    Ok(tx.prepare(&sql)?.execute(rusqlite::params_from_iter(&chunk))?)
                 })
                 .await?;
         }
@@ -1083,8 +1116,12 @@ impl Metastore for SqliteMetastore {
 
     async fn segment_paths(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
         let project = project.clone();
-        self.read(move |c| string_set(c, "SELECT path FROM segments WHERE project_id = ?1", &project))
-            .await
+        self.read(move |c| {
+            let mut st = c.prepare_cached("SELECT path FROM segments WHERE project_id = ?1")?;
+            let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
     }
 
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
@@ -1094,7 +1131,7 @@ impl Metastore for SqliteMetastore {
         self.write(move |tx| begin_in_txn(tx, &r, now_ms())).await
     }
 
-    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
+    async fn commit_compaction(&self, c: Arc<CompactionCommit>) -> MetaResult<()> {
         unique_segments(&c.outputs)?;
         self.write(move |tx| commit_compaction_in_txn(tx, &c, now_ms())).await
     }
@@ -1171,10 +1208,26 @@ impl Metastore for SqliteMetastore {
         .await
     }
 
-    async fn blob_refs(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
+    async fn referenced_blobs(&self, project: &ProjectId, paths: &[String]) -> MetaResult<HashSet<String>> {
         let project = project.clone();
-        self.read(move |c| string_set(c, "SELECT DISTINCT path FROM blob_refs WHERE project_id = ?1", &project))
-            .await
+        let paths = paths.to_vec();
+        self.read(move |c| {
+            let mut out = HashSet::new();
+            for chunk in paths.chunks(ID_CHUNK) {
+                let sql = format!(
+                    "SELECT DISTINCT path FROM blob_refs WHERE project_id = ? AND path IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut st = c.prepare(&sql)?;
+                let p = std::iter::once(project.as_str()).chain(chunk.iter().map(String::as_str));
+                let rows = st.query_map(rusqlite::params_from_iter(p), |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    out.insert(r?);
+                }
+            }
+            Ok(out)
+        })
+        .await
     }
 }
 

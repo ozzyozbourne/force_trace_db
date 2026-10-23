@@ -5,6 +5,7 @@ use arrow::record_batch::RecordBatch;
 use forge_meta::NewSegment;
 use forge_model::catalog::paths;
 use forge_storage::{SegmentSpec, SegmentStore, StorageResult, WrittenSegment};
+use futures::future::{AbortHandle, Aborted, abortable};
 use futures::{SinkExt, StreamExt};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -12,8 +13,10 @@ use std::sync::Arc;
 pub struct SegmentSink {
     objects: [String; 2],
     tx: futures::channel::mpsc::Sender<RecordBatch>,
-    /// Some until `finish`; dropping an unfinished sink aborts the writer (nothing is uploaded).
-    handle: Option<tokio::task::JoinHandle<StorageResult<WrittenSegment>>>,
+    /// The writer, on the blocking pool (the Vortex encode is CPU work). Some until `finish`.
+    handle: Option<tokio::task::JoinHandle<Result<StorageResult<WrittenSegment>, Aborted>>>,
+    /// Dropping an unfinished sink aborts the writer (nothing is uploaded).
+    abort: AbortHandle,
     blobs: BTreeSet<String>,
 }
 
@@ -22,11 +25,14 @@ impl SegmentSink {
     pub fn open(store: Arc<dyn SegmentStore>, spec: SegmentSpec) -> Result<Self, IngestError> {
         let path = paths::segment_path(&spec.project_id, spec.level, spec.partition_hour, spec.id)?;
         let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(2);
-        let handle = tokio::spawn(async move { store.write_segment(spec, rx.map(Ok).boxed()).await });
+        let (write, abort) = abortable(async move { store.write_segment(spec, rx.map(Ok).boxed()).await });
+        let rt = tokio::runtime::Handle::current();
+        let handle = tokio::task::spawn_blocking(move || rt.block_on(write));
         Ok(Self {
             objects: paths::segment_objects(&path),
             tx,
             handle: Some(handle),
+            abort,
             blobs: BTreeSet::new(),
         })
     }
@@ -47,9 +53,14 @@ impl SegmentSink {
         Ok(())
     }
 
+    /// Ends the input; the upload goes on (`finish` waits for it).
+    pub fn close(&mut self) {
+        self.tx.close_channel();
+    }
+
     /// Ends the input and waits for the upload.
     pub async fn finish(mut self) -> Result<NewSegment, IngestError> {
-        self.tx.close_channel();
+        self.close();
         let w = join(self.handle.take().expect("not finished")).await?;
         Ok(NewSegment {
             meta: w.meta,
@@ -59,15 +70,20 @@ impl SegmentSink {
     }
 }
 
-async fn join(h: tokio::task::JoinHandle<StorageResult<WrittenSegment>>) -> Result<WrittenSegment, IngestError> {
-    Ok(h.await
-        .map_err(|e| IngestError::Internal(format!("segment writer: {e}")))??)
+async fn join(
+    h: tokio::task::JoinHandle<Result<StorageResult<WrittenSegment>, Aborted>>,
+) -> Result<WrittenSegment, IngestError> {
+    let w = h
+        .await
+        .map_err(|e| IngestError::Internal(format!("segment writer: {e}")))?
+        .map_err(|_| IngestError::Internal("segment writer aborted".into()))?;
+    Ok(w?)
 }
 
 impl Drop for SegmentSink {
     fn drop(&mut self) {
-        if let Some(h) = &self.handle {
-            h.abort();
+        if self.handle.is_some() {
+            self.abort.abort();
         }
     }
 }

@@ -207,8 +207,8 @@ const COMPACTION_ON: [(&str, &str); 6] = [
     ("FORGE_COMPACTION__INTERVAL", "200ms"),
     ("FORGE_COMPACTION__L0_TRIGGER", "2"),
     ("FORGE_COMPACTION__L0_MAX_AGE", "1s"),
-    ("FORGE_COMPACTION__GC_INTERVAL", "1s"),
-    ("FORGE_COMPACTION__GC_GRACE", "1s"),
+    ("FORGE_COMPACTION__GC_INTERVAL", "300ms"),
+    ("FORGE_COMPACTION__GC_GRACE", "200ms"),
     ("FORGE_MEMTABLE__FLUSH_BYTES", "512KiB"),
 ];
 
@@ -467,7 +467,11 @@ impl Case {
 
 /// Load until the failpoint SIGKILLs the server, restart, verify (A–O). A compaction/GC failpoint passes
 /// `Some(after_restart)`: the load runs with compaction on, then `after_restart` (before S, whose `forge compact`
-/// adds jobs), then P, R, S.
+/// adds jobs), then P and R; the full S (offline compact + gc, answers unchanged) only for `FULL_S`.
+/// The compaction failpoints that also run S (one inside the swap txn, one inside GC); S is costly (many
+/// `forge sql` processes) and the other cases add no S-specific state.
+const FULL_S: [&str; 2] = ["meta_compact_in_txn@1", "gc_after_object_delete@1"];
+
 async fn crash_case(fp: &str, interval: &str, orphans: Orphans, compaction: Option<fn(&Path)>) -> Replay {
     let c = Case::new("5s");
     let extra: &[_] = if compaction.is_some() { &COMPACTION_ON } else { &[] };
@@ -477,7 +481,12 @@ async fn crash_case(fp: &str, interval: &str, orphans: Orphans, compaction: Opti
     verify_with_sql(c.dir(), &c.ledger, orphans, &ctx).await;
     if let Some(after_restart) = compaction {
         after_restart(c.dir());
-        check_prs(c.dir(), &ctx).await;
+        if FULL_S.contains(&fp) {
+            check_prs(c.dir(), &ctx).await;
+        } else {
+            assert!(p_holds(c.dir()), "{ctx} P: compacting segments or running jobs");
+            check_r(c.dir(), &ctx).await;
+        }
     }
     replay
 }

@@ -25,6 +25,7 @@ bytesize.workspace = true
 humantime-serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+foldhash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

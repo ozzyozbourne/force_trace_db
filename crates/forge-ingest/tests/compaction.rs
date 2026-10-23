@@ -379,9 +379,9 @@ async fn upload_failure_deletes_uploads() {
     assert!(rep.outputs.len() > 1);
     for s in w.l1().await {
         let b = w.store.scan_all(&s, ScanRequest::default()).await.unwrap();
-        let mut refs: Vec<String> = w.meta.blob_refs(&pid("p")).await.unwrap().into_iter().collect();
-        refs.sort();
-        for path in blob_refs_in(&b) {
+        let paths = blob_refs_in(&b);
+        let refs = w.meta.referenced_blobs(&pid("p"), &paths).await.unwrap();
+        for path in paths {
             assert!(refs.contains(&path), "{path}");
         }
     }
