@@ -7,7 +7,9 @@ mod common;
 
 use common::*;
 use forge_meta::{Metastore, SqliteMetastore};
+use forge_model::catalog::{Level, paths};
 use forge_model::row::SpanRow;
+use forge_model::schema::ALL_COLUMNS;
 use forge_model::testing::{RowKey, files_under, row_key};
 use opentelemetry_proto::tonic::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -185,10 +187,13 @@ async fn join(tasks: Vec<tokio::task::JoinHandle<()>>) {
 // Server lifecycle
 // ---------------------------------------------------------------------------------------------------------------
 
+/// Compaction and GC are off unless a case passes `COMPACTION_ON` (later entries win).
 fn env<'a>(failpoint: Option<&'a str>, interval: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
     let mut e = vec![
         ("FORGE_WAL__SEGMENT_BYTES", "256KiB"),
         ("FORGE_MEMTABLE__FLUSH_INTERVAL", interval),
+        ("FORGE_COMPACTION__INTERVAL", "0s"),
+        ("FORGE_COMPACTION__GC_INTERVAL", "0s"),
     ];
     if let Some(fp) = failpoint {
         e.push(("FORGE_FAILPOINT", fp));
@@ -196,6 +201,16 @@ fn env<'a>(failpoint: Option<&'a str>, interval: &'a str, extra: &[(&'a str, &'a
     e.extend_from_slice(extra);
     e
 }
+
+/// The first run of each compaction case: small L0s, eager jobs and GC.
+const COMPACTION_ON: [(&str, &str); 6] = [
+    ("FORGE_COMPACTION__INTERVAL", "200ms"),
+    ("FORGE_COMPACTION__L0_TRIGGER", "2"),
+    ("FORGE_COMPACTION__L0_MAX_AGE", "1s"),
+    ("FORGE_COMPACTION__GC_INTERVAL", "1s"),
+    ("FORGE_COMPACTION__GC_GRACE", "1s"),
+    ("FORGE_MEMTABLE__FLUSH_BYTES", "512KiB"),
+];
 
 fn assert_killed(st: std::process::ExitStatus, logs: &str, failpoint: Option<&str>) {
     assert_eq!(st.signal(), Some(9), "expected SIGKILL, got {st}\n{logs}");
@@ -365,8 +380,12 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) -> usi
     let wal_files = forge_ingest::wal::list_segments(&wal_dir).expect("list wal").len();
     assert!(wal_files <= 2, "{ctx} G: {wal_files} WAL files left");
 
-    // H: orphan objects (on disk, not visible). `*.vortex#N` staging files are reported, not counted.
-    let visible_paths: HashSet<_> = segs.iter().map(|s| dir.join("data").join(&s.path)).collect();
+    // H: orphan objects (on disk, with no `segments` row in any state: a compacted-away input waiting for its
+    // purge is not an orphan). `*.vortex#N` staging files are reported, not counted.
+    let known: HashSet<_> = segment_paths(dir, "1")
+        .into_iter()
+        .map(|p| dir.join("data").join(p))
+        .collect();
     let (mut on_disk, mut staging) = (Vec::new(), Vec::new());
     for p in files_under(&dir.join("data/segments")) {
         let name = p.to_string_lossy();
@@ -376,7 +395,7 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) -> usi
             staging.push(p);
         }
     }
-    let n = on_disk.iter().filter(|p| !visible_paths.contains(*p)).count();
+    let n = on_disk.iter().filter(|p| !known.contains(*p)).count();
     if !staging.is_empty() {
         eprintln!("{ctx}: {} staging files: {staging:?}", staging.len());
     }
@@ -428,8 +447,8 @@ impl Case {
     }
 
     /// Load until the failpoint SIGKILLs the server.
-    async fn kill_under_load(&self, fp: &str, interval: &str) {
-        let (mut s, p) = spawn_ready(self.dir(), Some(&self.cfg), &env(Some(fp), interval, &[])).await;
+    async fn kill_under_load(&self, fp: &str, interval: &str, extra: &[(&str, &str)]) {
+        let (mut s, p) = spawn_ready(self.dir(), Some(&self.cfg), &env(Some(fp), interval, extra)).await;
         let tasks = load(p, 0, &self.ledger, Duration::ZERO).await;
         let st = s.wait_exit(Duration::from_secs(20)).await;
         assert_killed(st, &s.logs(), Some(fp));
@@ -449,7 +468,7 @@ impl Case {
 /// Load until the failpoint SIGKILLs the server, restart, verify.
 async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
     let c = Case::new("5s");
-    c.kill_under_load(fp, interval).await;
+    c.kill_under_load(fp, interval, &[]).await;
     let replay = restart_and_post(c.dir(), &c.ledger).await;
     verify_with_sql(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
     replay
@@ -469,6 +488,134 @@ async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &st
     ]);
     assert!(o.status.success(), "{ctx}: {o:?}");
     assert_eq!(common::sql_count(&o), n as u64, "{ctx}: forge sql count");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Compaction checks P, R, S (plan §6.4), on a stopped server
+// ---------------------------------------------------------------------------------------------------------------
+
+fn db(dir: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(dir.join("meta.db")).expect("meta.db")
+}
+
+fn count(dir: &Path, sql: &str) -> i64 {
+    db(dir).query_row(sql, [], |r| r.get(0)).expect(sql)
+}
+
+/// `path` of every `segments` row matching `cond`.
+fn segment_paths(dir: &Path, cond: &str) -> Vec<String> {
+    let c = db(dir);
+    let mut st = c
+        .prepare(&format!("SELECT path FROM segments WHERE {cond}"))
+        .expect("prepare");
+    st.query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+/// P: no `compacting` segment and no `running` job.
+fn check_p(dir: &Path, ctx: &str) {
+    let compacting = count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'");
+    let running = count(dir, "SELECT count(*) FROM compaction_jobs WHERE status = 'running'");
+    assert_eq!(
+        (compacting, running),
+        (0, 0),
+        "{ctx} P: compacting segments, running jobs"
+    );
+}
+
+/// R (sticky): every key of the visible L1 segments lies in one hour. Returns the number of L1 segments.
+async fn check_r(dir: &Path, ctx: &str) -> usize {
+    let (segs, rows) = visible(dir).await;
+    let mut hour: HashMap<RowKey, i64> = HashMap::new();
+    let mut rows = rows.iter();
+    for s in &segs {
+        for r in rows.by_ref().take(s.row_count as usize) {
+            if s.level == Level::L1 {
+                let h = *hour.entry(row_key(r)).or_insert(s.partition_hour.0);
+                assert_eq!(h, s.partition_hour.0, "{ctx} R: {:?} in two hours", row_key(r));
+            }
+        }
+    }
+    segs.iter().filter(|s| s.level == Level::L1).count()
+}
+
+/// `forge sql --data-dir` columns + rows (not the envelope's timing), complete.
+fn sql_answer(dir: &Path, q: &str) -> (String, usize) {
+    let o = forge_output(&["sql", "--data-dir", dir.to_str().unwrap(), "--format", "json", q]);
+    assert!(o.status.success(), "{q}: {o:?}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("json envelope");
+    assert_eq!(v["truncated"], false, "{q}");
+    let n = v["rows"].as_array().expect("rows").len();
+    (format!("{}\n{}", v["columns"], v["rows"]), n)
+}
+
+/// S1/S3: the fixed query set; the full-spans query in pages (under the default row cap).
+fn answers(dir: &Path) -> Vec<String> {
+    let cols: Vec<_> = ALL_COLUMNS.iter().filter(|c| **c != "dotted_order").copied().collect();
+    let mut out = vec![
+        sql_answer(
+            dir,
+            "SELECT project_id, count(*) AS n, sum(total_tokens) AS t FROM spans GROUP BY project_id ORDER BY project_id",
+        )
+        .0,
+    ];
+    const PAGE: usize = 4000;
+    for page in 0.. {
+        let q = format!(
+            "SELECT {} FROM spans ORDER BY project_id, trace_id, span_id LIMIT {PAGE} OFFSET {}",
+            cols.join(", "),
+            page * PAGE
+        );
+        let (a, n) = sql_answer(dir, &q);
+        out.push(a);
+        if n < PAGE {
+            return out;
+        }
+    }
+    unreachable!()
+}
+
+/// P, R, then S: offline `forge compact` + `forge gc` (zero graces) leave every answer byte-identical, purge
+/// every deleted row and leave no object without a visible row.
+async fn check_prs(dir: &Path, ctx: &str) {
+    check_p(dir, ctx);
+    check_r(dir, ctx).await;
+    let before = answers(dir);
+    let d = dir.to_str().unwrap();
+    for p in ["p0", "p1"] {
+        let o = forge_output(&["compact", "--project", p, "--data-dir", d]);
+        assert!(o.status.success(), "{ctx} S2: compact {p}: {o:?}");
+    }
+    let o = forge_output(&["gc", "--data-dir", d, "--gc-grace", "0s", "--orphan-grace", "0s"]);
+    assert!(o.status.success(), "{ctx} S2: gc: {o:?}");
+    assert!(answers(dir) == before, "{ctx} S3: an answer changed");
+    // S4
+    let deleted = count(dir, "SELECT count(*) FROM segments WHERE state = 'deleted'");
+    assert_eq!(deleted, 0, "{ctx} S4: deleted rows left");
+    let live: HashSet<_> = segment_paths(dir, "state = 'live'")
+        .into_iter()
+        .flat_map(|p| [dir.join("data").join(&p), dir.join("data").join(paths::fts_path(&p))])
+        .collect();
+    let stray: Vec<_> = files_under(&dir.join("data/segments"))
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains('#') && !live.contains(p))
+        .collect();
+    assert!(stray.is_empty(), "{ctx} S4: objects without a visible row: {stray:?}");
+    assert!(check_r(dir, ctx).await > 0, "{ctx} R: no L1 after forge compact");
+}
+
+/// A compaction/GC failpoint: load with compaction on until the kill, restart with it off, then A–O, P, R, S.
+/// `after_restart` runs before S (whose `forge compact` adds jobs).
+async fn compaction_case(fp: &str, orphans: Orphans, after_restart: impl FnOnce(&Path)) {
+    let c = Case::new("5s");
+    c.kill_under_load(fp, "300ms", &COMPACTION_ON).await;
+    let replay = restart_and_post(c.dir(), &c.ledger).await;
+    let ctx = format!("{fp} {replay:?}");
+    verify_with_sql(c.dir(), &c.ledger, orphans, &ctx).await;
+    after_restart(c.dir());
+    check_prs(c.dir(), &ctx).await;
 }
 
 async fn timed<T>(f: impl Future<Output = T>) -> T {
@@ -536,7 +683,7 @@ async fn crash_after_commit() {
 async fn crash_replay_flush() {
     timed(async {
         let c = Case::new("5s");
-        c.kill_under_load("wal_after_fsync@40", "1h").await;
+        c.kill_under_load("wal_after_fsync@40", "1h", &[]).await;
 
         let fp = "flush_before_upload@1";
         let mut s = ServerProc::spawn(
@@ -576,7 +723,8 @@ async fn crash_random_sigkill() {
         let (dir, cfg) = (c.dir(), Some(c.cfg.as_path()));
         for round in 0..3 {
             let ms = 200 + rng.below(800);
-            let (mut s, p) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
+            let compaction: &[_] = if round == 1 { &COMPACTION_ON } else { &[] };
+            let (mut s, p) = spawn_ready(dir, cfg, &env(None, "300ms", compaction)).await;
             let tasks = load(p, round, &c.ledger, Duration::from_millis(ms)).await;
             // Under a loaded machine the random cut can land before MIN_ACKED acks; extend it (bounded) so the
             // round still exercises a kill mid-load instead of flaking.
@@ -612,7 +760,102 @@ async fn crash_random_sigkill() {
             let _ = verify(dir, &c.ledger, Orphans::Any, &ctx).await;
         }
         let replay = restart_and_post(dir, &c.ledger).await;
-        verify_with_sql(dir, &c.ledger, Orphans::Any, &format!("seed {seed} final {replay:?}")).await;
+        let ctx = format!("seed {seed} final {replay:?}");
+        verify_with_sql(dir, &c.ledger, Orphans::Any, &ctx).await;
+        check_prs(dir, &ctx).await;
+    })
+    .await;
+}
+
+// Compaction and GC failpoints (plan §4). `Any` orphans: a concurrent flush upload can be cut by the kill.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_meta_lease_in_txn() {
+    timed(compaction_case("meta_lease_in_txn@1", Orphans::Any, |d| {
+        assert_eq!(
+            count(d, "SELECT count(*) FROM compaction_jobs"),
+            0,
+            "the begin txn rolled back"
+        );
+    }))
+    .await;
+}
+
+/// The restart runs with `interval = 0`: P proves the reset at open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_compact_after_lease() {
+    timed(compaction_case("compact_after_lease@1", Orphans::Any, |d| {
+        let failed = count(d, "SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
+        assert!(failed >= 1, "the killed job was reset to failed");
+    }))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_compact_after_upload() {
+    timed(compaction_case("compact_after_upload@1", Orphans::AtLeastOne, |_| {})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_meta_compact_in_txn() {
+    timed(compaction_case("meta_compact_in_txn@1", Orphans::AtLeastOne, |_| {})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_compact_after_swap() {
+    timed(compaction_case("compact_after_swap@1", Orphans::Any, |_| {})).await;
+}
+
+/// S4 proves the next GC forgets the row whose object is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_gc_after_object_delete() {
+    timed(compaction_case("gc_after_object_delete@1", Orphans::Any, |_| {})).await;
+}
+
+/// Not a kill: the merge task panics, the job fails before any commit attempt, later jobs succeed, and P holds
+/// on the running server once the load stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_compact_merge_panic() {
+    timed(async {
+        let c = Case::new("5s");
+        let dir = c.dir();
+        let fp = "compact_merge_panic@1";
+        let (mut s, p) = spawn_ready(dir, Some(&c.cfg), &env(Some(fp), "300ms", &COMPACTION_ON)).await;
+        let tasks = load(p, 0, &c.ledger, Duration::ZERO).await;
+        s.wait_for_log("compaction failed", Duration::from_secs(30)).await;
+        let jobs = |st: &str| {
+            count(
+                dir,
+                &format!("SELECT count(*) FROM compaction_jobs WHERE status = '{st}'"),
+            )
+        };
+        let until = |cond: &dyn Fn() -> bool, what: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "{what}\n{}", s.logs());
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        until(&|| jobs("done") >= 1, "a later job succeeds");
+        for t in &tasks {
+            t.abort(); // the in-flight post stays in doubt
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        let quiet =
+            || count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'") == 0 && jobs("running") == 0;
+        until(
+            &quiet,
+            "P: no compacting segment and no running job once the load stops",
+        );
+        assert!(jobs("failed") >= 1, "{}", s.logs());
+        s.stop_ok(Duration::from_secs(20)).await;
+        drop(s);
+        let replay = restart_and_post(dir, &c.ledger).await;
+        let ctx = format!("{fp} {replay:?}");
+        verify_with_sql(dir, &c.ledger, Orphans::Any, &ctx).await;
+        check_prs(dir, &ctx).await;
     })
     .await;
 }
