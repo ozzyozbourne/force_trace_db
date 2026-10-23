@@ -1,0 +1,25 @@
+[package]
+name = "forge-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+forge-model.workspace = true
+arrow.workspace = true
+vortex.workspace = true
+object_store.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true

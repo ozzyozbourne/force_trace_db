@@ -1,0 +1,26 @@
+[package]
+name = "forge-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow.workspace = true
+serde.workspace = true
+chrono.workspace = true
+ulid.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+figment.workspace = true
+bytesize.workspace = true
+humantime-serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+figment = { workspace = true, features = ["test"] }

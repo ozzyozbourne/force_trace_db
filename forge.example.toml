@@ -1,0 +1,27 @@
+[storage]
+url = "file:///var/lib/forge/data"   # or s3://bucket/prefix
+
+[metastore]
+url = "sqlite:///var/lib/forge/meta.db"   # or postgres://…
+
+[wal]
+mode = "local"   # local | object_store
+dir = "/var/lib/forge/wal"
+
+[memtable]
+flush_bytes = "64MiB"
+flush_interval = "30s"
+memory_budget = "1GiB"
+
+[cache]
+memory = "512MiB"
+disk = "10GiB"
+disk_dir = "/var/lib/forge/cache"
+
+[compaction]
+target_segment = "256MiB"
+concurrency = 2
+
+[query]
+memory_limit = "2GiB"
+timeout = "30s"

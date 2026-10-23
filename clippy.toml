@@ -1,0 +1,3 @@
+disallowed-methods = [
+  { path = "futures::executor::block_on", reason = "blocks a tokio worker; use .await or spawn_blocking" },
+]
