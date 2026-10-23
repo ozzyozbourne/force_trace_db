@@ -21,6 +21,7 @@ tantivy.workspace = true
 bytes.workspace = true
 crc32fast.workspace = true
 foldhash.workspace = true
+aho-corasick.workspace = true
 
 [dev-dependencies]
 forge-model = { workspace = true, features = ["test-util"] }

@@ -742,6 +742,14 @@ pub fn expected_trace_json(project: &str, rows: &[&SpanRow], tree: &[RefNode], p
 
 /// FP §2.1 semantics in plain Rust: every listed run of `req`, in page order (ignores `limit`).
 pub fn ref_runs(reference: &[SpanRow], req: &RunsRequest) -> Vec<(i64, TraceId, SpanId)> {
+    let mut an = forge_index::Analyzer::default();
+    let name_q = req.q.as_ref().map(|q| {
+        let p = forge_index::FtsPredicate::Search {
+            column: forge_index::FtsColumn::Name,
+            query: q.clone(),
+        };
+        forge_index::Matcher::new(&mut an, &p).unwrap()
+    });
     let mut out: Vec<(i64, TraceId, SpanId)> = reference
         .iter()
         .filter(|r| r.project_id.as_ref() == Some(&req.project) && r.parent_span_id.is_none())
@@ -750,15 +758,9 @@ pub fn ref_runs(reference: &[SpanRow], req: &RunsRequest) -> Vec<(i64, TraceId, 
         .filter(|(r, _)| req.run_types.is_empty() || r.run_type.is_some_and(|x| req.run_types.contains(&x)))
         .filter(|(r, _)| req.statuses.is_empty() || r.status.is_some_and(|x| req.statuses.contains(&x)))
         .filter(|(r, _)| {
-            req.q.as_ref().is_none_or(|q| {
-                let mut an = forge_index::Analyzer::default();
-                let p = forge_index::FtsPredicate::Search {
-                    column: forge_index::FtsColumn::Name,
-                    query: q.clone(),
-                };
-                let m = forge_index::Matcher::new(&mut an, &p).unwrap();
-                r.name.as_ref().is_some_and(|n| m.matches(&mut an, n))
-            })
+            name_q
+                .as_ref()
+                .is_none_or(|m| r.name.as_ref().is_some_and(|n| m.matches(&mut an, n)))
         })
         .map(|(r, s)| (s, r.trace_id, r.span_id))
         .filter(|p| req.cursor.as_ref().is_none_or(|Cursor(c)| p < c))

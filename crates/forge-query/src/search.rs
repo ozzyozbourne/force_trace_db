@@ -1,14 +1,14 @@
 //! `POST /v1/search` (M4, plans/phase-5 §3.5): newest-first full-text hits over the shared `page` loop.
 use crate::filters::KeyFilters;
-use crate::fts_scan::{Tree, Unit, lookup, part_hits, single_source, split};
+use crate::fts_scan::{Tree, Unit, lookup, part_hits, scan_hits, single_source, split};
 use crate::read::{ReadView, SegmentPart, coalesce, mem_versions, merge_or_filter, needs_merge, read_columns};
 use crate::runs::{
     Candidate, CandidateSource, Cursor, Ids, RUN_COLUMNS, RunsPage, bad, decode_cursor, encode_cursor, in_set,
     in_window, newest_first_segments, page, page_json, parse_list, parse_time, upper_bound,
 };
 use crate::{FtsCounters, QueryCtx, QueryEngine, QueryError, QueryKind};
-use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray};
-use arrow::compute::{concat_batches, filter_record_batch};
+use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray, UInt32Array};
+use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
 use datafusion::execution::memory_pool::MemoryReservation;
 use forge_index::{Analyzer, FtsColumn, FtsExpr, FtsPredicate, IndexError, IndexReader, Matcher};
 use forge_model::catalog::{SegmentId, SegmentMeta};
@@ -198,6 +198,9 @@ struct FtsSource<'a> {
     memo: Mutex<HashMap<SegmentId, Arc<Hits>>>,
     /// One index lookup per segment, shared by concurrent callers (`start`, `prefetch`, `segments`).
     lookups: moka::future::Cache<SegmentId, Arc<Hits>>,
+    /// Per segment: its hit rows (ascending) and their RUN_COLUMNS, when at most `MEMO_ROWS` (verify takes its
+    /// single-source rows from here instead of reading them again).
+    hit_rows: Mutex<HashMap<SegmentId, Arc<(RoaringTreemap, RecordBatch)>>>,
     /// Traces with memtable rows in the snapshot (D11).
     mem_traces: Mutex<BTreeSet<TraceId>>,
     /// Segments brute-forced by this call (D4).
@@ -224,6 +227,7 @@ impl<'a> FtsSource<'a> {
             read_group,
             memo: Mutex::default(),
             lookups: moka::future::Cache::new(u64::MAX),
+            hit_rows: Mutex::default(),
             mem_traces: Mutex::default(),
             bruted: AtomicUsize::new(0),
         })
@@ -260,17 +264,23 @@ impl<'a> FtsSource<'a> {
     /// One part: per-unit rows (brute force for NoIndex), then the key + start of every hit row.
     async fn part(&self, q: &QueryCtx, view: &ReadView, part: &SegmentPart) -> Result<Vec<Candidate>, QueryError> {
         let hits = self.lookup(&part.seg).await?;
-        let cols = [col::TRACE_ID, col::SPAN_ID, col::START_TIME];
-        let h = part_hits(
-            view,
-            &q.pool,
-            &self.counters,
-            part,
-            &self.units,
-            hits.per_unit.clone(),
-            &cols,
-        )
-        .await?;
+        let mut h = part_hits(view, &q.pool, &self.counters, part, &self.units, hits.per_unit.clone()).await?;
+        // Few hits: read what verify needs too (key, start and RUN_COLUMNS), saving its read of them.
+        let all = h.rows();
+        let wide = all.len() <= MEMO_ROWS;
+        let cols = if wide {
+            read_columns(&RUN_COLUMNS)
+        } else {
+            vec![col::TRACE_ID, col::SPAN_ID, col::START_TIME]
+        };
+        scan_hits(view, &mut h, &cols).await?;
+        if wide && !all.is_empty() {
+            let b = concat_batches(&projected_schema(&cols), &h.batches)?;
+            self.hit_rows
+                .lock()
+                .expect("poisoned")
+                .insert(part.seg.id, Arc::new((all, b)));
+        }
         let mut out = Vec::new();
         for b in &h.batches {
             let ids = Ids::of(b)?;
@@ -296,6 +306,9 @@ impl<'a> FtsSource<'a> {
         Ok(out)
     }
 }
+
+/// Hit rows of one segment kept for verify (`FtsSource::hit_rows`).
+const MEMO_ROWS: u64 = 2048;
 
 /// Index lookups in flight for `start` and `prefetch`.
 const EAGER_LOOKUPS: usize = 256;
@@ -445,10 +458,28 @@ impl CandidateSource for FtsSource<'_> {
             .copied()
             .filter(|c| wide.contains(c))
             .collect();
-        let (exact, merged) = futures::try_join!(
-            view.scan(&exact_parts, &out_cols, None),
+        // Single-source rows already read by `part` are taken from there; the others are read now.
+        let (mut exact, mut unread) = (Vec::new(), Vec::new());
+        {
+            let memo = self.hit_rows.lock().expect("poisoned");
+            for p in exact_parts {
+                let RowSelection::Rows(rows) = &p.rows else {
+                    unreachable!("exact parts are Rows")
+                };
+                match memo.get(&p.seg.id) {
+                    Some(m) if rows.is_subset(&m.0) => {
+                        let idx: UInt32Array = rows.iter().map(|r| (m.0.rank(r) - 1) as u32).collect();
+                        exact.push(take_record_batch(&m.1, &idx)?);
+                    }
+                    _ => unread.push(p),
+                }
+            }
+        }
+        let (read, merged) = futures::try_join!(
+            view.scan(&unread, &out_cols, None),
             view.scan(&merge_parts, &wide, None)
         )?;
+        exact.extend(read);
         let (snap, r, hi) = (view.mem().clone(), self.r.clone(), self.hi);
         let (units, tree, counters) = (self.units.clone(), self.tree.clone(), self.counters.clone());
         let mk = KeyFilters {

@@ -2350,6 +2350,7 @@ dependencies = [
 name = "forge-index"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "arrow",
  "async-trait",
  "bytes",

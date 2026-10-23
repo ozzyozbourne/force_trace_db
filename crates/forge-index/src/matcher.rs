@@ -8,6 +8,9 @@ use crate::query::{GroupSpec, Leaf, Query, compile, json_path, json_query, parse
 use crate::{FtsColumn, FtsExpr, FtsPredicate, IndexError, IndexResult};
 use std::collections::HashMap;
 
+/// A `must` token that never occurs (see `Matcher::must`).
+const NEVER: usize = usize::MAX;
+
 /// Leaves per AND group (a u64 mask per group).
 pub(crate) const MAX_GROUP_TERMS: usize = 64;
 
@@ -23,8 +26,11 @@ pub struct Matcher {
     /// json_key_search: the `[*]` path and one step per `[*]` (Some(n) = concrete index). Empty text: `exists`.
     path: Option<(String, Vec<Option<u32>>)>,
     exists: bool,
-    /// Per group: tokens that must occur in an ASCII cell lowercased (sound pre-filter, see `may_match`).
-    must: Vec<Vec<String>>,
+    /// Per group: ids (in `must_ac`) of tokens that must occur in an ASCII cell lowercased (sound pre-filter, see
+    /// `may_match`). `NEVER`: a token with an ASCII uppercase letter, never a substring of a lowercased cell.
+    must: Vec<Vec<usize>>,
+    /// Case-insensitive search for the `must` tokens (None: no token to look for).
+    must_ac: Option<aho_corasick::AhoCorasick>,
 }
 
 impl Matcher {
@@ -61,16 +67,33 @@ impl Matcher {
                 }
             }
         }
+        let mut patterns: Vec<&str> = Vec::new();
         let must = groups
             .iter()
             .map(|g| {
                 g.terms
                     .iter()
                     .filter(|(t, _)| t.is_ascii() && t.bytes().any(|b| !b.is_ascii_digit() && b != b'e'))
-                    .map(|(t, _)| t.clone())
+                    .map(|(t, _)| {
+                        if t.bytes().any(|b| b.is_ascii_uppercase()) {
+                            return NEVER;
+                        }
+                        patterns.iter().position(|p| p == t).unwrap_or_else(|| {
+                            patterns.push(t);
+                            patterns.len() - 1
+                        })
+                    })
                     .collect()
             })
             .collect();
+        let must_ac = (!patterns.is_empty())
+            .then(|| {
+                aho_corasick::AhoCorasick::builder()
+                    .ascii_case_insensitive(true)
+                    .build(&patterns)
+            })
+            .transpose()
+            .map_err(|e| IndexError::Query(e.to_string()))?;
         Ok(Self {
             col,
             query,
@@ -80,6 +103,7 @@ impl Matcher {
             path,
             exists,
             must,
+            must_ac,
         })
     }
 
@@ -151,10 +175,18 @@ impl Matcher {
         if !value.is_ascii() || value.contains("\\u") || self.must.iter().any(Vec::is_empty) {
             return true;
         }
-        let lower = value.to_ascii_lowercase();
+        // One pass over the cell, without a lowercased copy: a lowercase token occurs in the lowercased ASCII cell
+        // exactly when it occurs in the cell ignoring ASCII case.
+        let mut found = Vec::new();
+        if let Some(ac) = &self.must_ac {
+            found.resize(ac.patterns_len(), false);
+            for m in ac.find_overlapping_iter(value) {
+                found[m.pattern().as_usize()] = true;
+            }
+        }
         self.must
             .iter()
-            .any(|terms| terms.iter().all(|t| lower.contains(t.as_str())))
+            .any(|ids| ids.iter().all(|&i| found.get(i).copied().unwrap_or(false)))
     }
 
     /// Re-checks the key-level survivors on the cell's token runs (one per leaf, or the text).

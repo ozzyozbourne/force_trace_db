@@ -403,7 +403,8 @@ pub(crate) async fn page(
     prefetch: usize,
 ) -> Result<(RunsPage, MemoryReservation), QueryError> {
     let k = k.max(1);
-    src.start(q, view, &segs).await?;
+    // The eager lookups (I/O) and the memtable scan (CPU) at once.
+    let (_, mem) = futures::try_join!(src.start(q, view, &segs), src.mem(q, view))?;
     segs.retain(|s| src.frontier(s).is_some());
     segs.sort_by_key(|s| Reverse((src.frontier(s), s.id)));
     let mut res = MemoryConsumer::new("page").register(&q.pool);
@@ -415,7 +416,7 @@ pub(crate) async fn page(
         }
         u @ Candidate::Unpositioned(..) => pending.push(u),
     };
-    for c in src.mem(q, view).await? {
+    for c in mem {
         push(&mut cand, &mut pending, c);
     }
     let mut merged: Vec<RecordBatch> = Vec::new();

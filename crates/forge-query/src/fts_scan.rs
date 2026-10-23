@@ -9,7 +9,7 @@
 use crate::FtsCounters;
 use crate::QueryError;
 use crate::filters::KeyFilters;
-use crate::read::{ReadView, SegmentPart, coalesce, scan_request};
+use crate::read::{ReadView, SegmentPart, coalesce, mem_versions, scan_request};
 use arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use forge_index::{
@@ -17,6 +17,7 @@ use forge_index::{
 };
 use forge_model::catalog::{SegmentId, SegmentMeta};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
+use forge_model::merge::Cancel;
 use forge_model::row::span_keys;
 use forge_model::schema::{col, projected_schema};
 use forge_storage::RowSelection;
@@ -133,6 +134,10 @@ impl Tree {
             &|v| v.union(),
         )
     }
+    /// A lower bound on `keys` from a lower bound on each unit's key count (AND: none).
+    pub fn min_keys(&self, per_unit: &[usize]) -> usize {
+        self.fold(&|u| per_unit[u], &|_| 0, &|v| v.into_iter().max().unwrap_or(0))
+    }
     /// On per-unit booleans of one merged row (exact: one value per column).
     pub fn eval(&self, b: &[bool]) -> bool {
         self.fold(&|u| b[u], &|v| v.into_iter().all(|x| x), &|v| v.into_iter().any(|x| x))
@@ -151,63 +156,67 @@ pub(crate) struct Selected {
     pub merge_traces: BTreeSet<TraceId>,
 }
 
-/// Rows of `part` (file row ids) where `unit` holds, by scanning its column (no sidecar, or `NoIndex`). Streams:
-/// one batch at a time, charged to `pool` (D5).
+/// Rows of `part` (file row ids) where each unit of `which` holds, by scanning their columns in one pass (no
+/// sidecar, or `NoIndex`). Streams: one batch at a time, charged to `pool` (D5), matched on the blocking pool, with
+/// one prefix count per unit (D13: per source).
 pub(crate) async fn brute(
     view: &ReadView,
     pool: &Arc<dyn MemoryPool>,
     part: &SegmentPart,
-    unit: &Unit,
-) -> Result<RoaringTreemap, QueryError> {
+    units: &Arc<Vec<Unit>>,
+    which: &[usize],
+) -> Result<Vec<RoaringTreemap>, QueryError> {
     debug_assert!(
         !matches!(part.rows, RowSelection::Rows(_)),
         "candidate parts are All or Range"
     );
-    let start = part.rows.first_row();
-    let req = scan_request(part, &[unit.col.name()], None);
+    let cols: BTreeSet<&'static str> = which.iter().map(|&u| units[u].col.name()).collect();
+    let req = scan_request(part, &cols.into_iter().collect::<Vec<_>>(), None);
     let mut stream = view.store().scan(&part.seg, req).await?;
     let res = MemoryConsumer::new("fts.brute").register(pool);
-    let (mut an, mut seen) = (Analyzer::default(), PrefixSeen::default());
-    let mut out = RoaringTreemap::new();
-    let mut row = start;
+    let mut state: Vec<(PrefixSeen, RoaringTreemap)> = which.iter().map(|_| Default::default()).collect();
+    let mut row = part.rows.first_row();
     while let Some(b) = stream.try_next().await? {
-        res.try_grow(b.get_array_memory_size())?;
-        let c = b.column(0).as_string::<i32>();
-        for i in 0..c.len() {
-            if c.is_valid(i) && unit.matches_counting(&mut an, c.value(i), &mut seen)? {
-                out.insert(row + i as u64);
+        let (size, n) = (b.get_array_memory_size(), b.num_rows() as u64);
+        res.try_grow(size)?;
+        let (units, which) = (units.clone(), which.to_vec());
+        state = tokio::task::spawn_blocking(move || -> Result<_, QueryError> {
+            let mut an = Analyzer::default();
+            for (&u, (seen, out)) in which.iter().zip(&mut state) {
+                let unit = &units[u];
+                let c = b.column(b.schema_ref().index_of(unit.col.name())?).as_string::<i32>();
+                for i in 0..c.len() {
+                    if c.is_valid(i) && unit.matches_counting(&mut an, c.value(i), seen)? {
+                        out.insert(row + i as u64);
+                    }
+                }
             }
-        }
-        row += b.num_rows() as u64;
-        res.shrink(b.get_array_memory_size());
+            Ok(state)
+        })
+        .await??;
+        row += n;
+        res.shrink(size);
     }
-    Ok(out)
+    Ok(state.into_iter().map(|(_, out)| out).collect())
 }
 
-/// Each unit's index answer for `seg` (None: no usable sidecar; D4: every index error but a query error falls back
-/// to brute force), and whether some hit row has a null start (D8).
+/// Each unit's index answer for `seg`, from one batched lookup (None: no usable sidecar; D4: every index error but
+/// a query error falls back to brute force), and whether some hit row has a null start (D8).
 pub(crate) async fn lookup(
     index: &dyn IndexReader,
     seg: &SegmentMeta,
     units: &[Unit],
 ) -> IndexResult<(Vec<Option<RoaringTreemap>>, bool)> {
-    let looked = futures::future::try_join_all(units.iter().map(|u| async move {
-        match index.search(seg, &u.expr).await {
-            Ok(FtsHits::Rows { rows, start_less }) => Ok(Some((rows, start_less))),
-            Ok(FtsHits::NoIndex) => Ok(None),
-            Err(e @ IndexError::Query(_)) => Err(e),
-            Err(e) => {
-                tracing::debug!(segment = %seg.id, error = %e, ".fts unusable; brute force");
-                Ok(None)
-            }
+    let exprs: Vec<FtsExpr> = units.iter().map(|u| u.expr.clone()).collect();
+    match index.search(seg, &exprs).await {
+        Ok(FtsHits::Rows { rows, start_less }) => Ok((rows.into_iter().map(Some).collect(), start_less)),
+        Ok(FtsHits::NoIndex) => Ok((vec![None; units.len()], false)),
+        Err(e @ IndexError::Query(_)) => Err(e),
+        Err(e) => {
+            tracing::debug!(segment = %seg.id, error = %e, ".fts unusable; brute force");
+            Ok((vec![None; units.len()], false))
         }
-    }))
-    .await?;
-    let start_less = looked.iter().flatten().any(|(_, sl)| *sl);
-    Ok((
-        looked.into_iter().map(|x| x.map(|(rows, _)| rows)).collect(),
-        start_less,
-    ))
+    }
 }
 
 /// One part's hits: per-unit rows (the index's, completed by brute force) and the hit rows.
@@ -227,45 +236,56 @@ impl PartHits {
     }
 }
 
-/// The per-segment pipeline of the SQL and `/v1/search` paths: `looked` (each unit's index answer for the part's
-/// segment, from `lookup`) clipped to the part, the NoIndex units brute-forced, the part counters, then `cols` of
-/// every hit row.
+/// The per-segment pipeline of the SQL and `/v1/search` paths, first half: `looked` (each unit's index answer for
+/// the part's segment, from `lookup`) clipped to the part, the NoIndex units brute-forced, the part counters.
+/// `scan_hits` reads the hit rows.
 pub(crate) async fn part_hits(
     view: &ReadView,
     pool: &Arc<dyn MemoryPool>,
     counters: &FtsCounters,
     part: &SegmentPart,
-    units: &[Unit],
+    units: &Arc<Vec<Unit>>,
     looked: Vec<Option<RoaringTreemap>>,
-    cols: &[&'static str],
 ) -> Result<PartHits, QueryError> {
-    let bruted = looked.iter().any(Option::is_none);
+    let missing: Vec<usize> = (0..looked.len()).filter(|&u| looked[u].is_none()).collect();
+    let bruted = !missing.is_empty();
     counters.add(1, |c| if bruted { &mut c.brute_parts } else { &mut c.index_parts });
-    let mut per_unit = Vec::with_capacity(units.len());
-    for (u, h) in units.iter().zip(looked) {
-        per_unit.push(match h {
-            Some(rows) => part.rows.intersect(rows),
-            None => brute(view, pool, part, u).await?,
-        });
+    let mut forced = if bruted {
+        brute(view, pool, part, units, &missing).await?
+    } else {
+        Vec::new()
     }
-    let mut h = PartHits {
+    .into_iter();
+    let per_unit = looked
+        .into_iter()
+        .map(|h| match h {
+            Some(rows) => part.rows.intersect(rows),
+            None => forced.next().expect("one per missing unit"),
+        })
+        .collect();
+    let h = PartHits {
         seg: part.seg.clone(),
         per_unit,
         bruted,
         batches: Vec::new(),
     };
-    let all = h.rows();
-    if bruted || !all.is_empty() {
+    if bruted || !h.rows().is_empty() {
         counters.add(1, |c| &mut c.segments_read);
     }
+    Ok(h)
+}
+
+/// Second half of the per-segment pipeline: `cols` of every hit row.
+pub(crate) async fn scan_hits(view: &ReadView, h: &mut PartHits, cols: &[&'static str]) -> Result<(), QueryError> {
+    let all = h.rows();
     if !all.is_empty() {
         let hit = SegmentPart {
-            seg: part.seg.clone(),
+            seg: h.seg.clone(),
             rows: RowSelection::Rows(Arc::new(all)),
         };
         h.batches = view.scan(&[hit], cols, None).await?;
     }
-    Ok(h)
+    Ok(())
 }
 
 /// D11's split of `locs` (every location of the candidate traces). A trace is single-source when every unit is
@@ -328,12 +348,11 @@ pub(crate) async fn select(
     expr: &FtsExpr,
     max_keys: usize,
 ) -> Result<Option<Selected>, QueryError> {
-    let mut an = Analyzer::default();
     let mut units = Vec::new();
-    let tree = split(&mut an, expr, &mut units)?;
-    let mut per_unit: Vec<BTreeSet<Key>> = vec![BTreeSet::new(); units.len()];
+    let tree = split(&mut Analyzer::default(), expr, &mut units)?;
+    let units = Arc::new(units);
 
-    // Memtable rows of the project (key filters only), brute force per unit.
+    // Memtable rows of the project (key filters only), brute force per unit, on the blocking pool.
     let mk = KeyFilters {
         projects: Some([p.clone()].into()),
         traces: k.traces.clone(),
@@ -342,50 +361,71 @@ pub(crate) async fn select(
     let mut mem_cols: BTreeSet<&'static str> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID].into();
     mem_cols.extend(units.iter().map(|u| u.col.name()));
     let mem_cols: Vec<&'static str> = mem_cols.into_iter().collect();
-    let mut mem_traces: BTreeSet<TraceId> = BTreeSet::new();
-    let mut seen = PrefixSeen::default();
-    for b in view.mem_versions(&mk, &projected_schema(&mem_cols))? {
-        let keys = span_keys(&b)?;
-        mem_traces.extend(keys.iter().map(|k| k.0));
-        for (ui, u) in units.iter().enumerate() {
-            let c = b.column(b.schema().index_of(u.col.name())?).as_string::<i32>();
-            for (i, key) in keys.iter().enumerate() {
-                if c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen)? {
-                    per_unit[ui].insert(*key);
+    let (snap, mem_units) = (view.mem().clone(), units.clone());
+    let mem = async {
+        tokio::task::spawn_blocking(move || -> Result<_, QueryError> {
+            let mut an = Analyzer::default();
+            let mut per_unit: Vec<BTreeSet<Key>> = vec![BTreeSet::new(); mem_units.len()];
+            let mut mem_traces: BTreeSet<TraceId> = BTreeSet::new();
+            let mut seen = PrefixSeen::default();
+            for b in mem_versions(&snap, &mk, &projected_schema(&mem_cols), &Cancel::never())? {
+                let keys = span_keys(&b)?;
+                mem_traces.extend(keys.iter().map(|k| k.0));
+                for (ui, u) in mem_units.iter().enumerate() {
+                    let c = b.column(b.schema().index_of(u.col.name())?).as_string::<i32>();
+                    for (i, key) in keys.iter().enumerate() {
+                        if c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen)? {
+                            per_unit[ui].insert(*key);
+                        }
+                    }
                 }
             }
-        }
-    }
+            Ok((per_unit, mem_traces))
+        })
+        .await?
+    };
 
-    // Segments: index (or brute force) per unit, then the keys of the hit rows.
-    // A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
+    // Segments: index (or brute force) per unit; then, unless that already rules the index out, the keys of the
+    // hit rows. A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
     let bruted0 = counters.get().brute_parts;
     let mut futs = Vec::with_capacity(parts.len());
     for part in parts {
         let units = &units;
         futs.push(async move {
             let (looked, _) = lookup(index, &part.seg, units).await?;
-            part_hits(
-                view,
-                pool,
-                counters,
-                part,
-                units,
-                looked,
-                &[col::TRACE_ID, col::SPAN_ID],
-            )
-            .await
+            part_hits(view, pool, counters, part, units, looked).await
         });
     }
-    let hits: Vec<PartHits> = futures::stream::iter(futs)
+    let segs = futures::stream::iter(futs)
         .buffer_unordered(INDEX_CONCURRENCY)
-        .try_collect()
-        .await?;
+        .try_collect::<Vec<PartHits>>();
+    let ((mut per_unit, mem_traces), mut hits) = futures::try_join!(mem, segs)?;
     // Other queries add to the counter too: the count is approximate when they overlap.
     let n = counters.get().brute_parts.saturating_sub(bruted0);
     if n > 0 {
         tracing::warn!(project = %p, segments = n, "search: segments without a usable .fts were scanned by brute force");
     }
+    // A segment holds one row per key: a unit's rows in one part are that many distinct candidate keys.
+    let at_least: Vec<usize> = (0..units.len())
+        .map(|u| {
+            hits.iter()
+                .map(|h| h.per_unit[u].len() as usize)
+                .chain([per_unit[u].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    if tree.min_keys(&at_least) > max_keys {
+        return Ok(None);
+    }
+    let mut futs = Vec::with_capacity(hits.len());
+    for h in &mut hits {
+        futs.push(scan_hits(view, h, &[col::TRACE_ID, col::SPAN_ID]));
+    }
+    futures::stream::iter(futs)
+        .buffer_unordered(INDEX_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
     for h in &hits {
         let mut keys = BTreeMap::new();
         let mut ids = h.rows().into_iter();
@@ -470,7 +510,7 @@ type Fetch = futures::future::BoxFuture<'static, IndexResult<Vec<bytes::Bytes>>>
 
 #[async_trait::async_trait]
 impl IndexReader for FtsIndexReader {
-    async fn search(&self, seg: &SegmentMeta, expr: &FtsExpr) -> IndexResult<FtsHits> {
+    async fn search(&self, seg: &SegmentMeta, exprs: &[FtsExpr]) -> IndexResult<FtsHits> {
         let Some(len) = seg.fts_byte_size else {
             return Ok(FtsHits::NoIndex);
         };
@@ -499,18 +539,30 @@ impl IndexReader for FtsIndexReader {
                 msg: format!("{} rows, the segment has {}", file.footer().num_rows, seg.row_count),
             });
         }
-        // Every predicate's lookups at once: one wave of FST blocks, one of postings (D1).
-        let ms = Matcher::for_expr(&mut Analyzer::default(), expr)?;
-        let bms = futures::future::try_join_all(ms.iter().map(|m| file.execute(m.query(), &fetch))).await?;
-        let mut bms = bms.into_iter().map(|(b, _)| b);
-        let rows: RoaringBitmap = expr.fold(
-            &mut |_| bms.next().expect("one bitmap per predicate"),
-            &|v| v.into_iter().reduce(|a, b| a & b).unwrap_or_default(),
-            &|v| v.union(),
-        );
-        let start_less = !rows.is_disjoint(file.null_starts());
+        // Every predicate of every expression at once: one wave of FST blocks, one of postings (D1).
+        let mut an = Analyzer::default();
+        let ms: Vec<Vec<Matcher>> = exprs
+            .iter()
+            .map(|e| Matcher::for_expr(&mut an, e))
+            .collect::<IndexResult<_>>()?;
+        let qs: Vec<&forge_index::query::Query> = ms.iter().flatten().map(Matcher::query).collect();
+        let mut bms = file.execute_many(&qs, &fetch).await?.0.into_iter();
+        let rows: Vec<RoaringBitmap> = exprs
+            .iter()
+            .map(|e| {
+                e.fold(
+                    &mut |_| bms.next().expect("one bitmap per predicate"),
+                    &|v| v.into_iter().reduce(|a, b| a & b).unwrap_or_default(),
+                    &|v| v.union(),
+                )
+            })
+            .collect();
+        let start_less = rows.iter().any(|r| !r.is_disjoint(file.null_starts()));
         Ok(FtsHits::Rows {
-            rows: RoaringTreemap::from_bitmaps([(0, rows)]),
+            rows: rows
+                .into_iter()
+                .map(|r| RoaringTreemap::from_bitmaps([(0, r)]))
+                .collect(),
             start_less,
         })
     }

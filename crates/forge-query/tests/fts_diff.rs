@@ -363,8 +363,8 @@ impl P {
             P::And(a, b) => a.oracle(r) && b.oracle(r),
         }
     }
-    /// The shared matcher on the same cell (checked against the oracle).
-    fn matcher(&self, r: &SpanRow) -> bool {
+    /// The shared matchers of the predicate (its leaves, ANDed; checked against the oracle).
+    fn matchers(&self, an: &mut Analyzer) -> Vec<Matcher> {
         let pred = match self {
             P::S(c, q) => FtsPredicate::Search {
                 column: *c,
@@ -375,11 +375,9 @@ impl P {
                 path: p.to_string(),
                 text: t.to_string(),
             },
-            P::And(a, b) => return a.matcher(r) && b.matcher(r),
+            P::And(a, b) => return [a.matchers(an), b.matchers(an)].concat(),
         };
-        let an = &mut Analyzer::default();
-        let m = Matcher::new(an, &pred).unwrap();
-        cell(r, m.column()).is_some_and(|v| m.matches(an, v))
+        vec![Matcher::new(an, &pred).unwrap()]
     }
 }
 
@@ -541,9 +539,6 @@ async fn check_sql(e: &QueryEngine, merged: &[SpanRow], ctx: &str) -> Vec<(bool,
             .filter(|r| p.oracle(r))
             .map(|r| (r.trace_id, r.span_id))
             .collect();
-        for r in merged {
-            assert_eq!(p.matcher(r), p.oracle(r), "{ctx}: matcher != oracle for {p:?} on {r:?}");
-        }
         let q = format!(
             "SELECT trace_id, span_id FROM spans WHERE project_id = 's' AND {}",
             p.sql()
@@ -705,6 +700,15 @@ async fn run(seed: u64, light: bool) -> Outcome {
             && oracle_search(v, FtsColumn::Inputs, "refund")
             && oracle_search(v, FtsColumn::Outputs, "order")
     });
+    // The shared matcher equals the oracle on every merged row (once per layout: the rows do not change).
+    let an = &mut Analyzer::default();
+    for p in preds() {
+        let ms = p.matchers(an);
+        for r in &merged {
+            let got = ms.iter().all(|m| cell(r, m.column()).is_some_and(|v| m.matches(an, v)));
+            assert_eq!(got, p.oracle(r), "seed {seed}: matcher != oracle for {p:?} on {r:?}");
+        }
+    }
     let mut cover = vec![(false, false); preds().len()];
     let mut counters = FtsCountersSnapshot::default();
     for phase in ["L0", "L1"] {
@@ -742,8 +746,13 @@ async fn run(seed: u64, light: bool) -> Outcome {
                         let got = pages(&e, &req, v, 1, 5).await;
                         assert_eq!(got, want[..want.len().min(5)], "{ctx} limit 1");
                     }
-                    // Paged to the end at 3 once per layout phase (search_diff pages small limits on 432 cases).
-                    let limits: &[usize] = if sizes == (2, 2) && !light { &[3, 50] } else { &[50] };
+                    // Paged to the end at 3 once per layout phase, unfiltered only (search_diff pages small limits on
+                    // 432 unfiltered cases; the filter variant is paged at limit 1 above).
+                    let limits: &[usize] = if sizes == (2, 2) && !light && matches!(v, Variant::None) {
+                        &[3, 50]
+                    } else {
+                        &[50]
+                    };
                     for &limit in limits {
                         assert_eq!(pages(&e, &req, v, limit, usize::MAX).await, want, "{ctx} limit {limit}");
                     }

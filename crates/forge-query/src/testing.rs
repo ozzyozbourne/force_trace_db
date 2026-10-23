@@ -45,7 +45,7 @@ impl HidingIndexReader {
 
 #[async_trait]
 impl IndexReader for HidingIndexReader {
-    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr) -> IndexResult<FtsHits> {
+    async fn search(&self, seg: &SegmentMeta, e: &[FtsExpr]) -> IndexResult<FtsHits> {
         if self.hidden.lock().unwrap().contains(&seg.id) {
             return Ok(FtsHits::NoIndex);
         }

@@ -105,8 +105,18 @@ impl FtsFile {
         F: Fn(Vec<Range<u64>>) -> Fut,
         Fut: Future<Output = IndexResult<Vec<Bytes>>>,
     {
+        let (mut rows, io) = self.execute_many(&[q], fetch).await?;
+        Ok((rows.pop().expect("one query"), io))
+    }
+
+    /// `execute` of every query of `qs` at once: one wave of FST blocks and one of postings for all of them.
+    pub async fn execute_many<F, Fut>(&self, qs: &[&Query], fetch: &F) -> IndexResult<(Vec<RoaringBitmap>, Io)>
+    where
+        F: Fn(Vec<Range<u64>>) -> Fut,
+        Fut: Future<Output = IndexResult<Vec<Bytes>>>,
+    {
         let mut io = Io::default();
-        let leaves: Vec<&Leaf> = q.groups.iter().flatten().collect();
+        let leaves: Vec<&Leaf> = qs.iter().flat_map(|q| q.groups.iter().flatten()).collect();
         // Wave 1: the missing FST blocks of every leaf.
         let need: Vec<usize> = {
             let cached = self.blocks.lock().expect("poisoned");
@@ -129,21 +139,23 @@ impl FtsFile {
             .iter()
             .map(|l| self.resolve(l))
             .collect::<IndexResult<Vec<_>>>()?;
-        // Prune AND groups with an empty leaf.
-        let mut live = Vec::new();
+        // Prune AND groups with an empty leaf; `live[qi]`: the leaf ranges of query qi's live groups.
+        let mut live: Vec<Vec<Range<usize>>> = vec![Vec::new(); qs.len()];
         let mut k = 0;
-        for g in &q.groups {
-            let r = k..k + g.len();
-            k += g.len();
-            if vals[r.clone()].iter().all(|v| !v.is_empty()) {
-                live.push(r);
+        for (qi, q) in qs.iter().enumerate() {
+            for g in &q.groups {
+                let r = k..k + g.len();
+                k += g.len();
+                if vals[r.clone()].iter().all(|v| !v.is_empty()) {
+                    live[qi].push(r);
+                }
             }
         }
         // Wave 2: every non-inline posting entry of the live leaves.
         let mut leaf_bm: Vec<RoaringBitmap> = vec![RoaringBitmap::new(); leaves.len()];
         let (mut ranges, mut owners) = (Vec::new(), Vec::new());
         let p0 = self.footer.postings.start;
-        for li in live.iter().flat_map(|r| r.clone()) {
+        for li in live.iter().flatten().flat_map(|r| r.clone()) {
             for &v in &vals[li] {
                 match TermValue::unpack(v) {
                     TermValue::Inline(row) => {
@@ -165,7 +177,10 @@ impl FtsFile {
                 leaf_bm[li] |= decode_postings(&buf).map_err(|e| self.corrupt(&e))?;
             }
         }
-        let rows = live.into_iter().map(|r| leaf_bm[r].iter().intersection()).union();
+        let rows = live
+            .into_iter()
+            .map(|l| l.into_iter().map(|r| leaf_bm[r].iter().intersection()).union())
+            .collect();
         Ok((rows, io))
     }
 

@@ -129,10 +129,10 @@ impl FtsExpr {
 pub enum FtsHits {
     /// The segment has no usable index for some column in the expression: caller must scan + brute-force.
     NoIndex,
-    /// Candidate rows (file-relative). May be a superset (phrases, concrete array indexes, see
-    /// `Query::needs_recheck`): the caller re-checks with `matches()`.
+    /// Candidate rows (file-relative), one set per expression. May be a superset (phrases, concrete array
+    /// indexes, see `Query::needs_recheck`): the caller re-checks with `matches()`.
     Rows {
-        rows: roaring::RoaringTreemap,
+        rows: Vec<roaring::RoaringTreemap>,
         /// Some hit row has a null start_time (the footer's null-start bitmap): the segment's `max_start_ns` does not
         /// bound the merged start of its hits (plans/phase-5 D8).
         start_less: bool,
@@ -141,8 +141,8 @@ pub enum FtsHits {
 
 #[async_trait]
 pub trait IndexReader: Send + Sync + std::fmt::Debug + 'static {
-    /// ≤ 2 round trips with a cached footer.
-    async fn search(&self, seg: &SegmentMeta, expr: &FtsExpr) -> IndexResult<FtsHits>;
+    /// Every expression of `exprs` on `seg`, at once: ≤ 2 round trips with a cached footer.
+    async fn search(&self, seg: &SegmentMeta, exprs: &[FtsExpr]) -> IndexResult<FtsHits>;
 }
 
 /// A reader that never has an index: callers fall back to scan + brute force (tests).
@@ -150,7 +150,7 @@ pub trait IndexReader: Send + Sync + std::fmt::Debug + 'static {
 pub struct NoopIndexReader;
 #[async_trait]
 impl IndexReader for NoopIndexReader {
-    async fn search(&self, _: &SegmentMeta, _: &FtsExpr) -> IndexResult<FtsHits> {
+    async fn search(&self, _: &SegmentMeta, _: &[FtsExpr]) -> IndexResult<FtsHits> {
         Ok(FtsHits::NoIndex)
     }
 }
@@ -181,7 +181,7 @@ mod tests {
             query: "x".into(),
         });
         assert!(matches!(
-            NoopIndexReader.search(&seg, &expr).await,
+            NoopIndexReader.search(&seg, &[expr]).await,
             Ok(FtsHits::NoIndex)
         ));
     }
