@@ -60,7 +60,7 @@ async fn create(
     req: Result<Json<CreateProject>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ProjectView>), ApiError> {
     // Bad bodies get the same 400 {"error": ..} shape as other invalid input (axum defaults to 415/422 text).
-    let Json(req) = req.map_err(|e| ApiError::invalid_input(e.body_text()))?;
+    let req = json_params(req)?;
     let id = ProjectId::new(req.id)?;
     let p = Project::new(id, req.name, req.retention_days, now_ms())?;
     s.meta.create_project(p.clone()).await?;
@@ -106,6 +106,10 @@ fn query_params<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     q.map(|Query(q)| q).map_err(|e| ApiError::invalid_input(e.body_text()))
 }
 
+fn json_params<T>(r: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    r.map(|Json(t)| t).map_err(|e| ApiError::invalid_input(e.body_text()))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TraceParams {
     pub project: Option<String>,
@@ -140,6 +144,6 @@ async fn runs(
 
 /// `POST /v1/sql {"query", "max_rows"?, "timeout_ms"?}`.
 async fn sql(State(s): State<AppState>, req: Result<Json<SqlRequest>, JsonRejection>) -> Result<Response, ApiError> {
-    let Json(req) = req.map_err(|e| ApiError::invalid_input(e.body_text()))?;
+    let req = json_params(req)?;
     Ok(json_body(s.query.sql_json(&req).await?))
 }

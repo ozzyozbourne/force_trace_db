@@ -31,11 +31,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut r = (http_status(self.kind), Json(serde_json::json!({ "error": self.msg }))).into_response();
-        if let Some(v) = retry_after(self.kind) {
-            r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
-        }
-        r
+        error_response(self.kind, Json(serde_json::json!({ "error": self.msg })))
     }
 }
 
@@ -68,8 +64,17 @@ pub(crate) fn grpc_code(k: ErrorKind) -> tonic::Code {
     }
 }
 
-/// `Retry-After` for retryable kinds (sent by the OTLP/HTTP receiver).
-pub(crate) fn retry_after(k: ErrorKind) -> Option<HeaderValue> {
+/// `kind`'s HTTP status and `body`, plus `Retry-After` for retryable kinds (API and OTLP/HTTP).
+pub(crate) fn error_response(kind: ErrorKind, body: impl IntoResponse) -> Response {
+    let mut r = (http_status(kind), body).into_response();
+    if let Some(v) = retry_after(kind) {
+        r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+    }
+    r
+}
+
+/// `Retry-After` for retryable kinds.
+fn retry_after(k: ErrorKind) -> Option<HeaderValue> {
     matches!(k, ErrorKind::Backpressure | ErrorKind::Transient).then(|| HeaderValue::from_static("1"))
 }
 

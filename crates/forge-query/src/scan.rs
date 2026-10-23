@@ -1,6 +1,6 @@
 //! `SegmentScanExec`: the segment leaf over `SegmentStore::scan` (D2).
 use crate::ext;
-use crate::provider::SegmentPart;
+use crate::read::{SegmentPart, scan_request};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, exec_err};
@@ -12,7 +12,7 @@ use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     ReplaceChildrenOptions,
 };
-use forge_storage::{ScanRequest, SegmentStore};
+use forge_storage::SegmentStore;
 use futures::TryStreamExt;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Leaf over `SegmentStore::scan`: one partition per (segment, row selection). Prints its projection so
 /// EXPLAIN shows exactly which columns are read.
 #[derive(Debug)]
-pub struct SegmentScanExec {
+pub(crate) struct SegmentScanExec {
     store: Arc<dyn SegmentStore>,
     parts: Vec<SegmentPart>,
     cols: Vec<&'static str>,
@@ -101,12 +101,7 @@ impl ExecutionPlan for SegmentScanExec {
         let Some(part) = self.parts.get(partition).cloned() else {
             return exec_err!("SegmentScanExec has {} partitions, got {partition}", self.parts.len());
         };
-        let req = ScanRequest {
-            projection: Some(self.cols.clone()),
-            rows: part.rows,
-            filter: self.filter.clone(),
-            limit: None,
-        };
+        let req = scan_request(&part, &self.cols, self.filter.clone());
         let store = self.store.clone();
         let s = futures::stream::once(async move {
             let s = store.scan(&part.seg, req).await.map_err(ext)?;

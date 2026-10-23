@@ -1,11 +1,12 @@
 //! Filter classification for pruning (`SpansTableProvider::supports_filters_pushdown` / `scan`).
 use arrow::array::{AsArray, BooleanArray, RecordBatch};
 use arrow::datatypes::{DataType, TimeUnit};
+use arrow::error::ArrowError;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
-use forge_model::ids::TraceId;
-use forge_model::schema::{col as c, col_idx};
+use forge_model::ids::{ProjectId, SpanId, TraceId};
+use forge_model::schema::col as c;
 use std::collections::BTreeSet;
 
 /// What the provider learned from the (ANDed) filters. Used for pruning only; DataFusion re-applies every
@@ -15,6 +16,8 @@ pub struct KeyFilters {
     /// None = any project. Some(empty) = no row can match.
     pub projects: Option<BTreeSet<String>>,
     pub traces: Option<BTreeSet<TraceId>>,
+    /// Exact (trace, span) keys (runs verification; never from SQL).
+    pub spans: Option<BTreeSet<(TraceId, SpanId)>>,
     /// [start_ns, end_ns) on start_time: segment pruning only (decision 5).
     pub start_ns: Option<i64>,
     pub end_ns: Option<i64>,
@@ -216,24 +219,44 @@ impl KeyFilters {
     pub fn empty(&self) -> bool {
         self.projects.as_ref().is_some_and(|p| p.is_empty()) || self.traces.as_ref().is_some_and(|t| t.is_empty())
     }
-    /// The memtable rows that pass the KEY filters (never time: start_time is mutable before the merge).
-    pub(crate) fn key_mask(&self, b: &RecordBatch) -> Option<BooleanArray> {
-        if self.projects.is_none() && self.traces.is_none() {
-            return None;
+    /// Every key of project `p`, optionally only of trace `t`.
+    pub fn project(p: &ProjectId, t: Option<TraceId>) -> Self {
+        Self {
+            projects: Some([p.to_string()].into()),
+            traces: t.map(|t| [t].into()),
+            ..Self::default()
         }
-        let p = b.column(col_idx(c::PROJECT_ID)).as_string::<i32>();
-        let t = b.column(col_idx(c::TRACE_ID)).as_binary::<i32>();
-        Some(
+    }
+
+    /// The rows that pass the KEY filters (never time: start_time is mutable before the merge); None = no key
+    /// filter. Columns are found by name, so any batch with the key columns works.
+    pub(crate) fn key_mask(&self, b: &RecordBatch) -> Result<Option<BooleanArray>, ArrowError> {
+        if self.projects.is_none() && self.traces.is_none() && self.spans.is_none() {
+            return Ok(None);
+        }
+        let s = b.schema_ref();
+        let p = b.column(s.index_of(c::PROJECT_ID)?).as_string::<i32>();
+        let t = b.column(s.index_of(c::TRACE_ID)?).as_binary::<i32>();
+        let sp = match &self.spans {
+            Some(_) => Some(b.column(s.index_of(c::SPAN_ID)?).as_binary::<i32>()),
+            None => None,
+        };
+        let trace = |i: usize| TraceId::from_slice(t.value(i)).ok();
+        Ok(Some(
             (0..b.num_rows())
                 .map(|i| {
                     self.projects.as_ref().is_none_or(|s| s.contains(p.value(i)))
                         && self
                             .traces
                             .as_ref()
-                            .is_none_or(|s| TraceId::from_slice(t.value(i)).is_ok_and(|x| s.contains(&x)))
+                            .is_none_or(|s| trace(i).is_some_and(|x| s.contains(&x)))
+                        && self.spans.as_ref().is_none_or(|s| {
+                            let span = sp.and_then(|a| SpanId::from_slice(a.value(i)).ok());
+                            trace(i).zip(span).is_some_and(|k| s.contains(&k))
+                        })
                 })
                 .map(Some)
                 .collect(),
-        )
+        ))
     }
 }

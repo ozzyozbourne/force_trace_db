@@ -1,18 +1,12 @@
 //! Trace fast path (D3): `locate_trace` row ranges + memtable rows -> merge -> tree -> JSON. No DataFusion.
+use crate::filters::KeyFilters;
+use crate::read::{merge_or_filter, needs_merge, read_columns};
 use crate::tree::TraceTree;
-use crate::{QueryEngine, QueryError};
-use arrow::array::{AsArray, BooleanArray, RecordBatch};
-use arrow::compute::filter_record_batch;
-use arrow::datatypes::SchemaRef;
-use forge_model::MemtableSnapshot;
-use forge_model::catalog::SegmentMeta;
-use forge_model::derived::with_effective_total_tokens;
+use crate::{QueryEngine, QueryError, QueryKind};
+use arrow::array::RecordBatch;
 use forge_model::ids::{ProjectId, TraceId};
-use forge_model::merge::{Cancel, CancelOnDrop, Tombstones, merge_projected};
-use forge_model::schema::{ALL_COLUMNS, PAYLOAD_COLUMNS, col, col_idx, projected_schema};
-use forge_storage::{RowSelection, ScanRequest, SegmentStore};
-use futures::{StreamExt, TryStreamExt};
-use std::sync::Arc;
+use forge_model::merge::Cancel;
+use forge_model::schema::{ALL_COLUMNS, PAYLOAD_COLUMNS, col, projected_schema};
 
 #[derive(Clone, Debug)]
 pub struct TraceRequest {
@@ -61,7 +55,7 @@ impl TraceRequest {
 }
 
 /// Every column but dotted_order (D4: the tree comes from parent_span_id), and no payloads when `!payloads`.
-fn trace_columns(payloads: bool) -> Vec<&'static str> {
+pub(crate) fn trace_columns(payloads: bool) -> Vec<&'static str> {
     ALL_COLUMNS
         .iter()
         .copied()
@@ -70,68 +64,17 @@ fn trace_columns(payloads: bool) -> Vec<&'static str> {
 }
 
 pub struct LoadedTrace {
-    /// Merged rows (trace columns, effective total_tokens), in key order.
+    /// Merged rows (trace columns, effective total_tokens), one per span; in key order unless they come from one
+    /// segment alone (then in its physical order).
     pub rows: RecordBatch,
     pub tree: TraceTree,
-}
-
-/// Scans (segment, selection) parts, 8 at a time.
-pub(crate) async fn scan_parts(
-    store: &Arc<dyn SegmentStore>,
-    parts: Vec<(SegmentMeta, RowSelection)>,
-    cols: &[&'static str],
-) -> Result<Vec<RecordBatch>, QueryError> {
-    let out: Vec<Vec<RecordBatch>> = futures::stream::iter(parts)
-        .map(|(seg, rows)| {
-            let store = store.clone();
-            let req = ScanRequest {
-                projection: Some(cols.to_vec()),
-                rows,
-                filter: None,
-                limit: None,
-            };
-            async move { store.scan(&seg, req).await?.try_collect::<Vec<_>>().await }
-        })
-        .buffer_unordered(8)
-        .try_collect()
-        .await?;
-    Ok(out.into_iter().flatten().collect())
-}
-
-/// Memtable rows projected to `schema`, masked by `mask` (evaluated on the full batch); empty results dropped.
-pub(crate) fn mem_rows(
-    snap: &MemtableSnapshot,
-    schema: &SchemaRef,
-    mask: impl Fn(&RecordBatch) -> BooleanArray,
-) -> Result<Vec<RecordBatch>, QueryError> {
-    let idx: Vec<usize> = schema.fields().iter().map(|f| col_idx(f.name())).collect();
-    let mut out = Vec::new();
-    for b in snap.batches() {
-        let m = mask(b);
-        if m.true_count() > 0 {
-            out.push(filter_record_batch(&b.project(&idx)?, &m)?);
-        }
-    }
-    Ok(out)
-}
-
-/// `project_id == project` (and `trace_id == trace`) on a spans_schema batch.
-pub(crate) fn key_mask(b: &RecordBatch, project: &ProjectId, trace: Option<TraceId>) -> BooleanArray {
-    let p = b.column(col_idx(col::PROJECT_ID)).as_string::<i32>();
-    let t = b.column(col_idx(col::TRACE_ID)).as_binary::<i32>();
-    (0..b.num_rows())
-        .map(|i| Some(p.value(i) == project.as_str() && trace.is_none_or(|x| t.value(i) == x.as_bytes())))
-        .collect()
 }
 
 impl QueryEngine {
     /// Merged rows and tree of one trace; NotFound when it has no live span.
     pub async fn load_trace(&self, r: &TraceRequest) -> Result<LoadedTrace, QueryError> {
-        self.deadline(
-            self.cfg.timeout,
-            self.trace_blocking(r, |rows, tree, _| Ok(LoadedTrace { rows, tree })),
-        )
-        .await
+        self.trace_blocking(r, |rows, tree, _| Ok(LoadedTrace { rows, tree }))
+            .await
     }
 
     /// The trace as JSON (D5), nested or flat.
@@ -146,7 +89,7 @@ impl QueryEngine {
             crate::json::write_trace(&mut out, &project, &trace, &rows, &tree, flat, c)?;
             Ok(out)
         };
-        self.deadline(self.cfg.timeout, self.trace_blocking(r, write)).await
+        self.trace_blocking(r, write).await
     }
 
     /// Gathers every version of the trace's keys, then merges, builds the tree and runs `finish` on the blocking
@@ -156,33 +99,34 @@ impl QueryEngine {
         r: &TraceRequest,
         finish: impl FnOnce(RecordBatch, TraceTree, &Cancel) -> Result<T, QueryError> + Send + 'static,
     ) -> Result<T, QueryError> {
-        let first = (!self.snapshot_after_list).then(|| self.mem.snapshot()); // FIRST (invariant 1)
-        let locs = self.meta.locate_trace(&r.project, r.trace).await?;
-        let snap = first.unwrap_or_else(|| self.mem.snapshot());
-        let cols = trace_columns(r.payloads);
-        let schema = projected_schema(&cols);
-        let parts = locs
-            .iter()
-            .map(|l| (l.segment.clone(), RowSelection::Range(l.rows())))
-            .collect();
-        let mut batches = scan_parts(&self.store, parts, &cols).await?;
-        batches.extend(mem_rows(&snap, &schema, |b| key_mask(b, &r.project, Some(r.trace)))?);
-        drop(snap);
-        let reservation = self.fast_reservation("trace", &batches)?;
-        let cancel = self.new_cancel();
-        let _guard = CancelOnDrop(cancel.clone());
-        let not_found = format!("trace {} not found in project {}", r.trace, r.project);
-        let out = tokio::task::spawn_blocking(move || {
-            let m = with_effective_total_tokens(&merge_projected(&schema, &batches, Tombstones::Drop, &cancel)?)?;
-            drop(batches);
-            if m.num_rows() == 0 {
-                return Err(QueryError::NotFound(not_found));
-            }
-            let tree = TraceTree::build(&m, &cancel)?;
-            finish(m, tree, &cancel)
+        let q = self.ctx(QueryKind::Fast, self.cfg.timeout);
+        q.run(async {
+            let view = self.read_view(); // FIRST (invariant 1)
+            let k = KeyFilters::project(&r.project, Some(r.trace));
+            let cols = read_columns(&trace_columns(r.payloads));
+            let schema = projected_schema(&cols);
+            let parts = view.locate_versions(&k).await?;
+            let mut batches = view.scan(&parts, &cols, None).await?;
+            let mem = view.mem_versions(&k, &schema)?;
+            let merge = needs_merge(&parts, !mem.is_empty());
+            batches.extend(mem);
+            drop(view);
+            let reservation = q.reserve("trace", &batches)?;
+            let not_found = format!("trace {} not found in project {}", r.trace, r.project);
+            let out = q
+                .blocking(move |cancel| {
+                    let m = merge_or_filter(&schema, &batches, merge, cancel)?;
+                    drop(batches);
+                    if m.num_rows() == 0 {
+                        return Err(QueryError::NotFound(not_found));
+                    }
+                    let tree = TraceTree::build(&m, cancel)?;
+                    finish(m, tree, cancel)
+                })
+                .await?;
+            drop(reservation);
+            Ok(out)
         })
-        .await??;
-        drop(reservation);
-        Ok(out)
+        .await
     }
 }

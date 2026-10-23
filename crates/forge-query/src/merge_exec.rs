@@ -20,7 +20,7 @@ use forge_model::merge::{Cancel, CancelOnDrop, Tombstones, merge_versions_projec
 use forge_model::schema::col;
 use futures::{StreamExt, TryStreamExt};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Every version of a key lands in one partition when the input is hash-partitioned on these.
 const PARTITION_COLUMNS: [&str; 2] = [col::PROJECT_ID, col::TRACE_ID];
@@ -28,13 +28,15 @@ const PARTITION_COLUMNS: [&str; 2] = [col::PROJECT_ID, col::TRACE_ID];
 /// Requires hash(project_id, trace_id) input so every version of a key is in one partition; if the input is not
 /// so partitioned it gathers ALL input partitions into one output partition (always correct).
 #[derive(Debug)]
-pub struct MergeVersionsExec {
+pub(crate) struct MergeVersionsExec {
     input: Arc<dyn ExecutionPlan>,
     per_partition: bool,
     props: Arc<PlanProperties>,
-    /// Makes each partition's `Cancel` (`Cancel::new`; tests inject others) and remembers the latest one.
+    /// Tests: makes each partition's `Cancel` and remembers the latest one.
+    #[cfg(test)]
     new_cancel: fn() -> Cancel,
-    last_cancel: Mutex<Option<Cancel>>,
+    #[cfg(test)]
+    last_cancel: std::sync::Mutex<Option<Cancel>>,
 }
 
 fn hash_exprs(schema: &Schema) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
@@ -71,8 +73,10 @@ impl MergeVersionsExec {
             input,
             per_partition,
             props: Arc::new(props),
+            #[cfg(test)]
             new_cancel: Cancel::new,
-            last_cancel: Mutex::default(),
+            #[cfg(test)]
+            last_cancel: Default::default(),
         })
     }
 }
@@ -140,8 +144,14 @@ impl ExecutionPlan for MergeVersionsExec {
         let permit = ctx.session_config().get_extension::<QueryPermit>();
         let reservation = MemoryConsumer::new(format!("MergeVersionsExec[{partition}]")).register(ctx.memory_pool());
         let s2 = schema.clone();
+        #[cfg(not(test))]
+        let cancel = Cancel::new();
+        #[cfg(test)]
         let cancel = (self.new_cancel)();
-        *self.last_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
+        #[cfg(test)]
+        {
+            *self.last_cancel.lock().unwrap() = Some(cancel.clone());
+        }
         let fut = async move {
             // Owned by the future: dropping the stream at any point sets the flag.
             let guard = CancelOnDrop(cancel.clone());

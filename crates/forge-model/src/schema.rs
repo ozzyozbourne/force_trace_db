@@ -131,6 +131,19 @@ pub fn projected_schema(cols: &[&str]) -> SchemaRef {
     let idx: Vec<usize> = cols.iter().map(|c| col_idx(c)).collect();
     Arc::new(SPANS.project(&idx).expect("valid projection"))
 }
+/// `b`'s columns named by `schema`, in `schema`'s order (looked up by name: works on full and projected batches).
+pub fn project_to(
+    b: &arrow::record_batch::RecordBatch,
+    schema: &SchemaRef,
+) -> Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError> {
+    let s = b.schema_ref();
+    let idx = schema
+        .fields()
+        .iter()
+        .map(|f| s.index_of(f.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    b.project(&idx)
+}
 
 #[cfg(test)]
 mod tests {

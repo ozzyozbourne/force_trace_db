@@ -2308,6 +2308,7 @@ dependencies = [
  "forge-ingest",
  "forge-meta",
  "forge-model",
+ "forge-query",
  "forge-storage",
  "futures",
  "hex",

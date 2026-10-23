@@ -5,9 +5,10 @@ use crate::derived::effective_total_tokens_expr;
 use crate::ext;
 use crate::filters::{KeyFilters, classify};
 use crate::merge_exec::MergeVersionsExec;
+use crate::read::{ReadView, SegmentPart, needs_merge, read_columns};
 use crate::scan::SegmentScanExec;
 use arrow::array::{Array, AsArray, RecordBatch, UInt32Array};
-use arrow::compute::{filter_record_batch, take_record_batch};
+use arrow::compute::take_record_batch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
@@ -24,101 +25,50 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::{col, not};
 use forge_meta::{Metastore, SegmentFilter};
 use forge_model::MemtableView;
-use forge_model::catalog::{SegmentId, SegmentMeta};
 use forge_model::ids::{ProjectId, TraceId};
-use forge_model::merge::MERGE_COLUMNS;
-use forge_model::schema::{ALL_COLUMNS, col as c, col_idx, spans_schema};
+use forge_model::schema::{ALL_COLUMNS, col as c, projected_schema, spans_schema};
 use forge_storage::{RowSelection, SegmentStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub struct SpansTableProvider {
+pub(crate) struct SpansTableProvider {
     pub meta: Arc<dyn Metastore>,
     pub segments: Arc<dyn SegmentStore>,
     pub memtable: Arc<dyn MemtableView>,
 }
 
-/// One segment's partitions: one per row range (trace_index) or one `All`.
-#[derive(Clone, Debug)]
-pub struct SegmentPart {
-    pub seg: SegmentMeta,
-    pub rows: RowSelection,
-}
-
-impl SpansTableProvider {
-    /// Candidate segment parts by project. Key filters go to the metastore; time pruning = may_overlap_time
-    /// (start_time_nulls == 0 only, decision 5).
-    async fn plan_segments(&self, k: &KeyFilters) -> Result<BTreeMap<String, Vec<SegmentPart>>> {
-        let mut out: BTreeMap<String, Vec<SegmentPart>> = BTreeMap::new();
-        let valid = |p: &String| ProjectId::new(p.as_str()).ok();
-        match (&k.projects, &k.traces) {
-            (Some(ps), Some(ts)) => {
-                // One batched locate per project (D16).
-                let traces: Vec<TraceId> = ts.iter().copied().collect();
-                let mut by_seg: BTreeMap<SegmentId, (SegmentMeta, Vec<std::ops::Range<u64>>)> = BTreeMap::new();
-                for p in ps.iter().filter_map(valid) {
-                    for loc in self
-                        .meta
-                        .locate_traces(&p, &traces)
-                        .await
-                        .map_err(ext)?
-                        .into_values()
-                        .flatten()
-                    {
-                        if !loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
-                            continue;
-                        }
-                        let e = by_seg
-                            .entry(loc.segment.id)
-                            .or_insert_with(|| (loc.segment.clone(), vec![]));
-                        e.1.push(loc.rows());
-                    }
-                }
-                for (_, (seg, ranges)) in by_seg {
-                    let parts = out.entry(seg.project_id.to_string()).or_default();
-                    parts.extend(ranges.into_iter().map(|r| SegmentPart {
-                        seg: seg.clone(),
-                        rows: RowSelection::Range(r),
-                    }));
-                }
-            }
-            _ => {
-                let filters: Vec<SegmentFilter> = match &k.projects {
-                    Some(ps) => ps
-                        .iter()
-                        .filter_map(valid)
-                        .map(|p| SegmentFilter {
-                            project_id: Some(p),
-                            ..Default::default()
-                        })
-                        .collect(),
-                    None => vec![SegmentFilter::default()],
-                };
-                for mut f in filters {
-                    (f.start_ns, f.end_ns) = (k.start_ns, k.end_ns);
-                    for seg in self.meta.list_segments(&f).await.map_err(ext)? {
-                        out.entry(seg.project_id.to_string()).or_default().push(SegmentPart {
-                            seg,
-                            rows: RowSelection::All,
-                        });
-                    }
-                }
-            }
+/// Candidate segment parts by project. Key filters go to the metastore; time pruning = may_overlap_time
+/// (start_time_nulls == 0 only, decision 5).
+async fn plan_segments(view: &ReadView, k: &KeyFilters) -> Result<BTreeMap<String, Vec<SegmentPart>>> {
+    let mut out: BTreeMap<String, Vec<SegmentPart>> = BTreeMap::new();
+    if k.projects.is_some() && k.traces.is_some() {
+        for part in view.locate_versions(k).await.map_err(ext)? {
+            out.entry(part.seg.project_id.to_string()).or_default().push(part);
         }
-        Ok(out)
+        return Ok(out);
     }
-}
-
-/// Unprojected column indices the plan must read: the output columns + merge columns (+ the counts when
-/// total_tokens is derived). Ascending = spans_schema order.
-pub fn read_columns(out: &[usize]) -> Vec<usize> {
-    let mut s: BTreeSet<usize> = out.iter().copied().collect();
-    s.extend(MERGE_COLUMNS.iter().map(|n| col_idx(n)));
-    if s.contains(&col_idx(c::TOTAL_TOKENS)) {
-        s.extend([col_idx(c::PROMPT_TOKENS), col_idx(c::COMPLETION_TOKENS)]);
+    let filters: Vec<SegmentFilter> = match &k.projects {
+        Some(ps) => ps
+            .iter()
+            .filter_map(|p| ProjectId::new(p.as_str()).ok())
+            .map(|p| SegmentFilter {
+                project_id: Some(p),
+                ..Default::default()
+            })
+            .collect(),
+        None => vec![SegmentFilter::default()],
+    };
+    for mut f in filters {
+        (f.start_ns, f.end_ns) = (k.start_ns, k.end_ns);
+        for seg in view.list_segments(&f).await.map_err(ext)? {
+            out.entry(seg.project_id.to_string()).or_default().push(SegmentPart {
+                seg,
+                rows: RowSelection::All,
+            });
+        }
     }
-    s.into_iter().collect()
+    Ok(out)
 }
 
 /// The trace_id IN filter for scans that cannot use trace_index (no project filter). Key column: allowed
@@ -168,29 +118,23 @@ impl TableProvider for SpansTableProvider {
         filters: &[Expr],
         _limit: Option<usize>, // never below the merge; DataFusion keeps its own limit above
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Invariant 1: memtable snapshot BEFORE any metastore call.
-        let mem = self.memtable.snapshot();
+        let view = ReadView::new(&*self.memtable, &self.meta, &self.segments); // FIRST (invariant 1)
         let k = KeyFilters::from_exprs(filters);
-        let full = spans_schema();
-        let out_cols: Vec<usize> = projection
-            .cloned()
-            .unwrap_or_else(|| (0..full.fields().len()).collect());
-        let read = read_columns(&out_cols);
-        let read_schema: SchemaRef = Arc::new(full.project(&read)?);
-        let names: Vec<&'static str> = read.iter().map(|&i| ALL_COLUMNS[i]).collect();
+        let out_cols: Vec<&'static str> = match projection {
+            Some(p) => p.iter().map(|&i| ALL_COLUMNS[i]).collect(),
+            None => ALL_COLUMNS.to_vec(),
+        };
+        let names = read_columns(&out_cols);
+        let read_schema = projected_schema(&names);
 
         let mut groups: BTreeMap<String, (Vec<SegmentPart>, Vec<RecordBatch>)> = BTreeMap::new();
         if !k.empty() {
-            for (p, parts) in self.plan_segments(&k).await? {
+            for (p, parts) in plan_segments(&view, &k).await? {
                 groups.entry(p).or_default().0 = parts;
             }
-            // Memtable rows: key filters only, then projected and split by project.
-            for b in mem.batches() {
-                let b = match k.key_mask(b) {
-                    Some(m) => filter_record_batch(b, &m)?,
-                    None => b.clone(),
-                };
-                for (p, part) in split_rows_by_project(&b.project(&read)?)? {
+            // Memtable rows: key filters only, split by project.
+            for b in view.mem_versions(&k, &read_schema)? {
+                for (p, part) in split_rows_by_project(&b)? {
                     groups.entry(p).or_default().1.push(part);
                 }
             }
@@ -203,8 +147,8 @@ impl TableProvider for SpansTableProvider {
         let df_read = DFSchema::try_from(read_schema.as_ref().clone())?;
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         for (_, (parts, mem)) in groups {
+            let merge = needs_merge(&parts, !mem.is_empty());
             let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            let distinct: BTreeSet<SegmentId> = parts.iter().map(|p| p.seg.id).collect();
             if !parts.is_empty() {
                 inputs.push(Arc::new(SegmentScanExec::new(
                     self.segments.clone(),
@@ -214,19 +158,16 @@ impl TableProvider for SpansTableProvider {
                     filter.clone(),
                 )));
             }
-            let no_mem = mem.is_empty();
-            if !no_mem {
+            if !mem.is_empty() {
                 inputs.push(MemorySourceConfig::try_new_exec(&[mem], read_schema.clone(), None)?);
             }
-            // Disjoint: ONE segment and no memtable rows for this project. Its rows are already one per key
-            // (invariant 3); only tombstones must go.
-            let plan: Arc<dyn ExecutionPlan> = if no_mem && distinct.len() == 1 {
+            plans.push(if merge {
+                Arc::new(MergeVersionsExec::try_new(UnionExec::try_new(inputs)?)?)
+            } else {
+                // One segment: its rows are already one per key; only tombstones must go.
                 let pred = state.create_physical_expr(not(col(c::DELETED)), &df_read)?;
                 Arc::new(FilterExec::try_new(pred, inputs.pop().unwrap())?)
-            } else {
-                Arc::new(MergeVersionsExec::try_new(UnionExec::try_new(inputs)?)?)
-            };
-            plans.push(plan);
+            });
         }
         let merged: Arc<dyn ExecutionPlan> = match plans.len() {
             0 => Arc::new(EmptyExec::new(read_schema.clone())),
@@ -236,8 +177,7 @@ impl TableProvider for SpansTableProvider {
         // Output projection, with the derived total_tokens (decision 15) for EVERY read path.
         let exprs = out_cols
             .iter()
-            .map(|&i| {
-                let name = ALL_COLUMNS[i];
+            .map(|&name| {
                 let e: Arc<dyn PhysicalExpr> = if name == c::TOTAL_TOKENS {
                     state.create_physical_expr(effective_total_tokens_expr(), &df_read)?
                 } else {

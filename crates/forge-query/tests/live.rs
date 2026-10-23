@@ -223,8 +223,9 @@ async fn flush_between_snapshot_and_listing() {
                 p.flush_now().await.unwrap().expect("flushed");
             })
         });
-        let mut engine = QueryEngine::new(
-            Arc::new(hooked),
+        let hooked: Arc<dyn Metastore> = Arc::new(hooked);
+        let engine = QueryEngine::new(
+            hooked.clone(),
             s.store.clone(),
             s.pipeline.memtable_view(),
             QueryConfig::default(),
@@ -249,9 +250,13 @@ async fn flush_between_snapshot_and_listing() {
                 assert_eq!(keys(&b).len(), SPANS as usize);
             }
             _ => {
-                engine.snapshot_after_list = true;
-                let e = engine.load_trace(&req).await;
-                assert!(e.is_err(), "the wrong order must lose the trace");
+                // The wrong order: the metastore call (which flushes and releases), THEN the snapshot.
+                let locs = hooked.locate_trace(&pid("live"), tid(1)).await.unwrap();
+                let snap = s.pipeline.memtable_view().snapshot();
+                assert!(
+                    locs.is_empty() && snap.is_empty(),
+                    "the wrong order must lose the trace"
+                );
             }
         }
         assert_eq!(

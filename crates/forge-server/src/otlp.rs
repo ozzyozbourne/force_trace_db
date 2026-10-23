@@ -1,5 +1,5 @@
 //! OTLP receivers (forge-server): gRPC TraceService on 4317 and POST /v1/traces on 4318.
-use crate::error::{grpc_code, http_status, retry_after};
+use crate::error::{error_response, grpc_code};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -211,11 +211,7 @@ fn encode_err(enc: Encoding, e: ExportError) -> Response {
             serde_json::to_vec(&serde_json::json!({"code": code as i32, "message": e.msg})).expect("json")
         }
     };
-    let mut r = (http_status(kind), [(header::CONTENT_TYPE, enc.content_type())], body).into_response();
-    if let Some(v) = retry_after(kind) {
-        r.headers_mut().insert(header::RETRY_AFTER, v);
-    }
-    r
+    error_response(kind, ([(header::CONTENT_TYPE, enc.content_type())], body))
 }
 
 fn decode(enc: Encoding, body: &[u8]) -> Result<ExportTraceServiceRequest, ExportError> {

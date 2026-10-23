@@ -7,24 +7,22 @@
 //! are filtered. Segments are read newest `max_start` first; the page is final once K verified rows all start
 //! after the next unread segment's `max_start`. No budget: a deep page costs O(segments overlapping the window)
 //! (M3's per-hour L1 bounds that).
+use crate::filters::KeyFilters;
 use crate::json::SpanCols;
-use crate::trace::{key_mask, mem_rows, scan_parts};
-use crate::{QueryEngine, QueryError};
+use crate::read::{ReadView, SegmentPart, merge_or_filter, needs_merge, read_columns};
+use crate::{QueryCtx, QueryEngine, QueryError, QueryKind};
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
 use forge_meta::SegmentFilter;
-use forge_model::MemtableSnapshot;
-use forge_model::derived::with_effective_total_tokens;
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
-use forge_model::merge::{CancelOnDrop, Tombstones, merge_projected};
 use forge_model::schema::{col, projected_schema};
 use forge_storage::RowSelection;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-/// What a list reads: never payload, never dotted_order.
+/// What a list returns: never payload, never dotted_order (== `trace_columns(false)`).
 pub const RUN_COLUMNS: [&str; 21] = [
     col::PROJECT_ID,
     col::TRACE_ID,
@@ -206,17 +204,17 @@ fn positions(b: &RecordBatch) -> Vec<Option<Pos>> {
 
 impl QueryEngine {
     pub async fn list_runs(&self, r: &RunsRequest) -> Result<RunsPage, QueryError> {
-        self.deadline(self.cfg.timeout, self.list_runs_inner(r)).await
+        let q = self.ctx(QueryKind::Fast, self.cfg.timeout);
+        q.run(self.list_runs_inner(&q, r)).await
     }
 
     /// `{"runs":[…],"next_cursor":hex|null}`; spans written like the trace path, plus `trace_id`, no children.
     pub async fn runs_json(&self, r: &RunsRequest) -> Result<Vec<u8>, QueryError> {
-        self.deadline(self.cfg.timeout, async {
-            let page = self.list_runs_inner(r).await?;
+        let q = self.ctx(QueryKind::Fast, self.cfg.timeout);
+        q.run(async {
+            let page = self.list_runs_inner(&q, r).await?;
             let cursor = page.next_cursor.map(|c| r.encode_cursor(&c));
-            let cancel = self.new_cancel();
-            let _guard = CancelOnDrop(cancel.clone());
-            let out = tokio::task::spawn_blocking(move || {
+            q.blocking(move |cancel| {
                 let cols = SpanCols::new(&page.rows, true);
                 let mut out = b"{\"runs\":[".to_vec();
                 for i in 0..page.rows.num_rows() {
@@ -236,18 +234,18 @@ impl QueryEngine {
                     None => out.extend_from_slice(b"null"),
                 }
                 out.push(b'}');
-                Ok::<_, QueryError>(out)
+                Ok(out)
             })
-            .await??;
-            Ok(out)
+            .await
         })
         .await
     }
 
-    async fn list_runs_inner(&self, r: &RunsRequest) -> Result<RunsPage, QueryError> {
+    async fn list_runs_inner(&self, q: &QueryCtx, r: &RunsRequest) -> Result<RunsPage, QueryError> {
         let k = r.limit.max(1);
-        let schema = projected_schema(&RUN_COLUMNS);
-        let snap = self.mem.snapshot(); // FIRST (invariant 1)
+        let view = self.read_view(); // FIRST (invariant 1)
+        let cols = read_columns(&RUN_COLUMNS);
+        let schema = projected_schema(&cols);
         // Exclusive upper bound on start: the window end and, via the cursor, start <= cursor.start.
         let hi = match r.cursor.and_then(|Cursor(c)| c.0.checked_add(1)) {
             Some(c) => Some(r.end_ns.map_or(c, |e| e.min(c))),
@@ -261,15 +259,14 @@ impl QueryEngine {
             ..Default::default()
         };
         // All-null-start segments hold no candidates (their rows are still read by verify via locate_traces).
-        let segs: Vec<_> = self
-            .meta
+        let segs: Vec<_> = view
             .list_segments(&filter)
             .await?
             .into_iter()
             .filter(|s| s.max_start_ns.is_some())
             .collect();
         let mut cand: BTreeSet<Reverse<Pos>> = BTreeSet::new();
-        for b in mem_rows(&snap, &schema, |b| key_mask(b, &r.project, None))? {
+        for b in view.mem_versions(&KeyFilters::project(&r.project, None), &schema)? {
             candidates(r, hi, &b, &mut cand);
         }
         let mut checked: HashSet<Pos> = HashSet::new();
@@ -284,7 +281,7 @@ impl QueryEngine {
                 .filter(|p| !checked.contains(p) && frontier.is_none_or(|f| p.0 > f))
                 .collect();
             if !wave.is_empty() {
-                let b = self.verify(r, hi, &schema, &snap, &wave).await?;
+                let b = self.verify(q, &view, r, hi, &cols, &wave).await?;
                 checked.extend(wave);
                 for (row, p) in positions(&b).into_iter().enumerate() {
                     verified.insert(Reverse(p.expect("verified rows have a start")), (merged.len(), row));
@@ -299,10 +296,13 @@ impl QueryEngine {
             // Read segs[i] and every following segment with the same max_start (ties together).
             let mut parts = Vec::new();
             while segs.get(i).is_some_and(|s| s.max_start_ns == Some(f)) {
-                parts.push((segs[i].clone(), RowSelection::All));
+                parts.push(SegmentPart {
+                    seg: segs[i].clone(),
+                    rows: RowSelection::All,
+                });
                 i += 1;
             }
-            for b in scan_parts(&self.store, parts, &RUN_COLUMNS).await? {
+            for b in view.scan(&parts, &cols, None).await? {
                 candidates(r, hi, &b, &mut cand);
             }
         }
@@ -321,54 +321,35 @@ impl QueryEngine {
     /// the merged rows that pass EVERY filter.
     async fn verify(
         &self,
+        q: &QueryCtx,
+        view: &ReadView,
         r: &RunsRequest,
         hi: Option<i64>,
-        schema: &SchemaRef,
-        snap: &MemtableSnapshot,
+        cols: &[&'static str],
         wave: &[Pos],
     ) -> Result<RecordBatch, QueryError> {
-        let keys: HashSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
-        let traces: Vec<TraceId> = keys.iter().map(|k| k.0).collect::<BTreeSet<_>>().into_iter().collect();
-        let locs = self.meta.locate_traces(&r.project, &traces).await?;
-        let parts = locs
-            .into_values()
-            .flatten()
-            .map(|l| (l.segment.clone(), RowSelection::Range(l.rows())))
-            .collect();
-        let in_keys = |b: &RecordBatch| -> BooleanArray {
-            let s = b.schema_ref();
-            let p = b
-                .column(s.index_of(col::PROJECT_ID).expect("project"))
-                .as_string::<i32>();
-            let t = b.column(s.index_of(col::TRACE_ID).expect("trace")).as_binary::<i32>();
-            let sp = b.column(s.index_of(col::SPAN_ID).expect("span")).as_binary::<i32>();
-            (0..b.num_rows())
-                .map(|i| {
-                    let key = TraceId::from_slice(t.value(i))
-                        .ok()
-                        .zip(SpanId::from_slice(sp.value(i)).ok());
-                    Some(p.value(i) == r.project.as_str() && key.is_some_and(|k| keys.contains(&k)))
-                })
-                .collect()
+        let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
+        let k = KeyFilters {
+            traces: Some(keys.iter().map(|k| k.0).collect()),
+            spans: Some(keys),
+            ..KeyFilters::project(&r.project, None)
         };
+        let schema: SchemaRef = projected_schema(cols);
+        let parts = view.locate_versions(&k).await?;
         let mut batches = Vec::new();
-        for b in scan_parts(&self.store, parts, &RUN_COLUMNS).await? {
-            batches.push(filter_record_batch(&b, &in_keys(&b))?);
+        for b in view.scan(&parts, cols, None).await? {
+            batches.push(match k.key_mask(&b)? {
+                Some(m) => filter_record_batch(&b, &m)?,
+                None => b,
+            });
         }
-        batches.extend(mem_rows(snap, schema, in_keys)?);
-        let reservation = self.fast_reservation("runs", &batches)?;
-        let cancel = self.new_cancel();
-        let _guard = CancelOnDrop(cancel.clone());
-        let s2 = schema.clone();
-        let m = tokio::task::spawn_blocking(move || {
-            Ok::<_, QueryError>(with_effective_total_tokens(&merge_projected(
-                &s2,
-                &batches,
-                Tombstones::Drop,
-                &cancel,
-            )?)?)
-        })
-        .await??;
+        let mem = view.mem_versions(&k, &schema)?;
+        let merge = needs_merge(&parts, !mem.is_empty());
+        batches.extend(mem);
+        let reservation = q.reserve("runs", &batches)?;
+        let m = q
+            .blocking(move |cancel| merge_or_filter(&schema, &batches, merge, cancel))
+            .await?;
         drop(reservation);
         let s = m.schema_ref();
         let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
@@ -425,5 +406,21 @@ fn candidates(r: &RunsRequest, hi: Option<i64>, b: &RecordBatch, out: &mut BTree
         {
             out.insert(Reverse(pos));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The list returns the trace path's columns without payloads, and reads nothing more.
+    #[test]
+    fn run_columns() {
+        assert_eq!(crate::trace::trace_columns(false), RUN_COLUMNS);
+        assert_eq!(read_columns(&RUN_COLUMNS), RUN_COLUMNS);
+        assert_eq!(
+            read_columns(&crate::trace::trace_columns(true)),
+            crate::trace::trace_columns(true)
+        );
     }
 }

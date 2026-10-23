@@ -3,7 +3,6 @@
 mod common;
 
 use arrow::array::{AsArray, RecordBatch};
-use arrow::compute::concat_batches;
 use arrow::datatypes::TimestampNanosecondType;
 use common::*;
 use forge_model::config::QueryConfig;
@@ -20,15 +19,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 type Pos = (i64, TraceId, SpanId);
-
-async fn sql(fx: &Fixture, q: &str) -> RecordBatch {
-    let b = fx.engine.sql_batches(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
-    let schema = b
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
-    concat_batches(&schema, &b).unwrap()
-}
 
 fn span_at(b: &RecordBatch, row: usize) -> SpanId {
     let c = b.column(b.schema().index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
@@ -117,7 +107,11 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
                 cols.join(", "),
                 hex_lit(trace.as_bytes())
             );
-            assert_eq!(sort_by_key(&sql(fx, &q).await).columns(), want.columns(), "{ctx}: SQL");
+            assert_eq!(
+                sort_by_key(&sql(&fx.engine, &q).await).columns(),
+                want.columns(),
+                "{ctx}: SQL"
+            );
             let tree = ref_tree(&rows);
             let got: Vec<RefNode> = lt
                 .tree
@@ -200,7 +194,7 @@ async fn check_runs(fx: &Fixture, reference: &[SpanRow], seed: u64, limit_one: b
              AND start_time IS NOT NULL ORDER BY start_time DESC, trace_id DESC, span_id DESC"
         );
         assert_eq!(
-            positions(&sql(fx, &q).await),
+            positions(&sql(&fx.engine, &q).await),
             ref_runs(reference, &base),
             "{project}: SQL runs"
         );
@@ -396,7 +390,7 @@ async fn check_fixture(seed: u64, limit_one: bool) {
         "SELECT total_tokens FROM spans WHERE project_id = 'a' AND trace_id = {} ORDER BY span_id",
         hex_lit(tid(114).as_bytes())
     );
-    let b = sql(&fx, &q).await;
+    let b = sql(&fx.engine, &q).await;
     let mut got: Vec<i64> = b
         .column(0)
         .as_primitive::<arrow::datatypes::Int64Type>()

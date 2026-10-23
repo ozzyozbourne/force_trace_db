@@ -1,14 +1,14 @@
 //! SQL through `SpansTableProvider` vs the reference merge, plan shape, payload pruning, and limits (plan §6.4).
 mod common;
 
-use arrow::array::{Array, AsArray, RecordBatch};
-use arrow::compute::concat_batches;
+use arrow::array::{Array, AsArray};
 use arrow::datatypes::{Float64Type, Int64Type};
 use common::*;
 use datafusion::physical_plan::ExecutionPlan;
 use forge_model::config::QueryConfig;
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::error::{Classify, ErrorKind};
+use forge_model::merge::Cancel;
 use forge_model::row::SpanRow;
 use forge_model::schema::{ALL_COLUMNS, KEY_COLUMNS, PAYLOAD_COLUMNS, col};
 use forge_model::testing::{pid, tid};
@@ -19,15 +19,6 @@ use forge_query::{QueryEngine, QueryError};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-async fn sql(e: &QueryEngine, q: &str) -> RecordBatch {
-    let b = e.sql_batches(q).await.unwrap_or_else(|err| panic!("{q}: {err}"));
-    let schema = match b.first() {
-        Some(b) => b.schema(),
-        None => Arc::new(e.session().unwrap().sql(q).await.unwrap().schema().as_arrow().clone()),
-    };
-    concat_batches(&schema, &b).unwrap()
-}
 
 async fn physical(e: &QueryEngine, q: &str) -> Arc<dyn ExecutionPlan> {
     e.session()
@@ -556,40 +547,33 @@ async fn deadlines_cover_planning_and_scans() {
     }
 }
 
-/// Dropping a trace_json future while its blocking work runs sets that work's cancel flag.
+/// Dropping a trace_json future while its blocking work runs sets that work's cancel flag (the blocking hook
+/// holds the work until the flag is set).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_trace_future_cancels() {
-    let fx = Fixture::build(big_trace(6000, 2, 50, 64, 3), Traps::default(), QueryConfig::default()).await;
+    let mut fx = Fixture::build(big_trace(300, 2, 50, 64, 3), Traps::default(), QueryConfig::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cancel>();
+    fx.engine.blocking_hook = Some(Arc::new(move |c: &Cancel| {
+        tx.send(c.clone()).unwrap();
+        let t = Instant::now();
+        while !c.is_cancelled() && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }));
     let req = TraceRequest {
         project: pid("big"),
         trace: tid(999),
         payloads: true,
         format: TraceFormat::Tree,
     };
-    let mut observed = false;
-    for _ in 0..20 {
-        let before = fx.engine.last_cancel().map(|c| format!("{c:?}"));
-        let mut fut = Box::pin(fx.engine.trace_json(&req));
-        let c = loop {
-            tokio::select! {
-                _ = &mut fut => break None,
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    if let Some(c) = fx.engine.last_cancel().filter(|c| Some(format!("{c:?}")) != before) {
-                        break Some(c);
-                    }
-                }
-            }
-        };
-        let Some(c) = c else { continue };
-        if c.is_cancelled() {
-            continue;
-        }
-        drop(fut);
-        assert!(c.is_cancelled());
-        observed = true;
-        break;
-    }
-    assert!(observed, "never caught the blocking phase");
+    let mut fut = Box::pin(fx.engine.trace_json(&req));
+    let c = tokio::select! {
+        r = &mut fut => panic!("finished before the blocking phase: {:?}", r.map(|b| b.len())),
+        c = rx.recv() => c.unwrap(),
+    };
+    assert!(!c.is_cancelled());
+    drop(fut);
+    assert!(c.is_cancelled());
 }
 
 /// Unknown and other-project traces are NotFound; runs of an unknown project are empty.

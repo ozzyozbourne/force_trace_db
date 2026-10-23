@@ -1,6 +1,5 @@
 //! `/v1/sql` (D7): `{"columns":[{name,type}],"rows":[…],"row_count","truncated","elapsed_ms"}`.
-use crate::session::QueryPermit;
-use crate::{QueryEngine, QueryError};
+use crate::{QueryEngine, QueryError, QueryKind};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -63,12 +62,8 @@ impl QueryEngine {
         let timeout = r
             .timeout_ms
             .map_or(self.cfg.timeout, |ms| Duration::from_millis(ms).min(self.cfg.timeout));
-        let deadline = tokio::time::Instant::now() + timeout;
-        let permit = tokio::time::timeout_at(deadline, self.sql_slots.clone().acquire_owned())
-            .await
-            .map_err(|_| QueryError::Transient("too many concurrent queries".into()))?
-            .map_err(|_| QueryError::Transient("query engine closed".into()))?;
-        let ctx = self.session_with(Some(Arc::new(QueryPermit(permit))))?;
+        let mut q = self.begin(QueryKind::Sql, timeout).await?;
+        let ctx = self.session_with(&mut q)?;
         let cap = self.cfg.max_response_bytes.as_u64() as usize;
         let fut = async {
             let df = ctx.sql_with_options(&r.query, crate::session::read_only()).await?;
@@ -111,8 +106,6 @@ impl QueryEngine {
             Ok(buf)
         };
         // One deadline for the slot wait, planning, execution and writing.
-        tokio::time::timeout_at(deadline, fut)
-            .await
-            .map_err(|_| QueryError::Timeout(timeout))?
+        q.run(fut).await
     }
 }

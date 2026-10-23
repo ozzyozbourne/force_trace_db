@@ -4,14 +4,15 @@
 //! Every path takes the memtable snapshot BEFORE any metastore call (invariant 1), merges every version of a key
 //! with `forge_model::merge` (latest non-null wins, tombstones dropped) and only then applies non-key predicates
 //! (invariant 4). `total_tokens` is the effective total (decision 15) on every path.
-pub mod derived;
-pub mod filters;
-pub mod json;
-pub mod merge_exec;
-pub mod provider;
+mod derived;
+mod filters;
+mod json;
+mod merge_exec;
+mod provider;
+mod read;
 pub mod runs;
-pub mod scan;
-pub mod session;
+mod scan;
+mod session;
 pub mod sql;
 #[doc(hidden)]
 pub mod testing;
@@ -20,15 +21,17 @@ pub mod tree;
 
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
+};
 use forge_meta::Metastore;
 use forge_model::MemtableView;
 use forge_model::config::QueryConfig;
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
-use forge_model::merge::Cancel;
+use forge_model::merge::{Cancel, CancelOnDrop};
 use forge_storage::SegmentStore;
-use provider::SpansTableProvider;
-use std::sync::{Arc, Mutex};
+use read::ReadView;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -58,23 +61,41 @@ pub enum QueryError {
     DataFusion(DataFusionError),
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Our crates' errors that DataFusion carries as `External`: the ONE list behind `From<DataFusionError>` (owned)
+/// and `classify_datafusion` (borrowed).
+macro_rules! external_errors {
+    ($($v:ident($t:ty)),*) => {
+        fn from_external(b: BoxError) -> Result<QueryError, BoxError> {
+            $(let b = match b.downcast::<$t>() {
+                Ok(e) => return Ok(QueryError::$v(*e)),
+                Err(b) => b,
+            };)*
+            Err(b)
+        }
+        pub(crate) fn external_kind(b: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<ErrorKind> {
+            $(if let Some(e) = b.downcast_ref::<$t>() {
+                return Some(e.kind());
+            })*
+            None
+        }
+    };
+}
+external_errors!(
+    Meta(forge_meta::MetaError),
+    Storage(forge_storage::StorageError),
+    Model(forge_model::error::ModelError)
+);
+
 /// Unwraps `External` errors raised by our own code (metastore, storage, the merge's `Cancelled`).
 impl From<DataFusionError> for QueryError {
     fn from(e: DataFusionError) -> Self {
-        let DataFusionError::External(b) = e else {
-            return Self::DataFusion(e);
-        };
-        let b = match b.downcast::<forge_meta::MetaError>() {
-            Ok(m) => return Self::Meta(*m),
-            Err(b) => b,
-        };
-        let b = match b.downcast::<forge_storage::StorageError>() {
-            Ok(s) => return Self::Storage(*s),
-            Err(b) => b,
-        };
-        match b.downcast::<forge_model::error::ModelError>() {
-            Ok(m) => Self::Model(*m),
-            Err(b) => Self::DataFusion(DataFusionError::External(b)),
+        match e {
+            DataFusionError::External(b) => {
+                from_external(b).unwrap_or_else(|b| Self::DataFusion(DataFusionError::External(b)))
+            }
+            e => Self::DataFusion(e),
         }
     }
 }
@@ -112,21 +133,76 @@ impl Classify for QueryError {
     }
 }
 
+/// Test hook: runs on the blocking pool with the call's `Cancel`, before the blocking work.
+#[cfg(any(test, feature = "test-util"))]
+pub type BlockingHook = Arc<dyn Fn(&Cancel) + Send + Sync>;
+
 pub struct QueryEngine {
     pub(crate) meta: Arc<dyn Metastore>,
     pub(crate) store: Arc<dyn SegmentStore>,
     pub(crate) mem: Arc<dyn MemtableView>,
-    pub(crate) provider: Arc<SpansTableProvider>,
     pub(crate) cfg: QueryConfig,
     pub(crate) sql_slots: Arc<tokio::sync::Semaphore>,
     /// DataFusion `target_partitions` (default: the CPU count).
     pub target_partitions: usize,
-    /// The `Cancel` of the latest fast-path call (test hook).
-    last_cancel: Mutex<Option<Cancel>>,
-    /// Test hook: the trace path takes the memtable snapshot AFTER `locate_trace` (the wrong order of
-    /// invariant 1), to prove the mid-query-flush test can fail.
-    #[doc(hidden)]
-    pub snapshot_after_list: bool,
+    #[cfg(any(test, feature = "test-util"))]
+    pub blocking_hook: Option<BlockingHook>,
+}
+
+/// What a query's envelope holds (`QueryEngine::begin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryKind {
+    /// `/v1/sql`: waits for a concurrency slot inside the deadline (Transient when it expires); TrackConsumersPool.
+    Sql,
+    /// `sql_batches` / `session()`: no slot; TrackConsumersPool.
+    Tool,
+    /// Fast paths: no slot; a plain GreedyMemoryPool of `query.memory_limit` per call (D15).
+    Fast,
+}
+
+/// One query's deadline, memory pool, concurrency slot and blocking-work wrapper (D8).
+pub(crate) struct QueryCtx {
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    pub(crate) pool: Arc<dyn MemoryPool>,
+    pub(crate) permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    #[cfg(any(test, feature = "test-util"))]
+    hook: Option<BlockingHook>,
+}
+
+impl QueryCtx {
+    /// `fut` under the deadline: planning (metastore calls), execution and JSON writing.
+    pub(crate) async fn run<T>(&self, fut: impl Future<Output = Result<T, QueryError>>) -> Result<T, QueryError> {
+        tokio::time::timeout_at(self.deadline, fut)
+            .await
+            .map_err(|_| QueryError::Timeout(self.timeout))?
+    }
+
+    /// Reserves `batches` against the call's pool: an oversized input fails like an oversized query.
+    pub(crate) fn reserve(&self, name: &str, batches: &[RecordBatch]) -> Result<MemoryReservation, QueryError> {
+        let r = MemoryConsumer::new(name).register(&self.pool);
+        r.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
+        Ok(r)
+    }
+
+    /// `f` on the blocking pool under a fresh `Cancel` that dropping this future sets.
+    pub(crate) async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Cancel) -> Result<T, QueryError> + Send + 'static,
+    ) -> Result<T, QueryError> {
+        let cancel = Cancel::new();
+        let _guard = CancelOnDrop(cancel.clone());
+        #[cfg(any(test, feature = "test-util"))]
+        let hook = self.hook.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-util"))]
+            if let Some(h) = hook {
+                h(&cancel);
+            }
+            f(&cancel)
+        })
+        .await?
+    }
 }
 
 impl QueryEngine {
@@ -141,66 +217,65 @@ impl QueryEngine {
             0 => (cpus / 2).max(2),
             n => n,
         };
-        let provider = Arc::new(SpansTableProvider {
-            meta: meta.clone(),
-            segments: store.clone(),
-            memtable: mem.clone(),
-        });
         Self {
             meta,
             store,
             mem,
-            provider,
             cfg,
             sql_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
             target_partitions: cpus,
-            last_cancel: Mutex::default(),
-            snapshot_after_list: false,
+            #[cfg(any(test, feature = "test-util"))]
+            blocking_hook: None,
         }
     }
 
-    /// `fut` under a deadline: planning (metastore calls), execution and JSON writing (D8).
-    pub(crate) async fn deadline<T>(
-        &self,
-        d: Duration,
-        fut: impl Future<Output = Result<T, QueryError>>,
-    ) -> Result<T, QueryError> {
-        tokio::time::timeout(d, fut).await.map_err(|_| QueryError::Timeout(d))?
+    /// The memtable snapshot, taken now (before any metastore call made through the view).
+    pub(crate) fn read_view(&self) -> ReadView {
+        ReadView::new(&*self.mem, &self.meta, &self.store)
+    }
+
+    /// A query envelope without a slot (`begin` adds the `Sql` slot).
+    pub(crate) fn ctx(&self, kind: QueryKind, timeout: Duration) -> QueryCtx {
+        let limit = self.cfg.memory_limit.as_u64() as usize;
+        let pool: Arc<dyn MemoryPool> = match kind {
+            QueryKind::Fast => Arc::new(GreedyMemoryPool::new(limit)),
+            QueryKind::Sql | QueryKind::Tool => Arc::new(TrackConsumersPool::new(
+                GreedyMemoryPool::new(limit),
+                std::num::NonZeroUsize::new(5).unwrap(),
+            )),
+        };
+        QueryCtx {
+            deadline: tokio::time::Instant::now() + timeout,
+            timeout,
+            pool,
+            permit: None,
+            #[cfg(any(test, feature = "test-util"))]
+            hook: self.blocking_hook.clone(),
+        }
+    }
+
+    /// `ctx`, plus for `Sql` a concurrency slot (`query.sql_concurrency`) awaited inside the deadline.
+    pub(crate) async fn begin(&self, kind: QueryKind, timeout: Duration) -> Result<QueryCtx, QueryError> {
+        let mut ctx = self.ctx(kind, timeout);
+        if kind == QueryKind::Sql {
+            let p = tokio::time::timeout_at(ctx.deadline, self.sql_slots.clone().acquire_owned())
+                .await
+                .map_err(|_| QueryError::Transient("too many concurrent queries".into()))?
+                .map_err(|_| QueryError::Transient("query engine closed".into()))?;
+            ctx.permit = Some(p);
+        }
+        Ok(ctx)
     }
 
     /// All result batches of a read-only SQL query (tests and tools).
     pub async fn sql_batches(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        let ctx = self.session()?;
-        self.deadline(self.cfg.timeout, async {
+        let mut q = self.ctx(QueryKind::Tool, self.cfg.timeout);
+        let ctx = self.session_with(&mut q)?;
+        q.run(async {
             let df = ctx.sql_with_options(sql, session::read_only()).await?;
             Ok(df.collect().await?)
         })
         .await
-    }
-
-    /// A fresh cancellation flag for a fast-path call (D8).
-    pub(crate) fn new_cancel(&self) -> Cancel {
-        let c = Cancel::new();
-        *self.last_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
-        c
-    }
-
-    #[doc(hidden)]
-    pub fn last_cancel(&self) -> Option<Cancel> {
-        self.last_cancel.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Fast paths (not behind the SQL semaphore) reserve their merge input against a per-call pool of
-    /// `query.memory_limit` (D15): an oversized trace fails like an oversized query.
-    pub(crate) fn fast_reservation(
-        &self,
-        name: &str,
-        batches: &[RecordBatch],
-    ) -> Result<MemoryReservation, QueryError> {
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(self.cfg.memory_limit.as_u64() as usize));
-        let r = MemoryConsumer::new(name).register(&pool);
-        r.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
-        Ok(r)
     }
 }
 

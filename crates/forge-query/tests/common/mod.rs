@@ -491,6 +491,12 @@ fn forced_edges(f: &mut [Vec<SpanRow>], mem: &mut Vec<SpanRow>, traps: &mut Trap
         status: Some(SpanStatus::Error),
         ..post("d", tid(200), sid(0))
     });
+    // Project c: a span tombstoned inside its one segment (the merge skip must still drop it).
+    f[0].push(root("c", 200, 4, at(14), "cd-deleted"));
+    f[0].push(SpanRow {
+        deleted: true,
+        ..post("c", tid(200), sid(4))
+    });
 }
 
 /// An agent-shaped trace (project `big`, trace 999): parent among the previous 8 spans, depth <= 10, start / end
@@ -570,6 +576,16 @@ pub fn big_trace(spans: u64, flushes: usize, mem_batch: usize, payload_bytes: us
     }
     layout.mem = mem_rows.chunks(mem_batch.max(1)).map(|c| c.to_vec()).collect();
     layout
+}
+
+/// One batch of the query's rows (with the query's schema when there are none).
+pub async fn sql(e: &QueryEngine, q: &str) -> RecordBatch {
+    let b = e.sql_batches(q).await.unwrap_or_else(|err| panic!("{q}: {err}"));
+    let schema = match b.first() {
+        Some(b) => b.schema(),
+        None => Arc::new(e.session().unwrap().sql(q).await.unwrap().schema().as_arrow().clone()),
+    };
+    arrow::compute::concat_batches(&schema, &b).unwrap()
 }
 
 // ---------------------------------------------------------------- reference helpers
