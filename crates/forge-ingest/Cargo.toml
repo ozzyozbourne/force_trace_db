@@ -36,3 +36,4 @@ forge-model = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 bytesize.workspace = true
 proptest.workspace = true
+rusqlite.workspace = true

@@ -43,6 +43,8 @@ pub struct JobStats {
     pub orphan_outputs: u32,
     pub rotated: u32,
     pub folded_hours: u32,
+    /// Writers finished early because `MAX_OPEN_WRITERS` were open.
+    pub writer_cap: u32,
 }
 
 #[derive(Debug, serde::Serialize)]

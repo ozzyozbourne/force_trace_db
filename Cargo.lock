@@ -2253,6 +2253,7 @@ dependencies = [
  "object_store",
  "opentelemetry-proto",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
