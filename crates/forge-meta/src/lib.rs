@@ -145,9 +145,12 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     /// Ordered by id.
     async fn list_projects(&self) -> MetaResult<Vec<Project>>;
     /// One BEGIN IMMEDIATE txn: auto-create projects, insert segments (live) + trace_index, upsert checkpoint.
-    /// Idempotent: a segment already committed with the same id, path, project, level, partition, row count
-    /// and byte size is skipped, so retrying after an ambiguous error (timeout, cancelled future) is safe; an
-    /// existing id with other metadata is `Conflict`. The checkpoint never moves backwards.
+    /// Stale commits insert nothing (invariant 8): when `flushed_wal_seq` <= the node's stored checkpoint, the
+    /// segments and trace ranges are skipped (their objects become orphans for GC), only the checkpoint upsert
+    /// runs, and the result is Ok. So an identical retry after an ambiguous error (timeout, cancelled future) or
+    /// a re-flush of already-committed rows is safe. Otherwise, a segment already committed with the same id,
+    /// path, project, level, partition, row count and byte size is skipped; an existing id with other metadata
+    /// is `Conflict`. The checkpoint (flushed_seq, max_version) never moves backwards.
     /// `InvalidInput` for trace ranges that do not cover the segment's rows exactly (overlap, gap, past the
     /// end), a segment id listed twice in one commit, or u64 values > i64::MAX.
     async fn commit_flush(&self, c: FlushCommit) -> MetaResult<()>;

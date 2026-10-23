@@ -108,21 +108,26 @@ fn string_fields_accept_scalars() {
 fn string_and_path_env_values_keep_their_text() {
     for raw in ["007", "1.0", "+5", "-0", "1e3", "true", "123"] {
         jail(|jail| {
-            if raw != "+5" {
-                jail.set_env("FORGE_NODE__ID", raw);
-            }
             jail.set_env("FORGE_STORAGE__URL", raw);
             jail.set_env("FORGE_METASTORE__URL", raw);
             jail.set_env("FORGE_WAL__DIR", raw);
             jail.set_env("FORGE_CACHE__DISK_DIR", raw);
             let c = ForgeConfig::load(None)?;
-            if raw != "+5" {
-                assert_eq!(c.node.id, raw);
-            }
             assert_eq!(c.storage.url, raw);
             assert_eq!(c.metastore.url, raw);
             assert_eq!(c.wal.dir, Path::new(raw));
             assert_eq!(c.cache.disk_dir, Path::new(raw));
+            Ok(())
+        });
+    }
+    // node.id must also be a valid project id, so it gets only valid ids.
+    for raw in ["007", "1.0", "-0", "1e3", "true", "123"] {
+        jail(|jail| {
+            jail.set_env("FORGE_NODE__ID", raw);
+            jail.set_env("FORGE_INGEST__DEFAULT_PROJECT", raw);
+            let c = ForgeConfig::load(None)?;
+            assert_eq!(c.node.id, raw);
+            assert_eq!(c.ingest.default_project, raw);
             Ok(())
         });
     }

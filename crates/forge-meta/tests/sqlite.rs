@@ -552,3 +552,34 @@ async fn limit_is_applied_after_the_rust_filters() {
     };
     assert!(s.list_segments(&none).await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_watermark_commit_inserts_nothing() {
+    let s = SqliteMetastore::open_in_memory().unwrap();
+    let a = seg("p", Level::L0, Some((1, 2)), 0, 3);
+    s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
+    // New segments at a watermark that does not advance: Ok, but invisible (a re-flush of committed rows).
+    for (b, seq) in [
+        (seg("p", Level::L0, Some((1, 2)), 0, 3), 5),
+        (seg("p", Level::L0, Some((1, 2)), 0, 3), 4),
+    ] {
+        s.commit_flush(flush(vec![b.clone()], seq, 3)).await.unwrap();
+        assert_eq!(s.get_segment(b.meta.id).await.unwrap(), None, "seq {seq}");
+    }
+    assert_eq!(
+        s.list_segments(&SegmentFilter::default()).await.unwrap(),
+        std::slice::from_ref(&a.meta)
+    );
+    assert_eq!(s.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+    assert_eq!(s.wal_checkpoint("n").await.unwrap().unwrap().flushed_seq, 5);
+    // The checkpoint upsert still runs: max_version rises, flushed_seq never moves back.
+    s.commit_flush(flush(vec![], 3, 99)).await.unwrap();
+    assert_eq!(
+        s.wal_checkpoint("n").await.unwrap(),
+        Some(WalCheckpoint {
+            flushed_seq: 5,
+            max_version: 99
+        })
+    );
+    assert_eq!(s.max_version().await.unwrap(), 99);
+}

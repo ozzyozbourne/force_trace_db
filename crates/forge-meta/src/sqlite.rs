@@ -393,11 +393,19 @@ impl Metastore for SqliteMetastore {
         }
         self.write(move |tx| {
             let now = now_ms();
-            for s in &c.segments {
-                insert_segment(tx, s, now)?;
+            let stored: Option<i64> = tx
+                .prepare_cached("SELECT flushed_seq FROM wal_checkpoints WHERE node_id = ?1")?
+                .query_row([&c.node_id], |r| r.get(0))
+                .optional()?;
+            // Invariant 8: a stale or repeated flush (watermark not advancing) inserts nothing.
+            if stored.is_none_or(|s| seq > s) {
+                for s in &c.segments {
+                    insert_segment(tx, s, now)?;
+                }
             }
             tx.prepare_cached(UPSERT_CHECKPOINT)?
                 .execute(params![c.node_id, seq, max_version, now])?;
+            forge_model::failpoint::hit("meta_commit_in_txn"); // dies before COMMIT: the txn rolls back
             Ok(())
         })
         .await

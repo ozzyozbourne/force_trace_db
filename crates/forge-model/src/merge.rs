@@ -1,10 +1,27 @@
-//! Version merge + physical sort (paste target: forge-model/src/merge.rs; pure Arrow, no I/O).
+//! Version merge + physical sort (pure Arrow, no I/O).
 //!
 //! `merge_versions`: any number of spans_schema batches, any order, any number of versions per
 //! `(project_id, trace_id, span_id)` -> ONE row per key where every column is "latest non-null
 //! wins" by `version` (`version` and `deleted` come from the newest version), sorted by the physical
 //! key `(project_id, trace_id, dotted_order NULLS LAST, span_id)`. That is exactly what
 //! `SegmentStore::write_segment` requires (invariant 3).
+//!
+//! Semantics (M2/M3 rely on them):
+//! - Per field, the latest non-null value wins by `version`. `version` and `deleted` come from the newest row.
+//!   A null `tags` means "not set"; an empty list is a value.
+//! - **Associative only for version-disjoint parts** (every version of A older than every version of B):
+//!   `merge([merge(A), merge(B)]) == merge(A ∪ B)`. Flushes are version-disjoint and ordered because versions are
+//!   assigned in WAL order (invariant 9), so segments + memtable merge exactly; compaction must merge a key's
+//!   segments as a contiguous run in flush order.
+//! - **Equal versions** (L6): an equal-version row is either an identical replay copy, or the merged superset of
+//!   rows that are also present (memtable raw row + segment row during M2's snapshot window). Per-field selection
+//!   handles both. Never dedupe whole rows by `(key, version)`.
+//! - **Delete is not a barrier** (L2): a re-post after a tombstone is live again, and its null fields are filled
+//!   from versions older than the tombstone. Tombstones first appear in M6; revisit then.
+//! - Cost is per post: a post computes `cost_usd` only from its own model and tokens. M3/M6 recompute it after the
+//!   merge.
+//! - **M4** (L8): the FTS builder must skip values that are blob refs (`blob::parse_blob_ref`). Blob-backed
+//!   payloads are not searchable in v1.
 //!
 //! No `concat_batches`: rows are addressed as `(batch, row)` and gathered with `interleave`, so the
 //! input is never copied twice and no intermediate Utf8 column can overflow i32 offsets.
@@ -185,24 +202,205 @@ mod tests {
         b.finish().unwrap()
     }
 
+    fn row(project: &str, span: u64, version: u64) -> SpanRow {
+        SpanRow {
+            project_id: Some(crate::testing::pid(project)),
+            trace_id: crate::testing::tid(1),
+            span_id: crate::testing::sid(span),
+            version,
+            ..Default::default()
+        }
+    }
+
+    fn merge(rows: &[SpanRow], t: Tombstones) -> Vec<SpanRow> {
+        rows_from_batch(&merge_versions(&[batch(rows)], t).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn start_end_patch_merge_per_field() {
+        let start = SpanRow {
+            name: Some("n".into()),
+            start_time_ns: Some(1),
+            inputs: Some("{}".into()),
+            tags: Some(vec!["a".into()]),
+            ..row("p", 1, 1)
+        };
+        let end = SpanRow {
+            end_time_ns: Some(2),
+            outputs: Some("[1]".into()),
+            tags: Some(vec![]), // an empty list is a value
+            ..row("p", 1, 2)
+        };
+        let patch = SpanRow {
+            name: Some("renamed".into()),
+            ..row("p", 1, 3)
+        };
+        // Input order does not matter, only versions do.
+        let m = merge(&[patch, start, end], Tombstones::Keep);
+        assert_eq!(m.len(), 1);
+        let r = &m[0];
+        assert_eq!(r.name.as_deref(), Some("renamed"));
+        assert_eq!((r.start_time_ns, r.end_time_ns), (Some(1), Some(2)));
+        assert_eq!((r.inputs.as_deref(), r.outputs.as_deref()), (Some("{}"), Some("[1]")));
+        assert_eq!(r.tags, Some(vec![]));
+        assert_eq!(r.version, 3);
+    }
+
+    #[test]
+    fn tombstone_keep_vs_drop() {
+        let rows = [
+            SpanRow {
+                name: Some("x".into()),
+                ..row("p", 1, 1)
+            },
+            SpanRow {
+                deleted: true,
+                ..row("p", 1, 2)
+            },
+            row("p", 2, 3),
+        ];
+        let keep = merge(&rows, Tombstones::Keep);
+        assert_eq!(keep.len(), 2);
+        assert!(keep.iter().any(|r| r.deleted && r.name.as_deref() == Some("x")));
+        let drop = merge(&rows, Tombstones::Drop);
+        assert_eq!(drop.len(), 1);
+        assert_eq!(drop[0].span_id, crate::testing::sid(2));
+    }
+
+    #[test]
+    fn delete_then_repost_is_live() {
+        // L2: delete is not a barrier. The re-post is live and its nulls are filled from before the tombstone.
+        let rows = [
+            SpanRow {
+                name: Some("v1".into()),
+                inputs: Some("{}".into()),
+                ..row("p", 1, 1)
+            },
+            SpanRow {
+                deleted: true,
+                ..row("p", 1, 2)
+            },
+            SpanRow {
+                end_time_ns: Some(9),
+                ..row("p", 1, 3)
+            },
+        ];
+        let m = merge(&rows, Tombstones::Drop);
+        assert_eq!(m.len(), 1);
+        assert!(!m[0].deleted);
+        assert_eq!((m[0].name.as_deref(), m[0].end_time_ns), (Some("v1"), Some(9)));
+    }
+
+    /// G1: up to 300 rows over 3 projects x 5 traces x 8 spans, random nulls, ~5 % tombstones, ~2 % duplicates.
+    fn g1(seed: u64, n: usize) -> Vec<SpanRow> {
+        let mut r = Rng(seed);
+        let mut rows: Vec<SpanRow> = Vec::new();
+        for v in 0..n as u64 {
+            if !rows.is_empty() && r.chance(2) {
+                let d = rows[r.below(rows.len() as u64) as usize].clone();
+                rows.push(d);
+                continue;
+            }
+            let p = ["a", "b", "c"][r.below(3) as usize];
+            let (t, s) = (r.below(5), r.below(8));
+            rows.push(random_row(&mut r, p, t, s, v + 1));
+        }
+        rows
+    }
+
+    /// G2: few keys (often one), 2 projects sharing trace/span numbers, 25 % tombstones (delete -> re-post),
+    /// 10 % `tags = Some([])`, 5 % duplicates.
+    fn g2(seed: u64, n: usize) -> Vec<SpanRow> {
+        let mut r = Rng(seed);
+        let (traces, spans) = if r.chance(40) {
+            (1, 1)
+        } else {
+            (1 + r.below(2), 1 + r.below(3))
+        };
+        let mut rows: Vec<SpanRow> = Vec::new();
+        for v in 0..n as u64 {
+            if !rows.is_empty() && r.chance(5) {
+                let d = rows[r.below(rows.len() as u64) as usize].clone();
+                rows.push(d);
+                continue;
+            }
+            let p = ["a", "b"][r.below(2) as usize];
+            let (t, s) = (r.below(traces), r.below(spans));
+            let mut x = random_row(&mut r, p, t, s, v + 1);
+            x.deleted = r.chance(25);
+            if r.chance(10) {
+                x.tags = Some(vec![]);
+            }
+            rows.push(x);
+        }
+        rows
+    }
+
+    fn generate(g: u8, seed: u64, n: usize) -> Vec<SpanRow> {
+        if g == 1 { g1(seed, n) } else { g2(seed, n) }
+    }
+
+    fn chunked(rows: &[SpanRow], chunk: usize) -> Vec<RecordBatch> {
+        rows.chunks(chunk).map(batch).collect()
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
         #[test]
-        fn merge_matches_reference(seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
-            let mut r = Rng(seed);
-            let mut rows: Vec<SpanRow> = (0..n as u64)
-                .map(|v| {
-                    let p = ["a", "b", "c"][r.below(3) as usize];
-                    let (t, s) = (r.below(5), r.below(8));
-                    random_row(&mut r, p, t, s, v + 1)
-                })
-                .collect();
-            if n > 2 { let d = rows[0].clone(); rows.push(d); }
-            let batches: Vec<_> = rows.chunks(chunk).map(batch).collect();
-            let m = merge_versions(&batches, Tombstones::Keep).unwrap();
+        fn merge_keep_matches_reference(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
+            let rows = generate(g, seed, n);
+            let m = merge_versions(&chunked(&rows, chunk), Tombstones::Keep).unwrap();
             prop_assert_eq!(rows_from_batch(&m).unwrap(), reference_merge(&rows));
+        }
+
+        #[test]
+        fn merge_drop_matches_reference(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
+            let rows = generate(g, seed, n);
+            let m = merge_versions(&chunked(&rows, chunk), Tombstones::Drop).unwrap();
+            let want: Vec<_> = reference_merge(&rows).into_iter().filter(|r| !r.deleted).collect();
+            prop_assert_eq!(rows_from_batch(&m).unwrap(), want);
+        }
+
+        #[test]
+        fn merge_idempotent(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
+            let rows = generate(g, seed, n);
+            let m = merge_versions(&chunked(&rows, chunk), Tombstones::Keep).unwrap();
             let again = merge_versions(std::slice::from_ref(&m), Tombstones::Keep).unwrap();
             prop_assert_eq!(rows_from_batch(&again).unwrap(), rows_from_batch(&m).unwrap());
+        }
+
+        #[test]
+        fn merge_associative_for_version_disjoint_splits(
+            g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40, cut in 0.0f64..=1.0,
+        ) {
+            let mut rows = generate(g, seed, n);
+            rows.sort_by_key(|r| r.version);
+            let (a, b) = rows.split_at((rows.len() as f64 * cut) as usize);
+            let mut parts = Vec::new();
+            for part in [a, b].into_iter().filter(|p| !p.is_empty()) {
+                parts.push(merge_versions(&chunked(part, chunk), Tombstones::Keep).unwrap());
+            }
+            let two_step = merge_versions(&parts, Tombstones::Keep).unwrap();
+            let one_step = merge_versions(&chunked(&rows, chunk), Tombstones::Keep).unwrap();
+            prop_assert_eq!(rows_from_batch(&two_step).unwrap(), rows_from_batch(&one_step).unwrap());
+        }
+
+        #[test]
+        fn merge_output_sorted_one_row_per_key(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
+            let rows = generate(g, seed, n);
+            let m = merge_versions(&chunked(&rows, chunk), Tombstones::Keep).unwrap();
+            let out = rows_from_batch(&m).unwrap();
+            let k = |r: &SpanRow| (
+                r.project_id.as_ref().unwrap().to_string(),
+                r.trace_id,
+                r.dotted_order.is_none(),
+                r.dotted_order.clone().unwrap_or_default(),
+                r.span_id,
+            );
+            prop_assert!(out.windows(2).all(|w| k(&w[0]) < k(&w[1])), "strictly sorted");
+            let keys: std::collections::HashSet<_> =
+                out.iter().map(|r| (r.project_id.clone(), r.trace_id, r.span_id)).collect();
+            prop_assert_eq!(keys.len(), out.len());
             for (_, part) in split_by_project(&m).unwrap() { prop_assert!(part.num_rows() > 0); }
         }
     }

@@ -1,8 +1,10 @@
-//! Crash-test failpoints (paste target: forge-model/src/failpoint.rs).
-//!
-//! `FORGE_FAILPOINT=<name>[@<n>]` aborts the process (SIGABRT: no destructors, no buffered writes,
-//! the same durability outcome as `kill -9`) the n-th time (default 1st) `hit(<name>)` runs.
+//! Kill switch for crash tests: `FORGE_FAILPOINT=<name>[@<n>]` SIGKILLs the process the n-th time (default 1st)
+//! `hit(name)` runs. Every crash is `kill -9`: no destructors, no buffered writes, no core dump.
 //! Unset = one LazyLock read per call; always compiled, so the crash tests exercise the real binary.
+//!
+//! Names: wal_torn_write, wal_lose_unsynced, wal_before_fsync, wal_after_fsync, flush_before_upload,
+//! upload_before_fsync, upload_lose_unsynced, flush_after_upload, meta_commit_in_txn, flush_after_commit,
+//! flush_after_truncate.
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -26,7 +28,7 @@ static ARMED: LazyLock<Option<Armed>> = LazyLock::new(|| {
 });
 
 /// True exactly once: on the n-th call for the armed `name`. For failpoints that must do something
-/// (e.g. a partial write) before aborting.
+/// (e.g. a partial write) before calling `kill`.
 #[inline]
 pub fn fires(name: &str) -> bool {
     ARMED
@@ -34,17 +36,21 @@ pub fn fires(name: &str) -> bool {
         .is_some_and(|a| a.name == name && a.hits.fetch_add(1, Ordering::Relaxed) + 1 == a.nth)
 }
 
-/// Aborts on the n-th call for the armed `name`.
+/// SIGKILLs the process on the n-th call for the armed `name`.
 #[inline]
 pub fn hit(name: &str) {
     if fires(name) {
-        abort(name);
+        kill(name)
     }
 }
 
+/// Prints the marker the tests look for, then SIGKILLs this process. Other threads keep running until the
+/// signal lands, as they would up to any real crash.
 #[allow(clippy::print_stderr)] // the process is about to die; tracing may not flush
-pub fn abort(name: &str) -> ! {
-    // stderr marker so the test can tell "aborted at the failpoint" from a real crash.
-    eprintln!("FORGE_FAILPOINT {name} hit; aborting");
-    std::process::abort();
+pub fn kill(name: &str) -> ! {
+    eprintln!("FORGE_FAILPOINT {name} hit; killing");
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &std::process::id().to_string()])
+        .status();
+    std::process::abort() // only if `kill` is missing
 }
