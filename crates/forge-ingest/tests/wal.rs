@@ -14,8 +14,8 @@ fn opts(dir: &std::path::Path, seg: u64) -> WalOptions {
 }
 
 /// `encode` for tests whose items are already the payload.
-fn take(p: &mut Vec<u8>) -> Vec<u8> {
-    std::mem::take(p)
+fn take(p: &mut Vec<u8>, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&std::mem::take(p))
 }
 
 fn payload(i: u64) -> Vec<u8> {
@@ -332,9 +332,9 @@ async fn encode_runs_in_seq_order() {
     let encoded = Arc::new(Mutex::new(Vec::new()));
     let e2 = encoded.clone();
     let _lock = lock_dir(&dir).unwrap();
-    let encode = move |p: &mut Vec<u8>| {
+    let encode = move |p: &mut Vec<u8>, buf: &mut Vec<u8>| {
         e2.lock().unwrap().push(p[0]);
-        std::mem::take(p)
+        buf.extend_from_slice(&std::mem::take(p))
     };
     let w = Arc::new(Wal::start(opts(&dir, 1 << 20), 1, encode, |_: &mut Vec<(u64, Vec<u8>)>| {}).unwrap());
     let mut tasks = Vec::new();
@@ -360,4 +360,22 @@ async fn encode_runs_in_seq_order() {
         by_seq,
         "encode sees the items in ack seq order"
     );
+}
+
+/// The WAL thread stamps versions into a payload encoded with version 0; the bytes must equal encoding the
+/// stamped batch (the old path), for any rows.
+#[test]
+fn stamped_payload_equals_encoding_the_stamped_batch() {
+    let mut r = Rng(11);
+    for n in [1u64, 2, 7, 100, 513] {
+        let mut rows: Vec<_> = (0..n).map(|i| random_row(&mut r, "p", i % 5, i, 0)).collect();
+        let mut payload = wal::encode_batch(&batch_from_rows(&rows)).unwrap();
+        let at = wal::version_offset(&payload, n as usize).unwrap();
+        let first = 1_000_000 + n * 3;
+        wal::stamp_versions(&mut payload, at, first..first + n);
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.version = first + i as u64;
+        }
+        assert_eq!(payload, wal::encode_batch(&batch_from_rows(&rows)).unwrap(), "{n} rows");
+    }
 }

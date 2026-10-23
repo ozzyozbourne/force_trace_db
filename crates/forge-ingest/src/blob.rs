@@ -10,14 +10,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
-/// `threshold` bytes with a blob reference, after writing the exact UTF-8 bytes to the object store.
-/// Content-addressed, so writes are idempotent: `PutMode::Create` + AlreadyExists = success.
-/// Returns the number of distinct blobs written (or found).
-pub async fn offload_blobs(
-    rows: &mut [SpanRow],
-    store: &dyn ObjectStore,
-    threshold: usize,
-) -> object_store::Result<usize> {
+/// `threshold` bytes with a blob reference and returns the blobs to write (`put_blobs`), keyed by path.
+/// CPU only (SHA-256): call off the async workers.
+pub fn plan_blobs(rows: &mut [SpanRow], threshold: usize) -> HashMap<String, Bytes> {
     let mut puts: HashMap<String, Bytes> = HashMap::new();
     for r in rows.iter_mut() {
         let project: ProjectId = r.project_id.clone().expect("normalized rows carry a project");
@@ -34,6 +29,12 @@ pub async fn offload_blobs(
             puts.entry(path).or_insert(bytes);
         }
     }
+    puts
+}
+
+/// Writes the exact UTF-8 bytes of each planned blob. Content-addressed, so writes are idempotent:
+/// `PutMode::Create` + AlreadyExists = success. Returns the number of distinct blobs written (or found).
+pub async fn put_blobs(puts: HashMap<String, Bytes>, store: &dyn ObjectStore) -> object_store::Result<usize> {
     let n = puts.len();
     futures::stream::iter(puts)
         .map(|(path, bytes)| async move {
@@ -47,4 +48,13 @@ pub async fn offload_blobs(
         .try_collect::<Vec<()>>()
         .await?;
     Ok(n)
+}
+
+/// `plan_blobs` then `put_blobs`.
+pub async fn offload_blobs(
+    rows: &mut [SpanRow],
+    store: &dyn ObjectStore,
+    threshold: usize,
+) -> object_store::Result<usize> {
+    put_blobs(plan_blobs(rows, threshold), store).await
 }

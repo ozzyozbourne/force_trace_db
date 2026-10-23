@@ -613,3 +613,24 @@ fn rows_build_valid_batches() {
     }
     assert_eq!(alloc.high_water(), 41 + 4 + 5 + 7 + 4);
 }
+
+/// `attributes` is written with the resource / scope JSON spliced in as text; it must be the canonical
+/// serialization of its own value (what `J::Object(attrs).to_string()` produced), with the envelope present.
+#[test]
+fn attributes_text_is_canonical_json() {
+    let mut seen = 0;
+    for f in [
+        "openllmetry_langgraph.json",
+        "openinference_langchain_rag.json",
+        "genai_semconv_agent.json",
+        "openllmetry_legacy.json",
+    ] {
+        for r in norm(f).rows {
+            let text = r.attributes.expect("attributes");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v.to_string(), text, "{f}");
+            seen += usize::from(v.get("forge.resource").is_some() && v.get("forge.scope").is_some());
+        }
+    }
+    assert!(seen > 0, "no row with both forge.resource and forge.scope");
+}

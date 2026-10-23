@@ -7,12 +7,13 @@ mod common;
 
 use common::*;
 use forge_meta::{Metastore, SqliteMetastore};
+use forge_model::row::SpanRow;
 use forge_model::testing::{RowKey, files_under, row_key};
 use opentelemetry_proto::tonic::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status::StatusCode};
 use prost::Message;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -266,16 +267,25 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     }
 
     // Normalized rows per post, then per key: acked posts in order + the in-doubt post (at most one per key).
-    let norm: Vec<Vec<_>> = posts.iter().map(|p| normalize(&p.req, Some(&p.project))).collect();
+    // Per key: (post index, that post's rows of the key), in post order.
+    let mut by_post: HashMap<RowKey, Vec<(usize, Vec<SpanRow>)>> = HashMap::new();
+    for (i, p) in posts.iter().enumerate() {
+        for r in normalize(&p.req, Some(&p.project)) {
+            let v = by_post.entry(row_key(&r)).or_default();
+            match v.last_mut() {
+                Some((j, rs)) if *j == i => rs.push(r),
+                _ => v.push((i, vec![r])),
+            }
+        }
+    }
     let mut acked: BTreeMap<RowKey, Vec<usize>> = BTreeMap::new();
     let mut doubt: BTreeMap<RowKey, Vec<usize>> = BTreeMap::new();
-    for (i, rs) in norm.iter().enumerate() {
-        let keys: BTreeSet<RowKey> = rs.iter().map(row_key).collect();
-        for k in keys {
-            if posts[i].acked { &mut acked } else { &mut doubt }
-                .entry(k)
+    for (k, v) in &by_post {
+        for (i, _) in v {
+            if posts[*i].acked { &mut acked } else { &mut doubt }
+                .entry(k.clone())
                 .or_default()
-                .push(i);
+                .push(*i);
         }
     }
     let got = merged(&rows);
@@ -308,16 +318,19 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     }
     // O: every field.
     for (k, row) in &got {
-        let rows_of = |idx: &[usize]| -> Vec<Vec<forge_model::row::SpanRow>> {
-            idx.iter()
-                .map(|&i| norm[i].iter().filter(|r| row_key(r) == *k).cloned().collect())
+        let posts_of = |with_doubt: bool| -> Vec<Vec<SpanRow>> {
+            by_post[k]
+                .iter()
+                .filter(|(i, _)| with_doubt || posts[*i].acked)
+                .map(|(_, rs)| rs.clone())
                 .collect()
         };
-        let mut a: Vec<usize> = acked.get(k).cloned().unwrap_or_default();
-        let without = expected(&rows_of(&a));
-        a.extend(doubt.get(k).cloned().unwrap_or_default());
-        a.sort();
-        let with = expected(&rows_of(&a));
+        let without = expected(&posts_of(false));
+        let with = if doubt.contains_key(k) {
+            expected(&posts_of(true))
+        } else {
+            without.clone()
+        };
         assert!(
             without.get(k) == Some(row) || with.get(k) == Some(row),
             "{ctx} O: {k:?}\n got     {row:?}\n acked   {:?}\n +doubt  {:?}",

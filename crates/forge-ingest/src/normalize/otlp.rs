@@ -76,7 +76,9 @@ pub fn normalize_request(
             .cloned()
             .or_else(|| project_from_resource(&res))
             .unwrap_or_else(|| cfg.default_project.clone());
-        let resource_json = J::Object(res.into_json());
+        // Serialized once per resource / scope, spliced into each span's attributes text.
+        let res = res.into_json();
+        let resource_json = (!res.is_empty()).then(|| J::Object(res).to_string());
         for (si, ss) in rs.scope_spans.into_iter().enumerate() {
             let scope = ss.scope.and_then(|s| {
                 let mut m = Map::new();
@@ -89,10 +91,10 @@ pub fn normalize_request(
                 if !s.attributes.is_empty() {
                     m.insert("attributes".into(), J::Object(kvs_to_json(s.attributes)));
                 }
-                (!m.is_empty()).then_some(J::Object(m))
+                (!m.is_empty()).then(|| J::Object(m).to_string())
             });
             for (i, span) in ss.spans.into_iter().enumerate() {
-                match normalize_span(span, &project, &resource_json, scope.as_ref(), cfg) {
+                match normalize_span(span, &project, resource_json.as_deref(), scope.as_deref(), cfg) {
                     Ok(row) => out.rows.push(row),
                     Err(e) => {
                         out.rejected += 1;
@@ -104,6 +106,25 @@ pub fn normalize_request(
         }
     }
     finalize_rows(&mut out.rows);
+    out
+}
+
+/// `J::Object(attrs).to_string()` with the pre-serialized `forge.scope` / `forge.resource` values (when Some)
+/// written in place of their placeholders: the same bytes as serializing the whole object.
+fn attributes_text(attrs: &Map<String, J>, scope: Option<&str>, resource: Option<&str>) -> String {
+    let mut out = String::from("{");
+    for (i, (k, v)) in attrs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&J::String(k.clone()).to_string());
+        out.push(':');
+        match (k.as_str(), scope, resource) {
+            ("forge.scope", Some(raw), _) | ("forge.resource", _, Some(raw)) => out.push_str(raw),
+            _ => out.push_str(&v.to_string()),
+        }
+    }
+    out.push('}');
     out
 }
 
@@ -179,8 +200,8 @@ const SESSION_METADATA_KEYS: &[&str] = &["session_id", "conversation_id", "threa
 pub fn normalize_span(
     span: Span,
     project: &ProjectId,
-    resource: &J,
-    scope: Option<&J>,
+    resource: Option<&str>,
+    scope: Option<&str>,
     cfg: &NormalizeConfig,
 ) -> Result<SpanRow, SpanError> {
     let trace_id = id(&span.trace_id, "trace_id", TraceId::LEN, TraceId::from_slice)?;
@@ -273,11 +294,12 @@ pub fn normalize_span(
     if let Some(k) = span_kind(span.kind) {
         attrs.insert("forge.kind".into(), J::String(k.into()));
     }
-    if let Some(s) = scope {
-        attrs.insert("forge.scope".into(), s.clone());
+    // Placeholders keep the keys' sorted positions; `attributes_text` writes the pre-serialized JSON there.
+    if scope.is_some() {
+        attrs.insert("forge.scope".into(), J::Null);
     }
-    if resource.as_object().is_some_and(|m| !m.is_empty()) {
-        attrs.insert("forge.resource".into(), resource.clone());
+    if resource.is_some() {
+        attrs.insert("forge.resource".into(), J::Null);
     }
     if !span.trace_state.is_empty() {
         attrs.insert("forge.trace_state".into(), J::String(span.trace_state));
@@ -318,7 +340,7 @@ pub fn normalize_span(
         session_id,
         tags,
         metadata: (!metadata.is_empty()).then(|| J::Object(metadata).to_string()),
-        attributes: (!attrs.is_empty()).then(|| J::Object(attrs).to_string()),
+        attributes: (!attrs.is_empty()).then(|| attributes_text(&attrs, scope, resource)),
         events: (!events.is_empty()).then(|| J::Array(events.into_iter().map(event_json).collect()).to_string()),
         inputs: inputs.map(|v| v.to_string()),
         outputs: outputs.map(|v| v.to_string()),

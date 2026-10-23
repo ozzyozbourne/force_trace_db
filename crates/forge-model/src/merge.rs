@@ -29,8 +29,8 @@ use crate::error::Result;
 use crate::ids::ProjectId;
 use crate::row::validate_batch;
 use crate::schema::{col, col_idx, spans_schema};
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array};
-use arrow::compute::{SortOptions, filter_record_batch, interleave, take_record_batch};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt32Array};
+use arrow::compute::{SortOptions, interleave, take_record_batch};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 
@@ -117,35 +117,75 @@ pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result
     //    NOT NULL columns (key, version, deleted) always take the newest row.
     let newest: Vec<(usize, usize)> = groups.iter().map(|g| at(g.start)).collect();
     let all_singletons = groups.len() == total;
-    let mut out: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for (c, field) in schema.fields().iter().enumerate() {
-        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-        let no_nulls = !field.is_nullable() || arrays.iter().all(|a| a.null_count() == 0);
-        let idx: Vec<(usize, usize)> = if no_nulls || all_singletons {
-            newest.clone()
-        } else {
-            groups
-                .iter()
-                .map(|g| {
-                    g.clone()
-                        .map(at)
-                        .find(|&(b, r)| arrays[b].is_valid(r))
-                        .unwrap_or_else(|| at(g.start))
-                })
-                .collect()
-        };
-        out.push(interleave(&arrays, &idx)?);
-    }
-    let mut merged = RecordBatch::try_new(schema.clone(), out)?;
-
-    if tombstones == Tombstones::Drop {
-        let deleted = merged.column(col_idx(col::DELETED)).as_boolean();
-        if deleted.true_count() > 0 {
-            let keep: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
-            merged = filter_record_batch(&merged, &keep)?;
+    let arrays = |c: usize| -> Vec<&dyn Array> { batches.iter().map(|b| b.column(c).as_ref()).collect() };
+    let pick = |c: usize| -> std::borrow::Cow<'_, [(usize, usize)]> {
+        let arrays = arrays(c);
+        let no_nulls = !schema.field(c).is_nullable() || arrays.iter().all(|a| a.null_count() == 0);
+        if no_nulls || all_singletons {
+            return std::borrow::Cow::Borrowed(&newest);
         }
+        groups
+            .iter()
+            .map(|g| {
+                g.clone()
+                    .map(at)
+                    .find(|&(b, r)| arrays[b].is_valid(r))
+                    .unwrap_or_else(|| at(g.start))
+            })
+            .collect::<Vec<_>>()
+            .into()
+    };
+
+    // 4. The groups to emit: Drop skips keys whose newest row is a tombstone.
+    let mut keep: Vec<usize> = (0..groups.len()).collect();
+    if tombstones == Tombstones::Drop {
+        let deleted: Vec<_> = batches
+            .iter()
+            .map(|b| b.column(col_idx(col::DELETED)).as_boolean())
+            .collect();
+        keep.retain(|&g| !deleted[newest[g].0].value(newest[g].1));
     }
-    sort_physical(&merged)
+
+    // 5. Physical order of the kept groups, from their merged sort-key columns only.
+    let gather = |c: usize, order: &[usize]| -> Result<ArrayRef> {
+        let idx = pick(c);
+        let idx: Vec<(usize, usize)> = order.iter().map(|&g| idx[g]).collect();
+        Ok(interleave(&arrays(c), &idx)?)
+    };
+    let sort_cols = SORT_COLUMNS
+        .iter()
+        .map(|c| gather(col_idx(c), &keep))
+        .collect::<Result<Vec<_>>>()?;
+    let order: Vec<usize> = physical_order(&sort_cols)?
+        .into_iter()
+        .map(|i| keep[i as usize])
+        .collect();
+
+    // 6. One gather per column, in physical order.
+    let out = (0..schema.fields().len())
+        .map(|c| gather(c, &order))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(schema.clone(), out)?)
+}
+
+const SORT_COLUMNS: [&str; 4] = [col::PROJECT_ID, col::TRACE_ID, col::DOTTED_ORDER, col::SPAN_ID];
+
+/// The row order of `SORT_COLUMNS` arrays: `(project_id, trace_id, dotted_order NULLS LAST, span_id)`, byte-wise.
+fn physical_order(cols: &[ArrayRef]) -> Result<Vec<u32>> {
+    let n = cols[0].len();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    if n <= 1 {
+        return Ok(idx);
+    }
+    let conv = RowConverter::new(vec![
+        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
+        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
+        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
+        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
+    ])?;
+    let rows = conv.convert_columns(cols)?;
+    idx.sort_unstable_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
+    Ok(idx)
 }
 
 /// Sorts by `(project_id, trace_id, dotted_order NULLS LAST, span_id)`, byte-wise (matches the
@@ -154,19 +194,8 @@ pub fn sort_physical(b: &RecordBatch) -> Result<RecordBatch> {
     if b.num_rows() <= 1 {
         return Ok(b.clone());
     }
-    let conv = RowConverter::new(vec![
-        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
-    ])?;
-    let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::DOTTED_ORDER, col::SPAN_ID]
-        .iter()
-        .map(|c| b.column(col_idx(c)).clone())
-        .collect();
-    let rows = conv.convert_columns(&cols)?;
-    let mut idx: Vec<u32> = (0..b.num_rows() as u32).collect();
-    idx.sort_unstable_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
+    let cols: Vec<ArrayRef> = SORT_COLUMNS.iter().map(|c| b.column(col_idx(c)).clone()).collect();
+    let idx = physical_order(&cols)?;
     Ok(take_record_batch(b, &UInt32Array::from(idx))?)
 }
 

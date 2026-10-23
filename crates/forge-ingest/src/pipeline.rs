@@ -1,5 +1,5 @@
 //! The write path: WAL + memtable + flush behind the `Ingest` trait.
-use crate::blob::offload_blobs;
+use crate::blob::{plan_blobs, put_blobs};
 use crate::flush::{FlushCtx, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
 use crate::version::VersionAllocator;
@@ -21,7 +21,34 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-type Item = (RecordBatch, usize); // (batch, accounted bytes); version column stamped on the WAL thread
+type Rows = (RecordBatch, usize); // (batch, accounted bytes)
+
+/// One append: the rows with version 0 and their WAL payload, encoded off the WAL thread. The WAL thread stamps
+/// the versions into both (`payload[version_at..]` is the version values buffer).
+struct Item {
+    rows: Rows,
+    payload: Vec<u8>,
+    version_at: usize,
+}
+
+/// Builds and validates the batch (version 0) and encodes its WAL payload. CPU work: call off the async workers.
+fn build_item(mut rows: Vec<SpanRow>) -> Result<Item, IngestError> {
+    let mut bb = SpanBatchBuilder::with_capacity(rows.len());
+    for r in &mut rows {
+        r.version = 0; // stamped on the WAL thread
+        bb.push(r)?;
+    }
+    let batch = bb.finish()?;
+    validate_batch(&batch)?;
+    let bytes = accounted_bytes(&batch);
+    let payload = wal::encode_batch(&batch).map_err(forge_model::error::ModelError::from)?;
+    let version_at = wal::version_offset(&payload, batch.num_rows()).map_err(forge_model::error::ModelError::from)?;
+    Ok(Item {
+        rows: (batch, bytes),
+        payload,
+        version_at,
+    })
+}
 
 #[derive(Debug)]
 pub struct OpenReport {
@@ -80,7 +107,7 @@ impl Pipeline {
             backoff: Backoff::default(),
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Item)>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Rows)>(64);
         let rlog = log.clone();
         let reader = tokio::task::spawn_blocking(move || {
             rlog.replay(flushed, |seq, payload| {
@@ -108,21 +135,21 @@ impl Pipeline {
 
         // P2 / invariant 9: versions are reserved here, on the WAL thread, in seq order.
         let v = versions.clone();
-        let encode = move |item: &mut Item| -> Vec<u8> {
-            let r = v.reserve(item.0.num_rows() as u64);
-            let (p, b) = with_versions(&item.0, r)
-                .and_then(|b| Ok((wal::encode_batch(&b)?, b)))
-                .unwrap_or_else(|e| {
-                    // Unreachable: the batch was validated in `submit`.
-                    tracing::error!(error = %e, "WAL encode failed; aborting");
-                    std::process::abort()
-                });
-            item.0 = b;
-            p
+        // The payload bytes equal encoding the stamped batch (uncompressed IPC, fixed-width version buffer).
+        let encode = move |item: &mut Item, buf: &mut Vec<u8>| {
+            let r = v.reserve(item.rows.0.num_rows() as u64);
+            let at = buf.len() + item.version_at;
+            buf.extend_from_slice(&std::mem::take(&mut item.payload));
+            wal::stamp_versions(&mut buf[..], at, r.clone());
+            item.rows.0 = with_versions(&item.rows.0, r).unwrap_or_else(|e| {
+                // Unreachable: the batch was validated in `submit`.
+                tracing::error!(error = %e, "WAL encode failed; aborting");
+                std::process::abort()
+            });
         };
         let m2 = mem.clone();
         let on_durable = move |items: &mut Vec<(u64, Item)>| {
-            for (seq, (b, len)) in items.drain(..) {
+            for (seq, Item { rows: (b, len), .. }) in items.drain(..) {
                 if let Err(e) = m2.insert(seq, b, len) {
                     tracing::error!(error = %e, "memtable invariant broken; aborting");
                     std::process::abort();
@@ -194,29 +221,45 @@ impl Pipeline {
 
 #[async_trait::async_trait]
 impl Ingest for Pipeline {
-    async fn submit(&self, mut rows: Vec<SpanRow>) -> Result<(), IngestError> {
+    async fn submit(&self, rows: Vec<SpanRow>) -> Result<(), IngestError> {
         if rows.is_empty() {
             return Err(IngestError::Invalid("empty batch".into()));
         }
         if self.mem.unflushed_bytes() > self.memory_budget {
             return Err(IngestError::Backpressure);
         }
-        offload_blobs(&mut rows, self.blobs.as_ref(), self.blob_threshold)
-            .await
-            .map_err(StorageError::from)?;
-        let item = tokio::task::spawn_blocking(move || -> Result<Item, IngestError> {
-            let mut bb = SpanBatchBuilder::with_capacity(rows.len());
-            for r in &mut rows {
-                r.version = 0; // stamped on the WAL thread
-                bb.push(r)?;
-            }
-            let batch = bb.finish()?;
-            validate_batch(&batch)?;
-            let bytes = accounted_bytes(&batch);
-            Ok((batch, bytes))
+        let join = |e: tokio::task::JoinError| IngestError::Internal(e.to_string());
+        // Blob refs are planned (hashing) off the workers. Without blobs the item is built in the same task;
+        // with blobs the uploads and the build run concurrently. The append waits for both.
+        let threshold = self.blob_threshold;
+        let (puts, planned) = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
+            let mut rows = rows;
+            let puts = plan_blobs(&mut rows, threshold);
+            let planned = if puts.is_empty() {
+                Ok(build_item(rows)?)
+            } else {
+                Err(rows)
+            };
+            Ok((puts, planned))
         })
         .await
-        .map_err(|e| IngestError::Internal(e.to_string()))??;
+        .map_err(join)??;
+        let item = match planned {
+            Ok(item) => item,
+            Err(rows) => {
+                let put = async {
+                    put_blobs(puts, self.blobs.as_ref())
+                        .await
+                        .map_err(|e| IngestError::from(StorageError::from(e)))
+                };
+                let build = async {
+                    tokio::task::spawn_blocking(move || build_item(rows))
+                        .await
+                        .map_err(join)?
+                };
+                tokio::try_join!(put, build)?.1
+            }
+        };
         self.wal.append(item).await?;
         Ok(())
     }

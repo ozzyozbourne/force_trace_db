@@ -4,8 +4,8 @@
 //! Segment = `FORGWAL1` magic, then records `len:u32le | crc32:u32le | seq:u64le | payload[len]`,
 //! crc32 over `seq || payload`. A record never spans segments. Seqs are contiguous and increasing.
 //!
-//! One OS thread owns the active segment. Callers send `(item, oneshot)`; the thread encodes each
-//! item's payload (`encode`, in seq order: Forge stamps versions there) and frames everything queued (up to `group_commit_max_bytes`, or until `group_commit_max_delay` since
+//! One OS thread owns the active segment. Callers send `(item, oneshot)`; the thread has each item append
+//! its payload to the group buffer (`encode`, in seq order: Forge stamps versions there) and frames everything queued (up to `group_commit_max_bytes`, or until `group_commit_max_delay` since
 //! the first request of the group), does ONE `write_all` + `sync_data`, hands `(seq, item)` to
 //! `on_durable` **in seq order** (forge-ingest inserts into the memtable there: invariant 7), and
 //! only then acks. A failed write/fsync aborts the process (never retry fsync).
@@ -126,7 +126,7 @@ impl WalLog {
     pub fn start<T: Send + 'static>(
         &self,
         next_seq: u64,
-        encode: impl FnMut(&mut T) -> Vec<u8> + Send + 'static,
+        encode: impl FnMut(&mut T, &mut Vec<u8>) + Send + 'static,
         on_durable: impl FnMut(&mut Vec<(u64, T)>) + Send + 'static,
     ) -> Result<Wal<T>, WalError> {
         Wal::start(self.opts.clone(), next_seq, encode, on_durable)
@@ -184,22 +184,26 @@ fn record_crc(seq: u64, payload: &[u8]) -> u32 {
     h.finalize()
 }
 
-fn frame(buf: &mut Vec<u8>, seq: u64, payload: &[u8]) {
-    buf.extend_from_slice(&u32::try_from(payload.len()).expect("record < 4 GiB").to_le_bytes());
-    buf.extend_from_slice(&record_crc(seq, payload).to_le_bytes());
-    buf.extend_from_slice(&seq.to_le_bytes());
-    buf.extend_from_slice(payload);
+/// Appends one record: a header placeholder, the payload (`encode` appends it), then the header backfilled.
+fn frame(buf: &mut Vec<u8>, seq: u64, encode: impl FnOnce(&mut Vec<u8>)) {
+    let start = buf.len();
+    buf.extend_from_slice(&[0; REC_HDR]);
+    encode(buf);
+    let (hdr, payload) = buf[start..].split_at_mut(REC_HDR);
+    hdr[0..4].copy_from_slice(&u32::try_from(payload.len()).expect("record < 4 GiB").to_le_bytes());
+    hdr[4..8].copy_from_slice(&record_crc(seq, payload).to_le_bytes());
+    hdr[8..16].copy_from_slice(&seq.to_le_bytes());
 }
 
 impl<T: Send + 'static> Wal<T> {
     /// The caller holds the directory lock (`lock_dir`, taken before `replay`). `next_seq` comes from
-    /// `replay`. `encode` runs on the writer thread, in seq order, right before the record is framed
-    /// (P2: Forge stamps versions there). `on_durable` runs after the group fsync with the group's
+    /// `replay`. `encode` runs on the writer thread, in seq order, and appends the item's payload to
+    /// the group buffer (P2: Forge stamps versions there). `on_durable` runs after the group fsync with the group's
     /// records in seq order, before the acks are sent.
     pub fn start(
         opts: WalOptions,
         next_seq: u64,
-        encode: impl FnMut(&mut T) -> Vec<u8> + Send + 'static,
+        encode: impl FnMut(&mut T, &mut Vec<u8>) + Send + 'static,
         on_durable: impl FnMut(&mut Vec<(u64, T)>) + Send + 'static,
     ) -> Result<Self, WalError> {
         assert!(next_seq >= 1, "seq 0 is reserved for 'nothing flushed'");
@@ -258,7 +262,7 @@ fn writer_loop<T>(
     mut file: File,
     mut rx: mpsc::Receiver<Append<T>>,
     mut next_seq: u64,
-    mut encode: impl FnMut(&mut T) -> Vec<u8>,
+    mut encode: impl FnMut(&mut T, &mut Vec<u8>),
     mut on_durable: impl FnMut(&mut Vec<(u64, T)>),
 ) -> WriterStats {
     let mut stats = WriterStats::default();
@@ -281,9 +285,8 @@ fn writer_loop<T>(
         let mut push = |mut a: Append<T>, buf: &mut Vec<u8>| {
             let seq = next_seq;
             next_seq += 1;
-            let payload = encode(&mut a.item);
             last_start = buf.len();
-            frame(buf, seq, &payload);
+            frame(buf, seq, |buf| encode(&mut a.item, buf));
             items.push((seq, a.item));
             acks.push(a.ack);
         };
@@ -498,6 +501,60 @@ pub fn encode_batch(b: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, arr
     w.finish()?;
     drop(w);
     Ok(out)
+}
+
+/// Offset in an `encode_batch` payload of the values buffer of the spans `version` column (Int64, no nulls,
+/// `rows` values), so the WAL thread can stamp versions into the encoded bytes (uncompressed IPC: the bytes
+/// are exactly those of encoding the stamped batch).
+pub fn version_offset(payload: &[u8], rows: usize) -> Result<usize, arrow::error::ArrowError> {
+    use arrow::datatypes::DataType;
+    use forge_model::schema::{col, col_idx, spans_schema};
+    let err = |m: String| arrow::error::ArrowError::IpcError(format!("version buffer: {m}"));
+    // IPC buffers per field: validity + (offsets + values | values), plus the child's for a list.
+    fn buffers(dt: &DataType) -> usize {
+        match dt {
+            DataType::Utf8 | DataType::Binary => 3,
+            DataType::List(f) => 2 + buffers(f.data_type()),
+            _ => 2,
+        }
+    }
+    let schema = spans_schema();
+    let idx = 1 + schema.fields()[..col_idx(col::VERSION)]
+        .iter()
+        .map(|f| buffers(f.data_type()))
+        .sum::<usize>();
+    // Messages: `0xFFFFFFFF | meta_len:i32le | flatbuffer[meta_len] | body`; the schema comes first.
+    let mut pos = 0;
+    loop {
+        let len = payload
+            .get(pos + 4..pos + 8)
+            .ok_or_else(|| err("no record batch".into()))?;
+        let meta_len = i32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
+        let meta = payload
+            .get(pos + 8..pos + 8 + meta_len)
+            .ok_or_else(|| err("truncated".into()))?;
+        let msg = arrow::ipc::root_as_message(meta).map_err(|e| err(e.to_string()))?;
+        let body = pos + 8 + meta_len;
+        if let Some(rb) = msg.header_as_record_batch() {
+            let b = rb
+                .buffers()
+                .and_then(|b| b.iter().nth(idx))
+                .ok_or_else(|| err("missing".into()))?;
+            if b.length() as usize != rows * 8 {
+                return Err(err(format!("{} bytes for {rows} rows", b.length())));
+            }
+            return Ok(body + b.offset() as usize);
+        }
+        pos = body + msg.bodyLength() as usize;
+    }
+}
+
+/// Writes `versions` (as i64 LE) over the version values buffer that starts at `at`.
+pub fn stamp_versions(payload: &mut [u8], at: usize, versions: std::ops::Range<u64>) {
+    let n = (versions.end - versions.start) as usize;
+    for (dst, v) in payload[at..at + 8 * n].as_chunks_mut::<8>().0.iter_mut().zip(versions) {
+        dst.copy_from_slice(&(v as i64).to_le_bytes());
+    }
 }
 
 /// Exactly one batch, returned with the canonical `spans_schema()` Arc (IPC decoding yields an

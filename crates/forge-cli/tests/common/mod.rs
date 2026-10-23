@@ -75,6 +75,8 @@ pub async fn post_otlp(
 pub struct ServerProc {
     pub child: Child,
     logs: Arc<Mutex<Vec<String>>>,
+    /// Line count, bumped by the reader on every line; closed at EOF (the child exited).
+    lines_seen: tokio::sync::watch::Receiver<usize>,
     /// Drains stderr; finishes at EOF, i.e. when the child exits.
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -97,14 +99,18 @@ impl ServerProc {
             .expect("spawn forge");
         let logs = Arc::new(Mutex::new(Vec::new()));
         let (sink, stderr) = (logs.clone(), child.stderr.take().expect("piped stderr"));
+        let (tx, lines_seen) = tokio::sync::watch::channel(0);
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                let mut l = sink.lock().unwrap_or_else(|e| e.into_inner());
+                l.push(line);
+                tx.send_replace(l.len());
             }
         });
         Self {
             child,
             logs,
+            lines_seen,
             reader: Some(reader),
         }
     }
@@ -117,7 +123,8 @@ impl ServerProc {
         self.lines().join("\n")
     }
 
-    /// Calls `f` every 50 ms until it returns Some; panics with `what` and the server logs after `within`.
+    /// Calls `f` on every new log line (and at least every 50 ms) until it returns Some; panics with `what` and
+    /// the server logs after `within`.
     /// With `alive`, also panics as soon as the server exits.
     pub async fn poll<T>(
         &mut self,
@@ -135,7 +142,11 @@ impl ServerProc {
                 panic!("forge exited early: {status}\n--- server stderr ---\n{}", self.logs());
             }
             assert!(start.elapsed() < within, "{what} within {within:?}\n{}", self.logs());
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            match tokio::time::timeout(Duration::from_millis(50), self.lines_seen.changed()).await {
+                Ok(Ok(())) | Err(_) => {}
+                // EOF: the child is exiting; poll try_wait briefly.
+                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
         }
     }
 
@@ -229,8 +240,12 @@ impl ServerProc {
 
     pub async fn wait_for_log(&mut self, needle: &str, within: Duration) {
         let what = format!("log {needle:?} not seen");
+        let mut seen = 0;
         self.poll(within, &what, false, async |s: &mut Self| {
-            s.lines().iter().any(|l| l.contains(needle)).then_some(())
+            let lines = s.lines();
+            let found = lines[seen..].iter().any(|l| l.contains(needle));
+            seen = lines.len();
+            found.then_some(())
         })
         .await;
     }
@@ -330,7 +345,8 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
         .list_segments(&SegmentFilter::default())
         .await
         .expect("list_segments");
-    let mut rows = Vec::new();
+    // Each segment's rows, by path.
+    let mut by_seg: HashMap<String, Vec<SpanRow>> = HashMap::new();
     let mut per_trace: BTreeMap<(String, TraceId), u64> = BTreeMap::new();
     for s in &segs {
         let len = std::fs::metadata(dir.join("data").join(&s.path))
@@ -342,31 +358,40 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
         for x in &r {
             *per_trace.entry((row_key(x).0, x.trace_id)).or_default() += 1;
         }
-        rows.extend(r);
+        by_seg.insert(s.path.clone(), r);
     }
-    for ((p, t), n) in &per_trace {
+    // T is checked against the scanned rows; a deterministic sample (first, last, ~20 spread) also reads each
+    // range back with a real Range scan, so that path stays exercised.
+    let stride = (per_trace.len() / 20).max(1);
+    for (i, ((p, t), n)) in per_trace.iter().enumerate() {
+        let sampled = i == 0 || i + 1 == per_trace.len() || i % stride == 0;
         let project = ProjectId::new(p.clone()).expect("project");
         let locs = meta.locate_trace(&project, *t).await.expect("locate_trace");
         let mut covered = 0;
         for l in &locs {
-            let r = scan(&store, &l.segment, RowSelection::Range(l.rows())).await;
-            assert_eq!(
-                r.len() as u64,
-                l.row_count,
-                "T: range {:?} of {}",
-                l.rows(),
-                l.segment.path
-            );
+            let seg = &by_seg[&l.segment.path];
+            let range = l.rows();
+            let r = seg
+                .get(range.start as usize..range.end as usize)
+                .unwrap_or_else(|| panic!("T: range {range:?} past the end of {}", l.segment.path));
+            assert_eq!(r.len() as u64, l.row_count, "T: range {range:?} of {}", l.segment.path);
             assert!(
                 r.iter().all(|x| x.trace_id == *t && row_key(x).0 == *p),
-                "T: range {:?} of {} holds other traces",
-                l.rows(),
+                "T: range {range:?} of {} holds other traces",
                 l.segment.path
             );
+            if sampled {
+                let scanned = scan(&store, &l.segment, RowSelection::Range(range.clone())).await;
+                assert_eq!(scanned, r, "T: Range scan {range:?} of {}", l.segment.path);
+            }
             covered += r.len() as u64;
         }
         assert_eq!(covered, *n, "T: trace_index covers {covered} of {n} rows of {p}/{t:?}");
     }
+    let rows = segs
+        .iter()
+        .flat_map(|s| by_seg.remove(&s.path).expect("scanned"))
+        .collect();
     (segs, rows)
 }
 
