@@ -1,6 +1,23 @@
-#![allow(unused_imports)]
-use crate::pv::*;
-// ------------------------------------------------------------------ SegmentScanExec
+//! `SegmentScanExec`: the segment leaf over `SegmentStore::scan` (D2).
+use crate::ext;
+use crate::provider::SegmentPart;
+use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    ReplaceChildrenOptions,
+};
+use forge_storage::{ScanRequest, SegmentStore};
+use futures::TryStreamExt;
+use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
+
 /// Leaf over `SegmentStore::scan`: one partition per (segment, row selection). Prints its projection so
 /// EXPLAIN shows exactly which columns are read.
 #[derive(Debug)]
@@ -26,14 +43,26 @@ impl SegmentScanExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self { store, parts, cols, filter, props: Arc::new(props) }
+        Self {
+            store,
+            parts,
+            cols,
+            filter,
+            props: Arc::new(props),
+        }
     }
 }
 
 impl DisplayAs for SegmentScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let segs: BTreeSet<_> = self.parts.iter().map(|p| p.seg.id).collect();
-        write!(f, "SegmentScanExec: segments={}, parts={}, projection=[{}]", segs.len(), self.parts.len(), self.cols.join(", "))?;
+        write!(
+            f,
+            "SegmentScanExec: segments={}, parts={}, projection=[{}]",
+            segs.len(),
+            self.parts.len(),
+            self.cols.join(", ")
+        )?;
         if let Some(x) = &self.filter {
             write!(f, ", filter={x}")?;
         }

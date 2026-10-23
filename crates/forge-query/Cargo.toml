@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 crc32fast.workspace = true
+object_store.workspace = true
 
 [dev-dependencies]
 forge-model = { workspace = true, features = ["test-util"] }

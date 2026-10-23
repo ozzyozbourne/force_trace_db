@@ -1,6 +1,37 @@
-#![allow(unused_imports)]
-use crate::pv::*;
-// ------------------------------------------------------------------ provider
+//! `SpansTableProvider`: the `spans` table. Per project, segment scans + memtable rows are merged by
+//! `MergeVersionsExec` (or, for one segment and no memtable rows, only tombstones are filtered: D14); every
+//! non-key filter stays above that in DataFusion's `FilterExec` (invariant 4).
+use crate::derived::effective_total_tokens_expr;
+use crate::ext;
+use crate::filters::{KeyFilters, classify};
+use crate::merge_exec::MergeVersionsExec;
+use crate::scan::SegmentScanExec;
+use arrow::array::{Array, AsArray, RecordBatch, UInt32Array};
+use arrow::compute::{filter_record_batch, take_record_batch};
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::{DFSchema, Result};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::prelude::{col, not};
+use forge_meta::{Metastore, SegmentFilter};
+use forge_model::MemtableView;
+use forge_model::catalog::{SegmentId, SegmentMeta};
+use forge_model::ids::{ProjectId, TraceId};
+use forge_model::merge::MERGE_COLUMNS;
+use forge_model::schema::{ALL_COLUMNS, col as c, col_idx, spans_schema};
+use forge_storage::{RowSelection, SegmentStore};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
 #[derive(Debug)]
 pub struct SpansTableProvider {
     pub meta: Arc<dyn Metastore>,
@@ -23,21 +54,33 @@ impl SpansTableProvider {
         let valid = |p: &String| ProjectId::new(p.as_str()).ok();
         match (&k.projects, &k.traces) {
             (Some(ps), Some(ts)) => {
+                // One batched locate per project (D16).
+                let traces: Vec<TraceId> = ts.iter().copied().collect();
                 let mut by_seg: BTreeMap<SegmentId, (SegmentMeta, Vec<std::ops::Range<u64>>)> = BTreeMap::new();
                 for p in ps.iter().filter_map(valid) {
-                    for t in ts {
-                        for loc in self.meta.locate_trace(&p, *t).await.map_err(ext)? {
-                            if !loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
-                                continue;
-                            }
-                            let e = by_seg.entry(loc.segment.id).or_insert_with(|| (loc.segment.clone(), vec![]));
-                            e.1.push(loc.rows());
+                    for loc in self
+                        .meta
+                        .locate_traces(&p, &traces)
+                        .await
+                        .map_err(ext)?
+                        .into_values()
+                        .flatten()
+                    {
+                        if !loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
+                            continue;
                         }
+                        let e = by_seg
+                            .entry(loc.segment.id)
+                            .or_insert_with(|| (loc.segment.clone(), vec![]));
+                        e.1.push(loc.rows());
                     }
                 }
                 for (_, (seg, ranges)) in by_seg {
                     let parts = out.entry(seg.project_id.to_string()).or_default();
-                    parts.extend(ranges.into_iter().map(|r| SegmentPart { seg: seg.clone(), rows: RowSelection::Range(r) }));
+                    parts.extend(ranges.into_iter().map(|r| SegmentPart {
+                        seg: seg.clone(),
+                        rows: RowSelection::Range(r),
+                    }));
                 }
             }
             _ => {
@@ -45,16 +88,20 @@ impl SpansTableProvider {
                     Some(ps) => ps
                         .iter()
                         .filter_map(valid)
-                        .map(|p| SegmentFilter { project_id: Some(p), ..Default::default() })
+                        .map(|p| SegmentFilter {
+                            project_id: Some(p),
+                            ..Default::default()
+                        })
                         .collect(),
                     None => vec![SegmentFilter::default()],
                 };
                 for mut f in filters {
                     (f.start_ns, f.end_ns) = (k.start_ns, k.end_ns);
                     for seg in self.meta.list_segments(&f).await.map_err(ext)? {
-                        out.entry(seg.project_id.to_string())
-                            .or_default()
-                            .push(SegmentPart { seg, rows: RowSelection::All });
+                        out.entry(seg.project_id.to_string()).or_default().push(SegmentPart {
+                            seg,
+                            rows: RowSelection::All,
+                        });
                     }
                 }
             }
@@ -85,7 +132,10 @@ fn vortex_trace_filter(ts: &BTreeSet<TraceId>) -> Option<vortex::expr::Expressio
         .map(|t| {
             eq(
                 vortex::expr::col(c::TRACE_ID),
-                lit(Scalar::binary(ByteBuffer::copy_from(t.as_bytes()), Nullability::NonNullable)),
+                lit(Scalar::binary(
+                    ByteBuffer::copy_from(t.as_bytes()),
+                    Nullability::NonNullable,
+                )),
             )
         })
         .reduce(or)
@@ -122,7 +172,9 @@ impl TableProvider for SpansTableProvider {
         let mem = self.memtable.snapshot();
         let k = KeyFilters::from_exprs(filters);
         let full = spans_schema();
-        let out_cols: Vec<usize> = projection.cloned().unwrap_or_else(|| (0..full.fields().len()).collect());
+        let out_cols: Vec<usize> = projection
+            .cloned()
+            .unwrap_or_else(|| (0..full.fields().len()).collect());
         let read = read_columns(&out_cols);
         let read_schema: SchemaRef = Arc::new(full.project(&read)?);
         let names: Vec<&'static str> = read.iter().map(|&i| ALL_COLUMNS[i]).collect();

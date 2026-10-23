@@ -11,6 +11,10 @@ use std::sync::Arc;
 impl QueryEngine {
     /// Per-query SessionContext (PV §1.3) with `spans` registered.
     pub fn session(&self) -> Result<SessionContext, QueryError> {
+        self.session_with(None)
+    }
+
+    pub(crate) fn session_with(&self, permit: Option<Arc<QueryPermit>>) -> Result<SessionContext, QueryError> {
         let pool = TrackConsumersPool::new(
             GreedyMemoryPool::new(self.cfg.memory_limit.as_u64() as usize),
             std::num::NonZeroUsize::new(5).unwrap(),
@@ -23,14 +27,25 @@ impl QueryEngine {
             .with_target_partitions(self.target_partitions)
             .with_information_schema(false);
         cfg.options_mut().optimizer.repartition_file_scans = false;
+        if let Some(p) = permit {
+            cfg = cfg.with_extension(p);
+        }
         let ctx = SessionContext::new_with_config_rt(cfg, rt);
         ctx.register_table("spans", self.provider.clone())?;
         Ok(ctx)
     }
 }
 
+/// The `/v1/sql` concurrency slot, as a `SessionConfig` extension: `MergeVersionsExec` moves it into its blocking
+/// merge, so a slot frees only once the CPU work has stopped (D8). Absent for `sql_batches`.
+#[derive(Debug)]
+pub struct QueryPermit(pub tokio::sync::OwnedSemaphorePermit);
+
 pub fn read_only() -> SQLOptions {
-    SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false)
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
 }
 
 /// FP §3.3, after `find_root()`.

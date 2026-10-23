@@ -1,6 +1,13 @@
-#![allow(unused_imports)]
-use crate::pv::*;
-// ------------------------------------------------------------------ filter classification
+//! Filter classification for pruning (`SpansTableProvider::supports_filters_pushdown` / `scan`).
+use arrow::array::{AsArray, BooleanArray, RecordBatch};
+use arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
+use forge_model::ids::TraceId;
+use forge_model::schema::{col as c, col_idx};
+use std::collections::BTreeSet;
+
 /// What the provider learned from the (ANDed) filters. Used for pruning only; DataFusion re-applies every
 /// filter above the merge (all are Inexact).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -19,10 +26,28 @@ pub(crate) enum Pushed {
     Time { lo: Option<i64>, hi: Option<i64> },
 }
 
-fn column_name(e: &Expr) -> Option<&str> {
+/// The column under `e`, unwrapping only casts that keep values comparable to the stored ones (D16): on
+/// `start_time` a cast to `Timestamp(Nanosecond, _)`, on `project_id` a cast to a string type, on `trace_id` a cast
+/// to a binary type. Any other cast is not a key reference.
+fn key_column(e: &Expr) -> Option<&str> {
     match e {
         Expr::Column(col) => Some(col.name.as_str()),
-        Expr::Cast(cast) => column_name(&cast.expr),
+        Expr::Cast(cast) => {
+            let name = key_column(&cast.expr)?;
+            let ok = match name {
+                c::START_TIME => matches!(*cast.field.data_type(), DataType::Timestamp(TimeUnit::Nanosecond, _)),
+                c::PROJECT_ID => matches!(
+                    *cast.field.data_type(),
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                ),
+                c::TRACE_ID => matches!(
+                    *cast.field.data_type(),
+                    DataType::Binary | DataType::BinaryView | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+                ),
+                _ => false,
+            };
+            ok.then_some(name)
+        }
         _ => None,
     }
 }
@@ -73,14 +98,22 @@ fn flip(op: Operator) -> Operator {
 /// (DataFusion turns IN lists of <= 3 items into OR chains).
 fn key_set(e: &Expr) -> Option<(String, Vec<ScalarValue>)> {
     match e {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => {
-            let (name, v) = match (column_name(left), literal(right), column_name(right), literal(left)) {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => {
+            let (name, v) = match (key_column(left), literal(right), key_column(right), literal(left)) {
                 (Some(n), Some(v), _, _) | (_, _, Some(n), Some(v)) => (n, v),
                 _ => return None,
             };
             Some((name.to_string(), vec![v.clone()]))
         }
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Or, right }) => {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => {
             let (a, mut va) = key_set(left)?;
             let (b, vb) = key_set(right)?;
             (a == b).then(|| {
@@ -88,8 +121,12 @@ fn key_set(e: &Expr) -> Option<(String, Vec<ScalarValue>)> {
                 (a, va)
             })
         }
-        Expr::InList(InList { expr, list, negated: false }) => {
-            let name = column_name(expr)?;
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) => {
+            let name = key_column(expr)?;
             let vals = list.iter().map(|e| literal(e).cloned()).collect::<Option<Vec<_>>>()?;
             Some((name.to_string(), vals))
         }
@@ -98,19 +135,20 @@ fn key_set(e: &Expr) -> Option<(String, Vec<ScalarValue>)> {
 }
 
 pub(crate) fn classify(e: &Expr) -> Option<Pushed> {
+    // Key sets (an `=` on start_time falls through to the time range below).
     if let Some((name, vals)) = key_set(e) {
-        return match name.as_str() {
-            c::PROJECT_ID => vals.iter().map(str_lit).collect::<Option<_>>().map(Pushed::Projects),
+        match name.as_str() {
+            c::PROJECT_ID => return vals.iter().map(str_lit).collect::<Option<_>>().map(Pushed::Projects),
             c::TRACE_ID => {
                 let ids = vals.iter().map(trace_lit).collect::<Option<Vec<_>>>()?;
-                Some(Pushed::Traces(ids.into_iter().flatten().collect()))
+                return Some(Pushed::Traces(ids.into_iter().flatten().collect()));
             }
-            _ => None,
-        };
+            _ => {}
+        }
     }
     match e {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let (op, v) = match (column_name(left), literal(right), column_name(right), literal(left)) {
+            let (op, v) = match (key_column(left), literal(right), key_column(right), literal(left)) {
                 (Some(c::START_TIME), Some(v), _, _) => (*op, v),
                 (_, _, Some(c::START_TIME), Some(v)) => (flip(*op), v),
                 _ => return None,
@@ -118,14 +156,28 @@ pub(crate) fn classify(e: &Expr) -> Option<Pushed> {
             let ns = ts_ns(v)?;
             match op {
                 Operator::GtEq => Some(Pushed::Time { lo: Some(ns), hi: None }),
-                Operator::Gt => Some(Pushed::Time { lo: ns.checked_add(1), hi: None }),
+                Operator::Gt => Some(Pushed::Time {
+                    lo: ns.checked_add(1),
+                    hi: None,
+                }),
                 Operator::Lt => Some(Pushed::Time { lo: None, hi: Some(ns) }),
-                Operator::LtEq => Some(Pushed::Time { lo: None, hi: ns.checked_add(1) }),
-                Operator::Eq => Some(Pushed::Time { lo: Some(ns), hi: ns.checked_add(1) }),
+                Operator::LtEq => Some(Pushed::Time {
+                    lo: None,
+                    hi: ns.checked_add(1),
+                }),
+                Operator::Eq => Some(Pushed::Time {
+                    lo: Some(ns),
+                    hi: ns.checked_add(1),
+                }),
                 _ => None,
             }
         }
-        Expr::Between(Between { expr, negated: false, low, high }) if column_name(expr) == Some(c::START_TIME) => {
+        Expr::Between(Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        }) if key_column(expr) == Some(c::START_TIME) => {
             let lo = literal(low).and_then(ts_ns);
             let hi = literal(high).and_then(ts_ns).and_then(|h| h.checked_add(1));
             (lo.is_some() || hi.is_some()).then_some(Pushed::Time { lo, hi })
@@ -161,7 +213,7 @@ impl KeyFilters {
         }
         k
     }
-    pub(crate) fn empty(&self) -> bool {
+    pub fn empty(&self) -> bool {
         self.projects.as_ref().is_some_and(|p| p.is_empty()) || self.traces.as_ref().is_some_and(|t| t.is_empty())
     }
     /// The memtable rows that pass the KEY filters (never time: start_time is mutable before the merge).
