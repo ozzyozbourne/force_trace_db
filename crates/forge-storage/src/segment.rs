@@ -18,6 +18,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use vortex::VortexSessionDefault;
@@ -76,6 +77,9 @@ struct SegmentStats {
     traces: Vec<TraceRange>,
     /// Sort key of the last row of the previous batch.
     last: Option<OwnedKey>,
+    /// Span ids seen in the current trace (rows are trace-contiguous), so a repeated span is caught even
+    /// when its dotted_order differs.
+    trace_spans: HashSet<Vec<u8>>,
     min_start: Option<i64>,
     max_start: Option<i64>,
     start_nulls: u64,
@@ -83,15 +87,15 @@ struct SegmentStats {
     max_version: Option<u64>,
 }
 
-/// Physical sort key: (trace_id, dotted_order NULLS LAST, span_id, version); the project is checked separately.
-type Key<'a> = (&'a [u8], (bool, &'a str), &'a [u8], i64);
-type OwnedKey = (Vec<u8>, (bool, String), Vec<u8>, i64);
+/// Physical sort key: (trace_id, dotted_order NULLS LAST, span_id); the project is checked separately.
+type Key<'a> = (&'a [u8], (bool, &'a str), &'a [u8]);
+type OwnedKey = (Vec<u8>, (bool, String), Vec<u8>);
 
 fn owned(k: Key<'_>) -> OwnedKey {
-    (k.0.to_vec(), (k.1.0, k.1.1.to_string()), k.2.to_vec(), k.3)
+    (k.0.to_vec(), (k.1.0, k.1.1.to_string()), k.2.to_vec())
 }
 fn borrowed(k: &OwnedKey) -> Key<'_> {
-    (&k.0, (k.1.0, &k.1.1), &k.2, k.3)
+    (&k.0, (k.1.0, &k.1.1), &k.2)
 }
 
 /// Extends the running [lo, hi] range with `x`.
@@ -117,7 +121,7 @@ impl SegmentStats {
         let v = b.column_by_name(col::VERSION).unwrap().as_primitive::<Int64Type>();
         let key = |i: usize| -> Key<'_> {
             let dotted = if d.is_null(i) { (true, "") } else { (false, d.value(i)) };
-            (t.value(i), dotted, sp.value(i), v.value(i))
+            (t.value(i), dotted, sp.value(i))
         };
         for i in 0..b.num_rows() {
             let proj = p.value(i);
@@ -132,29 +136,31 @@ impl SegmentStats {
             } else {
                 self.last.as_ref().map(borrowed)
             };
-            if let Some(prev) = prev
-                && prev >= cur
-            {
-                let what = if prev == cur {
-                    "duplicate row"
-                } else {
-                    "row sorts before the previous row"
-                };
-                return Err(StorageError::Unsorted(format!(
+            let bad = |what: &str| {
+                StorageError::Unsorted(format!(
                     "{what} at row {}: trace_id {}, span_id {}, version {}",
                     self.rows + i as u64,
                     hex(cur.0),
                     hex(cur.2),
-                    cur.3
-                )));
+                    v.value(i)
+                ))
+            };
+            if prev.is_some_and(|prev| prev > cur) {
+                return Err(bad("row sorts before the previous row"));
             }
             match self.traces.last_mut() {
                 Some(last) if last.trace_id.as_bytes()[..] == *cur.0 => last.row_count += 1,
-                _ => self.traces.push(TraceRange {
-                    trace_id: TraceId::from_slice(cur.0)?,
-                    row_start: self.rows + i as u64,
-                    row_count: 1,
-                }),
+                _ => {
+                    self.trace_spans.clear();
+                    self.traces.push(TraceRange {
+                        trace_id: TraceId::from_slice(cur.0)?,
+                        row_start: self.rows + i as u64,
+                        row_count: 1,
+                    });
+                }
+            }
+            if !self.trace_spans.insert(cur.2.to_vec()) {
+                return Err(bad("span appears twice in its trace (versions must be merged first)"));
             }
         }
         if let Some(i) = b.num_rows().checked_sub(1) {

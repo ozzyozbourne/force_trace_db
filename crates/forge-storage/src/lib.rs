@@ -27,8 +27,8 @@ pub enum StorageError {
     #[error(transparent)]
     Model(#[from] forge_model::error::ModelError),
     #[error(
-        "segment rows must be strictly increasing by (project_id, trace_id, dotted_order NULLS LAST, span_id, \
-         version) within one project: {0}"
+        "segment rows must be strictly increasing by (project_id, trace_id, dotted_order NULLS LAST, span_id) \
+         within one project, with one merged row per span: {0}"
     )]
     Unsorted(String),
     #[error("{0}")]
@@ -118,7 +118,7 @@ pub struct ScanRequest {
 #[async_trait]
 pub trait SegmentStore: Send + Sync + std::fmt::Debug + 'static {
     /// rows: spans_schema, one project, strictly increasing by (project_id, trace_id, dotted_order NULLS LAST,
-    /// span_id, version); checked, else `Unsorted`. Writes one Vortex file (PutMode::Create). A retry with the
+    /// span_id), one row per span key (versions already merged, invariant 3); checked, else `Unsorted`. Writes one Vortex file (PutMode::Create). A retry with the
     /// same spec after an ambiguous error is safe: an existing object of the same size counts as written.
     /// Invisible until the metastore commit.
     async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment>;

@@ -145,9 +145,11 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     /// Ordered by id.
     async fn list_projects(&self) -> MetaResult<Vec<Project>>;
     /// One BEGIN IMMEDIATE txn: auto-create projects, insert segments (live) + trace_index, upsert checkpoint.
-    /// Idempotent: a segment whose id and path are already committed is skipped, so retrying after an
-    /// ambiguous error (timeout, cancelled future) is safe. The checkpoint never moves backwards.
-    /// `InvalidInput` for trace ranges that overlap or exceed the segment's row count, or u64 values > i64::MAX.
+    /// Idempotent: a segment already committed with the same id, path, project, level, partition, row count
+    /// and byte size is skipped, so retrying after an ambiguous error (timeout, cancelled future) is safe; an
+    /// existing id with other metadata is `Conflict`. The checkpoint never moves backwards.
+    /// `InvalidInput` for trace ranges that do not cover the segment's rows exactly (overlap, gap, past the
+    /// end), a segment id listed twice in one commit, or u64 values > i64::MAX.
     async fn commit_flush(&self, c: FlushCommit) -> MetaResult<()>;
     async fn wal_checkpoint(&self, node_id: &str) -> MetaResult<Option<WalCheckpoint>>;
     /// max(segments.max_version, wal_checkpoints.max_version); 0 when empty.

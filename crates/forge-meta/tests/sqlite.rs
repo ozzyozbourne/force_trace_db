@@ -463,11 +463,36 @@ async fn retried_commit_is_idempotent() {
             max_version: 3
         })
     );
-    // Same id, different path: a real conflict.
-    let mut other = a.clone();
-    other.meta.path.push_str(".other");
-    let e = s.commit_flush(flush(vec![other], 6, 3)).await.unwrap_err();
-    assert!(matches!(e, MetaError::Conflict(_)), "{e:?}");
+    // Same id with a different path or different stored metadata: a real conflict, and nothing changes.
+    let mut path = a.clone();
+    path.meta.path.push_str(".other");
+    let mut rows = a.clone();
+    rows.meta.row_count = 40;
+    rows.traces[1].row_count = 30;
+    let mut bytes = a.clone();
+    bytes.meta.byte_size += 1;
+    let mut level = a.clone();
+    level.meta.level = Level::L1;
+    let mut hour = a.clone();
+    hour.meta.partition_hour = HourBucket(101);
+    for other in [path, rows, bytes, level, hour] {
+        let e = s.commit_flush(flush(vec![other], 6, 3)).await.unwrap_err();
+        assert!(matches!(e, MetaError::Conflict(_)), "{e:?}");
+    }
+    assert_eq!(s.get_segment(a.meta.id).await.unwrap(), Some(a.meta.clone()));
+    assert_eq!(s.wal_checkpoint("n").await.unwrap().unwrap().flushed_seq, 5);
+
+    // The same segment twice in one commit is a flusher bug, not a retry.
+    let b = seg("p", Level::L0, Some((1, 2)), 0, 3);
+    let e = s
+        .commit_flush(flush(vec![b.clone(), b.clone()], 7, 3))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, MetaError::InvalidInput(ref m) if m.contains("listed twice")),
+        "{e:?}"
+    );
+    assert_eq!(s.get_segment(b.meta.id).await.unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -494,7 +519,13 @@ async fn bad_trace_ranges_are_invalid_input() {
     overlap.traces[1].row_start = 5; // 0..10 and 5..15
     let mut overflow = seg("p", Level::L0, None, 20, 1);
     overflow.traces[1].row_start = u64::MAX;
-    for bad in [past_end, overlap, overflow] {
+    let mut gap = seg("p", Level::L0, None, 20, 1);
+    (gap.traces[1].row_start, gap.traces[1].row_count) = (12, 8); // rows 10..12 in no trace
+    let mut short = seg("p", Level::L0, None, 20, 1);
+    short.traces[1].row_count = 5; // rows 15..20 in no trace
+    let mut late_start = seg("p", Level::L0, None, 20, 1);
+    late_start.traces.remove(0); // rows 0..10 in no trace
+    for bad in [past_end, overlap, overflow, gap, short, late_start] {
         let e = s.commit_flush(flush(vec![bad], 1, 1)).await.unwrap_err();
         assert!(matches!(e, MetaError::InvalidInput(_)), "{e:?}");
     }

@@ -131,6 +131,22 @@ fn string_and_path_env_values_keep_their_text() {
 }
 
 #[test]
+fn empty_node_id_is_rejected() {
+    jail(|jail| {
+        jail.set_env("FORGE_NODE__ID", "");
+        let e = ForgeConfig::load(None).unwrap_err().to_string();
+        assert!(e.contains("node.id must not be empty"), "{e}");
+        Ok(())
+    });
+    jail(|jail| {
+        jail.create_file("forge.toml", "[node]\nid = \"  \"\n")?;
+        let e = ForgeConfig::load(None).unwrap_err().to_string();
+        assert!(e.contains("node.id must not be empty"), "{e}");
+        Ok(())
+    });
+}
+
+#[test]
 fn unknown_and_malformed_values_error() {
     jail(|jail| {
         jail.create_file("forge.toml", "[cache]\nmemroy = \"1GiB\"\n")?;

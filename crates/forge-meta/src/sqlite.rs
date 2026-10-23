@@ -173,7 +173,7 @@ fn project_from_row(r: &Row<'_>) -> MetaResult<Project> {
     })
 }
 
-/// Trace ranges must not overlap and must lie inside the segment's rows (invariant 2).
+/// Trace ranges must cover the segment's rows exactly: contiguous, no overlap, no gap (invariant 2).
 fn check_trace_ranges(s: &NewSegment) -> MetaResult<()> {
     let m = &s.meta;
     let mut ranges: Vec<_> = s.traces.iter().collect();
@@ -189,32 +189,53 @@ fn check_trace_ranges(s: &NewSegment) -> MetaResult<()> {
         if t.row_start < end {
             return Err(bad("overlap another trace range"));
         }
+        if t.row_start > end {
+            return Err(bad(&format!("leave rows {end}..{} in no trace", t.row_start)));
+        }
         end = t.row_start.checked_add(t.row_count).ok_or_else(|| bad("overflow"))?;
         if end > m.row_count {
             return Err(bad("exceed the row count"));
         }
     }
+    if end != m.row_count {
+        return Err(MetaError::InvalidInput(format!(
+            "segment {}: trace ranges cover rows 0..{end} of {}",
+            m.id, m.row_count
+        )));
+    }
     Ok(())
 }
 
-/// Inserts one segment, or skips it when the same id and path are already committed (a retried commit).
+/// Inserts one segment, or skips it when the same segment is already committed (a retried commit): same
+/// id, path, project, level, partition, row count and byte size. Any other existing segment id is `Conflict`.
 fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<()> {
     let m = &s.meta;
     let id = m.id.to_string();
     check_trace_ranges(s)?;
-    let existing: Option<String> = tx
-        .prepare_cached("SELECT path FROM segments WHERE id = ?1")?
-        .query_row([&id], |r| r.get(0))
-        .optional()?;
-    match existing {
-        Some(path) if path == m.path => return Ok(()),
-        Some(path) => {
-            return Err(MetaError::Conflict(format!(
-                "segment {id} already exists with path {path}, not {}",
-                m.path
-            )));
+    let existing = tx
+        .prepare_cached(&GET_SEGMENT)?
+        .query_row([&id], |r| Ok(segment_from_row(r)))
+        .optional()?
+        .transpose()?;
+    if let Some(old) = existing {
+        let ident = |x: &SegmentMeta| {
+            (
+                x.path.clone(),
+                x.project_id.clone(),
+                x.level,
+                x.partition_hour,
+                x.row_count,
+                x.byte_size,
+            )
+        };
+        if ident(&old) == ident(m) {
+            return Ok(());
         }
-        None => {}
+        return Err(MetaError::Conflict(format!(
+            "segment {id} already exists as {:?}, not {:?} (path, project, level, hour, rows, bytes)",
+            ident(&old),
+            ident(m)
+        )));
     }
     let p = Project::new(m.project_id.clone(), None, None, now)?;
     tx.prepare_cached(&INSERT_PROJECT_IF_ABSENT)?.execute(params![
@@ -363,6 +384,13 @@ impl Metastore for SqliteMetastore {
             to_i64("flushed_wal_seq", c.flushed_wal_seq)?,
             to_i64("max_version", c.max_version)?,
         );
+        let mut ids = std::collections::HashSet::new();
+        if let Some(s) = c.segments.iter().find(|s| !ids.insert(s.meta.id)) {
+            return Err(MetaError::InvalidInput(format!(
+                "segment {} is listed twice in one commit",
+                s.meta.id
+            )));
+        }
         self.write(move |tx| {
             let now = now_ms();
             for s in &c.segments {

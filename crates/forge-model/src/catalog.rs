@@ -56,6 +56,7 @@ impl Level {
 pub struct HourBucket(pub i64);
 impl HourBucket {
     pub const NANOS: i64 = 3_600_000_000_000;
+    /// Total: every i64 nanosecond lands in a bucket that `path_component` can format.
     pub fn from_nanos(ns: i64) -> Self {
         Self(ns.div_euclid(Self::NANOS))
     }
@@ -71,9 +72,12 @@ impl HourBucket {
     }
     fn path_display(self) -> Result<impl fmt::Display, ModelError> {
         static ITEMS: LazyLock<Vec<Item<'static>>> = LazyLock::new(|| StrftimeItems::new("%Y-%m-%d/%H").collect());
-        // Same range as the data timestamps (i64 ns), so every in-range bucket also formats.
-        self.start_nanos()?;
-        let t = chrono::DateTime::<chrono::Utc>::from_timestamp(self.0 * 3600, 0)
+        // Formatted from seconds, not `start_nanos`: the lowest bucket holds valid i64-ns timestamps although
+        // its first nanosecond is below i64::MIN. chrono's range covers every `from_nanos` bucket.
+        let t = self
+            .0
+            .checked_mul(3600)
+            .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
             .ok_or(ModelError::HourOutOfRange(self.0))?;
         Ok(t.format_with_items(ITEMS.iter()))
     }
@@ -212,24 +216,30 @@ mod tests {
 
     #[test]
     fn out_of_range_hours_are_errors_not_panics() {
+        let p = crate::testing::pid("p");
+        // Every bucket `from_nanos` can produce formats, including the lowest one, whose first nanosecond is
+        // below i64::MIN.
+        let lowest = HourBucket::from_nanos(i64::MIN);
+        assert_eq!(lowest.path_component().unwrap(), "1677-09-21/00");
+        assert!(paths::segment_path(&p, Level::L0, lowest, SegmentId::new()).is_ok());
+        assert!(matches!(lowest.start_nanos(), Err(ModelError::HourOutOfRange(_))));
         let lo = HourBucket::from_nanos(i64::MIN + HourBucket::NANOS);
         let hi = HourBucket::from_nanos(i64::MAX);
+        assert_eq!(hi.path_component().unwrap(), "2262-04-11/23");
         for h in [lo, hi] {
-            assert!(h.path_component().is_ok(), "{h:?}");
             assert!(h.start_nanos().is_ok(), "{h:?}");
         }
-        for h in [
-            HourBucket(hi.0 + 1),
-            HourBucket(lo.0 - 1),
-            HourBucket(i64::MAX / 3600),
-            HourBucket(i64::MIN),
-        ] {
+        assert!(matches!(
+            HourBucket(hi.0 + 1).start_nanos(),
+            Err(ModelError::HourOutOfRange(_))
+        ));
+        // Hand-built buckets outside chrono's range are errors, not panics.
+        for h in [HourBucket(i64::MAX / 3600), HourBucket(i64::MIN), HourBucket(i64::MAX)] {
             assert!(
                 matches!(h.path_component(), Err(ModelError::HourOutOfRange(_))),
                 "{h:?}"
             );
             assert!(matches!(h.start_nanos(), Err(ModelError::HourOutOfRange(_))), "{h:?}");
-            let p = crate::testing::pid("p");
             assert!(paths::segment_path(&p, Level::L0, h, SegmentId::new()).is_err());
         }
     }

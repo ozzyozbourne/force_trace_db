@@ -294,27 +294,31 @@ async fn full_sort_key_is_enforced() {
     let e = write(&st, &desc).await.unwrap_err();
     assert!(matches!(e, StorageError::Unsorted(_)), "{e:?}");
     assert!(
-        e.to_string().contains("dotted_order NULLS LAST, span_id, version"),
+        e.to_string()
+            .contains("dotted_order NULLS LAST, span_id) within one project, with one merged row per span"),
         "{e}"
     );
 
     let mut dup = base.clone();
     dup.push(base[2].clone()); // the exact same row twice
     let e = write(&st, &dup).await.unwrap_err();
-    assert!(e.to_string().contains("duplicate row"), "{e}");
+    assert!(e.to_string().contains("span appears twice"), "{e}");
 
-    // Several versions of one span are fine in ascending order, not in descending order.
+    // A segment holds one merged row per span (invariant 3): two versions of one span are rejected, whether
+    // adjacent or apart (dotted_order changed between versions, so they do not sort together).
     let mut v2 = base[2].clone();
     v2.version = 99;
-    let mut versions = base.clone();
-    versions.push(v2.clone());
-    assert_eq!(write(&st, &versions).await.unwrap().meta.row_count, 4);
-    let mut versions_desc = base.clone();
-    versions_desc.insert(2, v2);
-    assert!(matches!(
-        write(&st, &versions_desc).await,
-        Err(StorageError::Unsorted(_))
-    ));
+    let mut adjacent = base.clone();
+    adjacent.push(v2);
+    let e = write(&st, &adjacent).await.unwrap_err();
+    assert!(e.to_string().contains("span appears twice"), "adjacent: {e}");
+    let mut moved = base[0].clone();
+    moved.version = 100;
+    moved.dotted_order = None;
+    let mut apart = base.clone();
+    apart.push(moved);
+    let e = write(&st, &apart).await.unwrap_err();
+    assert!(e.to_string().contains("span appears twice"), "apart: {e}");
 
     // Same span key, two different spans, sorted by span_id when dotted_order is equal.
     let mut sibling = base[2].clone();
@@ -339,7 +343,13 @@ async fn full_sort_key_is_enforced() {
         .write_segment(spec("p"), input(vec![b.slice(0, 3), b.slice(3, 1)]))
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("duplicate row"), "across batches: {e}");
+    assert!(e.to_string().contains("span appears twice"), "across batches: {e}");
+    let b = to_batch(&desc);
+    let e = st
+        .write_segment(spec("p"), input(vec![b.slice(0, 1), b.slice(1, 2)]))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("sorts before"), "across batches: {e}");
 }
 
 #[tokio::test]

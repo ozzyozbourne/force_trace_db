@@ -162,7 +162,12 @@ impl ForgeConfig {
         for (k, v) in raw {
             fig = fig.merge(Serialized::default(&k, v));
         }
-        fig.extract()
+        let cfg: Self = fig.extract()?;
+        // node.id names the WAL prefix and the checkpoint owner (M1).
+        if cfg.node.id.trim().is_empty() {
+            return Err(figment::Error::from("node.id must not be empty".to_string()));
+        }
+        Ok(cfg)
     }
 }
 
