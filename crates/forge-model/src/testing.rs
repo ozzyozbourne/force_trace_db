@@ -189,19 +189,19 @@ pub fn reference_merge(rows: &[SpanRow]) -> Vec<SpanRow> {
         });
     }
     // physical order: project, trace, dotted NULLS LAST, span
-    out.sort_by(|a, b| {
-        let k = |r: &SpanRow| {
-            (
-                r.project_id.as_ref().unwrap().to_string(),
-                r.trace_id,
-                r.dotted_order.is_none(),
-                r.dotted_order.clone().unwrap_or_default(),
-                r.span_id,
-            )
-        };
-        k(a).cmp(&k(b))
-    });
+    out.sort_by_key(physical_key);
     out
+}
+
+/// The physical sort key: (project, trace, dotted_order NULLS LAST, span).
+pub fn physical_key(r: &SpanRow) -> (String, TraceId, bool, String, SpanId) {
+    (
+        r.project_id.as_ref().unwrap().to_string(),
+        r.trace_id,
+        r.dotted_order.is_none(),
+        r.dotted_order.clone().unwrap_or_default(),
+        r.span_id,
+    )
 }
 
 /// Rows -> one spans_schema batch through `SpanBatchBuilder`; panics on an invalid row (tests only).

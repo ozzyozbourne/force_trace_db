@@ -31,19 +31,26 @@ pub struct Frozen {
     pub batches: Vec<RecordBatch>,
     /// Accounted bytes (sum of `accounted_bytes`).
     pub bytes: usize,
-    pub rows: usize,
-    pub first_seq: u64,
     /// Flush watermark: every seq <= this is in this or an earlier memtable.
     pub last_seq: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Active {
     batches: Vec<RecordBatch>,
     bytes: usize,
-    rows: usize,
-    first_seq: u64,
-    created: Option<Instant>,
+    /// When the first batch went in; meaningless while `batches` is empty.
+    created: Instant,
+}
+
+impl Active {
+    fn new() -> Self {
+        Self {
+            batches: Vec::new(),
+            bytes: 0,
+            created: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,26 +74,18 @@ pub struct MemtableSet {
     pub flush_wanted: tokio::sync::Notify,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InsertError {
     /// seq is not last_seq + 1: a hole would make the flush watermark lie (invariant 7).
+    #[error("WAL seq {got} inserted, expected {expected} (hole in the WAL)")]
     NotContiguous { expected: u64, got: u64 },
-}
-impl std::fmt::Display for InsertError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotContiguous { expected, got } => {
-                write!(f, "WAL seq {got} inserted, expected {expected} (hole in the WAL)")
-            }
-        }
-    }
 }
 
 impl MemtableSet {
     pub fn new(flushed_seq: u64, flush_bytes: usize, flush_interval: Duration) -> Self {
         Self {
             state: Mutex::new(State {
-                active: Active::default(),
+                active: Active::new(),
                 frozen: None,
                 last_seq: flushed_seq,
                 snapshot: None,
@@ -114,11 +113,9 @@ impl MemtableSet {
         s.last_seq = seq;
         let a = &mut s.active;
         if a.batches.is_empty() {
-            a.first_seq = seq;
-            a.created = Some(Instant::now());
+            a.created = Instant::now();
         }
         a.bytes += bytes;
-        a.rows += batch.num_rows();
         a.batches.push(batch);
         let full = a.bytes >= self.flush_bytes;
         s.snapshot = None;
@@ -141,8 +138,11 @@ impl MemtableSet {
         let a = &s.active;
         s.frozen.is_some()
             || !a.batches.is_empty()
-                && (a.bytes >= self.flush_bytes
-                    || a.created.is_some_and(|c| now.duration_since(c) >= self.flush_interval))
+                && (a.bytes >= self.flush_bytes || now.duration_since(a.created) >= self.flush_interval)
+    }
+
+    pub fn flush_interval(&self) -> Duration {
+        self.flush_interval
     }
 
     pub fn has_frozen(&self) -> bool {
@@ -160,15 +160,12 @@ impl MemtableSet {
         if s.active.batches.is_empty() {
             return None;
         }
-        let a = std::mem::take(&mut s.active);
+        let a = std::mem::replace(&mut s.active, Active::new());
         let f = Arc::new(Frozen {
             batches: a.batches,
             bytes: a.bytes,
-            rows: a.rows,
-            first_seq: a.first_seq,
             last_seq: s.last_seq,
         });
-        debug_assert_eq!(f.last_seq - f.first_seq + 1, f.batches.len() as u64);
         s.frozen = Some(f.clone());
         // snapshot content is unchanged (same batches), keep the cache
         Some(f)

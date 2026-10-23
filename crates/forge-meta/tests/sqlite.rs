@@ -18,6 +18,15 @@ fn proj(id: &str, name: &str) -> Project {
 }
 
 /// A segment of project `p` with start times [min, max] (None = all null) and traces 1 and 2.
+/// `a` is the only visible segment and trace [1; 16] has one location.
+async fn assert_only(s: &SqliteMetastore, a: &NewSegment) {
+    assert_eq!(
+        s.list_segments(&SegmentFilter::default()).await.unwrap(),
+        std::slice::from_ref(&a.meta)
+    );
+    assert_eq!(s.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+}
+
 fn seg(p: &str, level: Level, start: Option<(i64, i64)>, nulls: u64, max_version: u64) -> NewSegment {
     let (t1, t2) = (TraceId([1; 16]), TraceId([2; 16]));
     NewSegment {
@@ -451,11 +460,7 @@ async fn retried_commit_is_idempotent() {
     let a = seg("p", Level::L0, Some((1, 2)), 0, 3);
     s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
     s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
-    assert_eq!(
-        s.list_segments(&SegmentFilter::default()).await.unwrap(),
-        std::slice::from_ref(&a.meta)
-    );
-    assert_eq!(s.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+    assert_only(&s, &a).await;
     assert_eq!(
         s.wal_checkpoint("n").await.unwrap(),
         Some(WalCheckpoint {
@@ -566,11 +571,7 @@ async fn stale_watermark_commit_inserts_nothing() {
         s.commit_flush(flush(vec![b.clone()], seq, 3)).await.unwrap();
         assert_eq!(s.get_segment(b.meta.id).await.unwrap(), None, "seq {seq}");
     }
-    assert_eq!(
-        s.list_segments(&SegmentFilter::default()).await.unwrap(),
-        std::slice::from_ref(&a.meta)
-    );
-    assert_eq!(s.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+    assert_only(&s, &a).await;
     assert_eq!(s.wal_checkpoint("n").await.unwrap().unwrap().flushed_seq, 5);
     // The checkpoint upsert still runs: max_version rises, flushed_seq never moves back.
     s.commit_flush(flush(vec![], 3, 99)).await.unwrap();

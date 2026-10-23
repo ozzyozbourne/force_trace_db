@@ -37,71 +37,9 @@ pub async fn inspect_segment(path: &std::path::Path, o: &InspectOptions) -> crat
         .filter(|f| f.names().iter().any(|n| n == col::PROJECT_ID))
         .ok_or_else(|| crate::StorageError::InvalidInput("not a spans segment".into()))?
         .clone();
-    writeln!(out, "file:      {} ({size} bytes)", path.display()).unwrap();
-    writeln!(out, "rows:      {}", file.row_count()).unwrap();
-    writeln!(
-        out,
-        "footer:    ~{} bytes, {} segments",
-        footer.approx_byte_size().unwrap_or(0),
-        footer.segment_map().len()
-    )
-    .unwrap();
-    if let Some(m) = file.metadata_segment(FORGE_META_KEY) {
-        writeln!(out, "forge:     {}", String::from_utf8_lossy(m.as_slice())).unwrap();
-    }
     let sizes = footer.compressed_field_sizes()?;
-    writeln!(
-        out,
-        "{:<18} {:<28} {:>10} {:>6}  min .. max",
-        "column", "dtype", "bytes", "nulls"
-    )
-    .unwrap();
-    let stats = file.file_stats();
-    let u64_dt = DType::Primitive(PType::U64, Nullability::NonNullable);
-    for (i, (name, dt)) in fields.names().iter().zip(fields.fields()).enumerate() {
-        let bytes = sizes.get(&FieldPath::from_name(name.clone())).unwrap_or_default();
-        let (nulls, range) = match stats {
-            Some(st) => {
-                let (set, sdt) = st.get(i);
-                let show = |s: Stat| {
-                    let p = set.get(s).into_scalar(sdt.clone());
-                    let inexact = matches!(p, vortex::expr::stats::Precision::Inexact(_));
-                    let Some(v) = p.into_inner() else {
-                        return "-".to_string();
-                    };
-                    // ids are Binary: print hex, not Vortex's space-separated bytes
-                    let t = match v.as_binary_opt().and_then(|b| b.value().cloned()) {
-                        Some(bytes) => hex::encode(bytes.as_slice()),
-                        None => format!("{v}"),
-                    };
-                    let t = if t.len() > 40 { format!("{}…", &t[..40]) } else { t };
-                    if inexact { format!("~{t}") } else { t }
-                };
-                let nulls = set
-                    .get(Stat::NullCount)
-                    .into_scalar(u64_dt.clone())
-                    .into_inner()
-                    .and_then(|n| n.as_primitive_opt().and_then(|p| p.as_::<u64>()));
-                (
-                    nulls.map_or("-".into(), |n| n.to_string()),
-                    format!("{} .. {}", show(Stat::Min), show(Stat::Max)),
-                )
-            }
-            None => ("-".into(), "-".into()),
-        };
-        let dts = format!("{dt}");
-        let name = name.to_string();
-        writeln!(
-            out,
-            "{name:<18} {:<28} {bytes:>10} {nulls:>6}  {range}",
-            &dts[..dts.len().min(28)]
-        )
-        .unwrap();
-    }
-    if o.layout {
-        writeln!(out, "layout:\n{}", footer.layout().display_tree()).unwrap();
-    }
-    if o.verify {
+    // The verify scan is the only async step; it runs before rendering (its line is printed last).
+    let batches = if o.verify {
         let cols = vec![
             col::PROJECT_ID,
             col::TRACE_ID,
@@ -112,19 +50,89 @@ pub async fn inspect_segment(path: &std::path::Path, o: &InspectOptions) -> crat
             col::DELETED,
         ];
         let schema = projected_schema(&cols);
-        let batches: Vec<_> = file
+        let b: Vec<_> = file
             .scan()?
             .with_projection(select(cols, root()).bind(file.dtype())?)
             .into_record_batch_stream(schema)?
             .try_collect()
             .await?;
-        writeln!(out, "{}", verify_rows(&batches)).unwrap();
-    }
+        Some(b)
+    } else {
+        None
+    };
+    let mut render = || -> std::fmt::Result {
+        writeln!(out, "file:      {} ({size} bytes)", path.display())?;
+        writeln!(out, "rows:      {}", file.row_count())?;
+        writeln!(
+            out,
+            "footer:    ~{} bytes, {} segments",
+            footer.approx_byte_size().unwrap_or(0),
+            footer.segment_map().len()
+        )?;
+        if let Some(m) = file.metadata_segment(FORGE_META_KEY) {
+            writeln!(out, "forge:     {}", String::from_utf8_lossy(m.as_slice()))?;
+        }
+        writeln!(
+            out,
+            "{:<18} {:<28} {:>10} {:>6}  min .. max",
+            "column", "dtype", "bytes", "nulls"
+        )?;
+        let stats = file.file_stats();
+        let u64_dt = DType::Primitive(PType::U64, Nullability::NonNullable);
+        for (i, (name, dt)) in fields.names().iter().zip(fields.fields()).enumerate() {
+            let bytes = sizes.get(&FieldPath::from_name(name.clone())).unwrap_or_default();
+            let (nulls, range) = match stats {
+                Some(st) => {
+                    let (set, sdt) = st.get(i);
+                    let show = |s: Stat| {
+                        let p = set.get(s).into_scalar(sdt.clone());
+                        let inexact = matches!(p, vortex::expr::stats::Precision::Inexact(_));
+                        let Some(v) = p.into_inner() else {
+                            return "-".to_string();
+                        };
+                        // ids are Binary: print hex, not Vortex's space-separated bytes
+                        let t = match v.as_binary_opt().and_then(|b| b.value().cloned()) {
+                            Some(bytes) => hex::encode(bytes.as_slice()),
+                            None => format!("{v}"),
+                        };
+                        let t = if t.len() > 40 { format!("{}…", &t[..40]) } else { t };
+                        if inexact { format!("~{t}") } else { t }
+                    };
+                    let nulls = set
+                        .get(Stat::NullCount)
+                        .into_scalar(u64_dt.clone())
+                        .into_inner()
+                        .and_then(|n| n.as_primitive_opt().and_then(|p| p.as_::<u64>()));
+                    (
+                        nulls.map_or("-".into(), |n| n.to_string()),
+                        format!("{} .. {}", show(Stat::Min), show(Stat::Max)),
+                    )
+                }
+                None => ("-".into(), "-".into()),
+            };
+            let dts = format!("{dt}");
+            let name = name.to_string();
+            writeln!(
+                out,
+                "{name:<18} {:<28} {bytes:>10} {nulls:>6}  {range}",
+                &dts[..dts.len().min(28)]
+            )?;
+        }
+        if o.layout {
+            writeln!(out, "layout:\n{}", footer.layout().display_tree())?;
+        }
+        if let Some(b) = &batches {
+            verify_rows(b, &mut out)?;
+            writeln!(out)?;
+        }
+        Ok(())
+    };
+    render().expect("writing to a String");
     Ok(out)
 }
 
 /// Same contract as forge-storage's write-time check, re-derived from the file.
-fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
+fn verify_rows(batches: &[arrow::record_batch::RecordBatch], out: &mut String) -> std::fmt::Result {
     type Key = (String, Vec<u8>, (bool, String), Vec<u8>);
     let mut prev: Option<Key> = None;
     let (mut rows, mut traces, mut deleted, mut start_nulls) = (0u64, 0u64, 0u64, 0u64);
@@ -176,15 +184,13 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
     // An empty range prints as the i64 MAX..MIN sentinels.
     let (vmin, vmax) = (vmin.unwrap_or(i64::MAX), vmax.unwrap_or(i64::MIN));
     let (tmin, tmax) = (tmin.unwrap_or(i64::MAX), tmax.unwrap_or(i64::MIN));
-    let mut out = String::new();
     writeln!(
         out,
         "verify:    {rows} rows, {} project(s) {:?}, {traces} traces (max {per_trace_max} rows/trace), versions {vmin}..{vmax}, \
          start_time {tmin}..{tmax} ({start_nulls} null), {deleted} tombstones",
         projects.len(),
         projects
-    )
-    .unwrap();
+    )?;
     if projects.len() > 1 {
         problems.push("more than one project".into());
     }
@@ -192,10 +198,9 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
         write!(
             out,
             "contract:  OK (sorted by project, trace, dotted_order NULLS LAST, span; one row per span)"
-        )
-        .unwrap();
+        )?;
     } else {
-        write!(out, "contract:  VIOLATED: {}", problems.join("; ")).unwrap();
+        write!(out, "contract:  VIOLATED: {}", problems.join("; "))?;
     }
-    out
+    Ok(())
 }

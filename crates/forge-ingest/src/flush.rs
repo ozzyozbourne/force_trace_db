@@ -104,7 +104,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
         rows_out: commit.segments.iter().map(|s| s.meta.row_count).sum(),
         segments: commit.segments,
         watermark,
-        rows_in: f.rows,
+        rows_in: f.batches.iter().map(|b| b.num_rows()).sum(),
         wal_segments_deleted: deleted,
     })
 }

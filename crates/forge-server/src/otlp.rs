@@ -63,6 +63,29 @@ impl OtlpReceiver {
             cfg: Arc::new(NormalizeConfig::new(ProjectId::new(cfg.default_project.clone())?)),
         })
     }
+
+    /// Submit normalized rows (if any) and build the OTLP response. Rejected spans never fail the request:
+    /// they are reported in partial_success (OTLP: the client must not retry them).
+    pub async fn finish(&self, n: Normalized) -> Result<ExportTraceServiceResponse, ExportError> {
+        let Normalized {
+            rows,
+            rejected,
+            first_error,
+        } = n;
+        if !rows.is_empty() {
+            self.ingest.submit(rows).await?;
+        }
+        Ok(response(rejected, first_error))
+    }
+}
+
+/// Decode and normalize are CPU work proportional to the request (up to 64 MiB): run them off the async workers.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, ExportError> + Send + 'static,
+) -> Result<T, ExportError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ExportError::internal(format!("normalize task: {e}")))?
 }
 
 fn parse_project(h: Option<&str>) -> Result<Option<ProjectId>, ExportError> {
@@ -84,34 +107,6 @@ fn response(n_rejected: u64, first_error: Option<String>) -> ExportTraceServiceR
     }
 }
 
-impl OtlpReceiver {
-    /// Submit normalized rows (if any) and build the OTLP response. Rejected spans never fail the request:
-    /// they are reported in partial_success (OTLP: the client must not retry them).
-    pub async fn finish(&self, n: Normalized) -> Result<ExportTraceServiceResponse, ExportError> {
-        let Normalized {
-            rows,
-            rejected,
-            first_error,
-        } = n;
-        if !rows.is_empty() {
-            self.ingest.submit(rows).await?;
-        }
-        Ok(response(rejected, first_error))
-    }
-
-    /// Normalization is CPU work proportional to the request (up to 64 MiB): run it off the async workers.
-    async fn normalize(
-        &self,
-        req: ExportTraceServiceRequest,
-        project: Option<ProjectId>,
-    ) -> Result<Normalized, ExportError> {
-        let cfg = self.cfg.clone();
-        tokio::task::spawn_blocking(move || normalize_request(req, project.as_ref(), &cfg))
-            .await
-            .map_err(|e| ExportError::internal(format!("normalize task: {e}")))
-    }
-}
-
 // ------------------------------------------------------------------------------------------------
 // gRPC
 // ------------------------------------------------------------------------------------------------
@@ -128,7 +123,10 @@ impl TraceService for OtlpReceiver {
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
         let project =
             parse_project(req.metadata().get(PROJECT_HEADER).and_then(|v| v.to_str().ok())).map_err(to_status)?;
-        let n = self.normalize(req.into_inner(), project).await.map_err(to_status)?;
+        let (req, cfg) = (req.into_inner(), self.cfg.clone());
+        let n = blocking(move || Ok(normalize_request(req, project.as_ref(), &cfg)))
+            .await
+            .map_err(to_status)?;
         self.finish(n).await.map(tonic::Response::new).map_err(to_status)
     }
 }
@@ -219,12 +217,9 @@ fn decode(enc: Encoding, body: &[u8]) -> Result<ExportTraceServiceRequest, Expor
 async fn otlp_http(State(r): State<OtlpReceiver>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(enc) = Encoding::from_headers(&headers) else {
         let msg = "content-type must be application/x-protobuf or application/json";
-        return (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({"code": 3, "message": msg}).to_string(),
-        )
-            .into_response();
+        let mut r = encode_err(Encoding::Json, ExportError::invalid(msg));
+        *r.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        return r;
     };
     let project = match parse_project(headers.get(PROJECT_HEADER).and_then(|v| v.to_str().ok())) {
         Ok(p) => p,
@@ -232,14 +227,9 @@ async fn otlp_http(State(r): State<OtlpReceiver>, headers: HeaderMap, body: Byte
     };
     // Decode + normalize together on the blocking pool (both scale with the body).
     let cfg = r.cfg.clone();
-    let n = tokio::task::spawn_blocking(move || {
-        decode(enc, &body).map(|req| normalize_request(req, project.as_ref(), &cfg))
-    })
-    .await;
-    let n = match n {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return encode_err(enc, e),
-        Err(e) => return encode_err(enc, ExportError::internal(format!("normalize task: {e}"))),
+    let n = match blocking(move || decode(enc, &body).map(|req| normalize_request(req, project.as_ref(), &cfg))).await {
+        Ok(n) => n,
+        Err(e) => return encode_err(enc, e),
     };
     match r.finish(n).await {
         Ok(resp) => encode_ok(enc, &resp),

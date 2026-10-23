@@ -70,49 +70,38 @@ fn resolve(
     nodes: &HashMap<Key, (Option<SpanId>, Option<i64>)>,
     memo: &mut HashMap<Key, Option<String>>,
 ) -> Option<String> {
-    enum Base {
-        Root,
-        Prefix(String),
-        Unknown,
-    }
     if let Some(m) = memo.get(key) {
         return m.clone(); // resolved earlier as someone's ancestor
     }
     // Walk up until a memoized node, a root, a parent outside the batch, or a cycle.
+    // `prefix`: Some(None) = root, Some(Some(p)) = memoized prefix, None = unknown.
     let mut chain: Vec<(Key, Option<i64>)> = Vec::new();
     let mut cur = key.clone();
-    let base = loop {
+    let mut prefix: Option<Option<String>> = loop {
         if let Some(m) = memo.get(&cur) {
-            break m.clone().map_or(Base::Unknown, Base::Prefix);
+            break m.clone().map(Some);
         }
         let Some(&(parent, start)) = nodes.get(&cur) else {
-            break Base::Unknown;
+            break None;
         };
         chain.push((cur.clone(), start));
         if chain.len() > nodes.len() {
-            break Base::Unknown; // cycle
+            break None; // cycle
         }
         match parent {
-            None => break Base::Root,
+            None => break Some(None),
             Some(ps) => cur = (cur.0.clone(), cur.1, ps),
         }
     };
-    let mut prefix = match base {
-        Base::Root => Some(None),
-        Base::Prefix(s) => Some(Some(s)),
-        Base::Unknown => None,
-    };
-    let mut last = None;
     for (k, start) in chain.into_iter().rev() {
         let v = match (&prefix, start) {
             (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.2)),
             _ => None,
         };
         memo.insert(k, v.clone());
-        prefix = v.clone().map(Some);
-        last = v;
+        prefix = v.map(Some);
     }
-    last
+    prefix.flatten()
 }
 
 #[cfg(test)]

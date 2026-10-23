@@ -65,7 +65,7 @@ use object_store::{
 
 #[derive(Debug)]
 pub struct DurableLocalFs {
-    inner: Arc<LocalFileSystem>,
+    inner: LocalFileSystem,
     root: PathBuf,
 }
 
@@ -73,7 +73,7 @@ impl DurableLocalFs {
     /// `root` must exist (build_object_store creates it) and be absolute.
     pub fn new(root: PathBuf) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(LocalFileSystem::new_with_prefix(&root)?),
+            inner: LocalFileSystem::new_with_prefix(&root)?,
             root,
         })
     }
@@ -93,7 +93,7 @@ impl DurableLocalFs {
 
 /// fsync(file), then fsync each ancestor dir up to and including `root` (LocalFileSystem may have
 /// created any of them for this put). ~6 fsyncs per segment; fine at one flush per 64 MiB / 30 s.
-pub fn sync_file_and_parents(file: &std::path::Path, root: &std::path::Path) -> std::io::Result<()> {
+fn sync_file_and_parents(file: &std::path::Path, root: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(file)?.sync_all()?;
     let mut dir = file.parent();
     while let Some(d) = dir {

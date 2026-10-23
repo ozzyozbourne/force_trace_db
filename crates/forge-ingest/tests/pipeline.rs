@@ -4,11 +4,10 @@ use bytesize::ByteSize;
 use common::*;
 use forge_ingest::{Ingest, IngestError, OpenReport, Pipeline};
 use forge_meta::{Metastore, SegmentFilter, SqliteMetastore};
-use forge_model::config::ForgeConfig;
+use forge_model::config::{ForgeConfig, StorageConfig};
 use forge_model::merge::{Tombstones, merge_versions};
 use forge_model::row::SpanRow;
-use forge_storage::DurableLocalFs;
-use forge_storage::{BuiltStore, ScanRequest, SegmentStore, VortexSegmentStore};
+use forge_storage::{ScanRequest, SegmentStore, VortexSegmentStore, build_object_store};
 use futures::TryStreamExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,14 +19,23 @@ struct Stack {
 }
 
 fn stack(root: &Path) -> Stack {
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).unwrap();
+    let url = format!("file://{}", root.join("data").display());
     Stack {
         meta: Arc::new(SqliteMetastore::open_path(&root.join("meta.db")).unwrap()),
-        segs: Arc::new(VortexSegmentStore::new(BuiltStore {
-            store: Arc::new(DurableLocalFs::new(data.clone()).unwrap()),
-            local_root: Some(data),
-        })),
+        segs: Arc::new(VortexSegmentStore::new(
+            build_object_store(&StorageConfig { url }).unwrap(),
+        )),
+    }
+}
+
+/// Copies the `*.wal` files of `from` into a new dir `to`.
+fn copy_wal_files(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "wal") {
+            std::fs::copy(&p, to.join(p.file_name().unwrap())).unwrap();
+        }
     }
 }
 
@@ -171,13 +179,7 @@ async fn crash_after_commit_before_truncate_skips_by_watermark() {
     ingest_spans(&ing, 0, 200, false).await;
     let wal = root.join("wal/node-1");
     let saved = root.join("wal-copy");
-    std::fs::create_dir_all(&saved).unwrap();
-    for e in std::fs::read_dir(&wal).unwrap() {
-        let p = e.unwrap().path();
-        if p.extension().is_some_and(|x| x == "wal") {
-            std::fs::copy(&p, saved.join(p.file_name().unwrap())).unwrap();
-        }
-    }
+    copy_wal_files(&wal, &saved);
     let r = ing.flush_now().await.unwrap().unwrap();
     assert!(r.wal_segments_deleted > 0);
     drop(ing);
@@ -422,13 +424,7 @@ async fn versions_follow_wal_order() {
     }
     // Read a copy of the live WAL dir.
     let copy = tmp.path().join("wal-copy");
-    std::fs::create_dir_all(&copy).unwrap();
-    for e in std::fs::read_dir(tmp.path().join("wal/node-1")).unwrap() {
-        let p = e.unwrap().path();
-        if p.extension().is_some_and(|x| x == "wal") {
-            std::fs::copy(&p, copy.join(p.file_name().unwrap())).unwrap();
-        }
-    }
+    copy_wal_files(&tmp.path().join("wal/node-1"), &copy);
     let mut ranges = Vec::new();
     let st = forge_ingest::wal::replay(&copy, 0, |_, payload| {
         let rows = rows_from_batch(&forge_ingest::wal::decode_batch(payload).unwrap());

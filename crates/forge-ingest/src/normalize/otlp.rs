@@ -124,21 +124,13 @@ fn id<T>(
     b: &[u8],
     what: &'static str,
     len: usize,
-    mk: impl FnOnce(&[u8]) -> T,
-    zero: impl FnOnce(&T) -> bool,
+    parse: fn(&[u8]) -> forge_model::error::Result<T>,
 ) -> Result<T, SpanError> {
-    if b.len() != len {
-        return Err(SpanError::IdLength {
-            what,
-            expected: len,
-            got: b.len(),
-        });
-    }
-    let v = mk(b);
-    if zero(&v) {
-        return Err(SpanError::ZeroId(what));
-    }
-    Ok(v)
+    parse(b).map_err(|_| SpanError::IdLength {
+        what,
+        expected: len,
+        got: b.len(),
+    })
 }
 
 const MODEL_KEYS: &[&str] = &[
@@ -191,20 +183,14 @@ pub fn normalize_span(
     scope: Option<&J>,
     cfg: &NormalizeConfig,
 ) -> Result<SpanRow, SpanError> {
-    let trace_id = id(
-        &span.trace_id,
-        "trace_id",
-        TraceId::LEN,
-        |b| TraceId::from_slice(b).expect("len"),
-        TraceId::is_zero,
-    )?;
-    let span_id = id(
-        &span.span_id,
-        "span_id",
-        SpanId::LEN,
-        |b| SpanId::from_slice(b).expect("len"),
-        SpanId::is_zero,
-    )?;
+    let trace_id = id(&span.trace_id, "trace_id", TraceId::LEN, TraceId::from_slice)?;
+    if trace_id.is_zero() {
+        return Err(SpanError::ZeroId("trace_id"));
+    }
+    let span_id = id(&span.span_id, "span_id", SpanId::LEN, SpanId::from_slice)?;
+    if span_id.is_zero() {
+        return Err(SpanError::ZeroId("span_id"));
+    }
     // Empty or all-zero parent = root (some SDKs send 8 zero bytes).
     let parent_span_id = match span.parent_span_id.len() {
         0 => None,
@@ -212,8 +198,7 @@ pub fn normalize_span(
             &span.parent_span_id,
             "parent_span_id",
             SpanId::LEN,
-            |b| SpanId::from_slice(b).expect("len"),
-            |_| false,
+            SpanId::from_slice,
         )?)
         .filter(|p| !p.is_zero()),
     };
@@ -303,17 +288,12 @@ pub fn normalize_span(
             J::Array(span.links.into_iter().map(link_json).collect()),
         );
     }
-    let dropped = json!({
-        "attributes": span.dropped_attributes_count,
-        "events": span.dropped_events_count,
-        "links": span.dropped_links_count,
-    });
-    if dropped
-        .as_object()
-        .expect("obj")
-        .values()
-        .any(|v| v.as_u64() != Some(0))
-    {
+    if span.dropped_attributes_count | span.dropped_events_count | span.dropped_links_count != 0 {
+        let dropped = json!({
+            "attributes": span.dropped_attributes_count,
+            "events": span.dropped_events_count,
+            "links": span.dropped_links_count,
+        });
         attrs.insert("forge.dropped".into(), dropped);
     }
 

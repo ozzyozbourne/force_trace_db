@@ -43,9 +43,10 @@ struct Scalars<'a> {
     status: Option<SpanStatus>,
     session: Option<&'a str>,
 }
-fn scalars(r: &SpanRow) -> Scalars<'_> {
+/// `parent` is the row's parent span id in hex (owned by the caller).
+fn scalars<'a>(r: &'a SpanRow, parent: Option<&'a str>) -> Scalars<'a> {
     Scalars {
-        parent: None, // filled by the caller-side comparison below
+        parent,
         name: r.name.as_deref().unwrap(),
         run_type: r.run_type.unwrap(),
         model: r.model.as_deref(),
@@ -58,8 +59,7 @@ fn scalars(r: &SpanRow) -> Scalars<'_> {
 fn check(n: &Normalized, span: &str, want: Scalars<'_>, cost: Option<f64>) {
     let r = row(n, span);
     let parent = r.parent_span_id.map(|p| p.to_string());
-    assert_eq!(parent.as_deref(), want.parent, "{span} parent");
-    assert_eq!(scalars(r), Scalars { parent: None, ..want }, "{span}");
+    assert_eq!(scalars(r, parent.as_deref()), want, "{span}");
     match (r.cost_usd, cost) {
         (None, None) => {}
         (Some(a), Some(b)) => assert!((a - b).abs() < 1e-12, "{span} cost {a} != {b}"),

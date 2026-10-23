@@ -235,10 +235,7 @@ fn ipc_decoded_batches_overcount_memory() {
         "1-row IPC payload = {} B (schema message repeated per record)",
         one.len()
     );
-    assert!(arc_eq(&d));
-}
-fn arc_eq(d: &arrow::array::RecordBatch) -> bool {
-    Arc::ptr_eq(&d.schema(), &forge_model::schema::spans_schema())
+    assert!(Arc::ptr_eq(&d.schema(), &forge_model::schema::spans_schema()));
 }
 
 // ---------- real crash: re-exec this test binary as a child that aborts mid-write ----------

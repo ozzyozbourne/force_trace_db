@@ -335,13 +335,13 @@ fn segment_strategy(session: &VortexSession) -> Arc<dyn LayoutStrategy> {
     let mut b = WriteStrategyBuilder::from_session(session)
         .with_row_block_size(1024)
         .with_data_block_target_bytes(None);
+    let payload = WriteStrategyBuilder::from_session(session)
+        .with_row_block_size(64)
+        .with_data_block_target_bytes(None)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact())
+        .build();
     for c in PAYLOAD_COLUMNS {
-        let payload = WriteStrategyBuilder::from_session(session)
-            .with_row_block_size(64)
-            .with_data_block_target_bytes(None)
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact())
-            .build();
-        b = b.with_field_writer(FieldPath::from_name(c), payload);
+        b = b.with_field_writer(FieldPath::from_name(c), payload.clone());
     }
     b.build()
 }

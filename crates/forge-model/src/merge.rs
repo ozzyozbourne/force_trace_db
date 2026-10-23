@@ -104,26 +104,23 @@ pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result
         ka.2.value(ra) == kb.2.value(rb) && ka.1.value(ra) == kb.1.value(rb) && ka.0.value(ra) == kb.0.value(rb)
     };
     let at = |pos: usize| loc[order[pos] as usize];
-    let mut starts: Vec<usize> = Vec::with_capacity(total);
-    for pos in 0..total {
-        if pos == 0 || !same_key(at(pos - 1), at(pos)) {
-            starts.push(pos);
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0;
+    for pos in 1..=total {
+        if pos == total || !same_key(at(pos - 1), at(pos)) {
+            groups.push(start..pos);
+            start = pos;
         }
     }
-    let groups: Vec<std::ops::Range<usize>> = starts
-        .iter()
-        .zip(starts.iter().skip(1).copied().chain([total]))
-        .map(|(&a, b)| a..b)
-        .collect();
 
     // 3. Per column: for each group, the newest row where the column is non-null (else the newest).
     //    NOT NULL columns (key, version, deleted) always take the newest row.
     let newest: Vec<(usize, usize)> = groups.iter().map(|g| at(g.start)).collect();
+    let all_singletons = groups.len() == total;
     let mut out: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (c, field) in schema.fields().iter().enumerate() {
         let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
         let no_nulls = !field.is_nullable() || arrays.iter().all(|a| a.null_count() == 0);
-        let all_singletons = groups.len() == total;
         let idx: Vec<(usize, usize)> = if no_nulls || all_singletons {
             newest.clone()
         } else {
@@ -191,7 +188,7 @@ pub fn split_by_project(b: &RecordBatch) -> Result<Vec<(ProjectId, RecordBatch)>
 mod tests {
     use super::*;
     use crate::row::SpanRow;
-    use crate::testing::{Rng, batch_from_rows, random_row, reference_merge, rows_from_batch};
+    use crate::testing::{Rng, batch_from_rows, physical_key, random_row, reference_merge, rows_from_batch};
     use proptest::prelude::*;
 
     fn row(project: &str, span: u64, version: u64) -> SpanRow {
@@ -284,13 +281,21 @@ mod tests {
     }
 
     /// G1: up to 300 rows over 3 projects x 5 traces x 8 spans, random nulls, ~5 % tombstones, ~2 % duplicates.
+    /// With `pct`% chance, pushes a copy of a random earlier row.
+    fn maybe_dup(r: &mut Rng, rows: &mut Vec<SpanRow>, pct: u64) -> bool {
+        if rows.is_empty() || !r.chance(pct) {
+            return false;
+        }
+        let d = rows[r.below(rows.len() as u64) as usize].clone();
+        rows.push(d);
+        true
+    }
+
     fn g1(seed: u64, n: usize) -> Vec<SpanRow> {
         let mut r = Rng(seed);
         let mut rows: Vec<SpanRow> = Vec::new();
         for v in 0..n as u64 {
-            if !rows.is_empty() && r.chance(2) {
-                let d = rows[r.below(rows.len() as u64) as usize].clone();
-                rows.push(d);
+            if maybe_dup(&mut r, &mut rows, 2) {
                 continue;
             }
             let p = ["a", "b", "c"][r.below(3) as usize];
@@ -311,9 +316,7 @@ mod tests {
         };
         let mut rows: Vec<SpanRow> = Vec::new();
         for v in 0..n as u64 {
-            if !rows.is_empty() && r.chance(5) {
-                let d = rows[r.below(rows.len() as u64) as usize].clone();
-                rows.push(d);
+            if maybe_dup(&mut r, &mut rows, 5) {
                 continue;
             }
             let p = ["a", "b"][r.below(2) as usize];
@@ -382,14 +385,7 @@ mod tests {
             let rows = generate(g, seed, n);
             let m = merge_versions(&chunked(&rows, chunk), Tombstones::Keep).unwrap();
             let out = rows_from_batch(&m).unwrap();
-            let k = |r: &SpanRow| (
-                r.project_id.as_ref().unwrap().to_string(),
-                r.trace_id,
-                r.dotted_order.is_none(),
-                r.dotted_order.clone().unwrap_or_default(),
-                r.span_id,
-            );
-            prop_assert!(out.windows(2).all(|w| k(&w[0]) < k(&w[1])), "strictly sorted");
+            prop_assert!(out.windows(2).all(|w| physical_key(&w[0]) < physical_key(&w[1])), "strictly sorted");
             let keys: std::collections::HashSet<_> =
                 out.iter().map(|r| (r.project_id.clone(), r.trace_id, r.span_id)).collect();
             prop_assert_eq!(keys.len(), out.len());

@@ -191,6 +191,11 @@ async fn http_export() {
     // errors
     let r = post("text/plain", None, b"x".to_vec()).await.unwrap();
     assert_eq!(r.status(), 415);
+    assert_eq!(r.headers()["content-type"], "application/json");
+    assert_eq!(
+        r.text().await.unwrap(),
+        r#"{"code":3,"message":"content-type must be application/x-protobuf or application/json"}"#
+    );
     let r = post("application/json", Some("br"), b"x".to_vec()).await.unwrap();
     assert_eq!(r.status(), 415, "unsupported content-encoding");
     let r = post("application/json", None, b"{not json".to_vec()).await.unwrap();

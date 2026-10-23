@@ -36,7 +36,6 @@ pub struct Pipeline {
     blobs: Arc<dyn ObjectStore>,
     blob_threshold: usize,
     memory_budget: usize,
-    flush_interval: Duration,
     flush: FlushCtx,
     flush_lock: tokio::sync::Mutex<()>,
 }
@@ -81,26 +80,27 @@ impl Pipeline {
             backoff: Backoff::default(),
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, RecordBatch, usize)>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Item)>(64);
         let rlog = log.clone();
         let reader = tokio::task::spawn_blocking(move || {
             rlog.replay(flushed, |seq, payload| {
                 let b = wal::decode_batch(payload).map_err(|e| e.to_string())?;
                 validate_batch(&b).map_err(|e| e.to_string())?;
                 let len = accounted_bytes(&b);
-                tx.blocking_send((seq, b, len))
+                tx.blocking_send((seq, (b, len)))
                     .map_err(|_| "replay aborted".to_string())
             })
         });
-        let mut replay_flushes = 0;
-        while let Some((seq, b, len)) = rx.recv().await {
+        let (mut replay_flushes, mut watermark) = (0, flushed);
+        while let Some((seq, (b, len))) = rx.recv().await {
             let v = b.column(col_idx(col::VERSION)).as_primitive::<Int64Type>();
             let vmax = arrow::compute::max(v).unwrap_or(0) as u64;
             versions.observe(vmax);
             mem.insert(seq, b, len).map_err(|e| internal(&e))?;
-            if mem.flush_due(Instant::now()) && mem.unflushed_bytes() >= flush_bytes {
+            // Never a frozen memtable during replay (each one is flushed right here), so this is the size trigger.
+            if mem.unflushed_bytes() >= flush_bytes {
                 let f = mem.freeze().expect("non-empty");
-                flush_frozen(&flush, f).await.map_err(|e| internal(&e))?;
+                watermark = flush_frozen(&flush, f).await.map_err(|e| internal(&e))?.watermark;
                 replay_flushes += 1;
             }
         }
@@ -110,18 +110,15 @@ impl Pipeline {
         let v = versions.clone();
         let encode = move |item: &mut Item| -> Vec<u8> {
             let r = v.reserve(item.0.num_rows() as u64);
-            match with_versions(&item.0, r).and_then(|b| {
-                let p = wal::encode_batch(&b)?;
-                item.0 = b;
-                Ok(p)
-            }) {
-                Ok(p) => p,
-                Err(e) => {
+            let (p, b) = with_versions(&item.0, r)
+                .and_then(|b| Ok((wal::encode_batch(&b)?, b)))
+                .unwrap_or_else(|e| {
                     // Unreachable: the batch was validated in `submit`.
                     tracing::error!(error = %e, "WAL encode failed; aborting");
                     std::process::abort()
-                }
-            }
+                });
+            item.0 = b;
+            p
         };
         let m2 = mem.clone();
         let on_durable = move |items: &mut Vec<(u64, Item)>| {
@@ -133,7 +130,6 @@ impl Pipeline {
             }
         };
         let wal: Wal<Item> = log.start(replay.next_seq, encode, on_durable)?;
-        let watermark = flush.meta.wal_checkpoint(&node_id).await?.map_or(0, |c| c.flushed_seq);
         log.truncate(watermark).map_err(wal::WalError::from)?;
         let next_version = versions.high_water() + 1;
         tracing::info!(
@@ -152,7 +148,6 @@ impl Pipeline {
                 blobs,
                 blob_threshold: cfg.ingest.blob_threshold.as_u64() as usize,
                 memory_budget: cfg.memtable.memory_budget.as_u64() as usize,
-                flush_interval: cfg.memtable.flush_interval,
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
             }),
@@ -260,7 +255,7 @@ impl IngestTasks {
 
 /// Background flusher. Cancellation is observed only BETWEEN flushes.
 async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
-    let tick = (p.flush_interval / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+    let tick = (p.mem.flush_interval() / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,

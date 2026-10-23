@@ -76,7 +76,6 @@ struct Append<T> {
 pub struct WriterStats {
     pub records: u64,
     pub fsyncs: u64,
-    pub segments: u64,
 }
 
 pub struct Wal<T> {
@@ -234,18 +233,22 @@ impl<T: Send + 'static> Wal<T> {
     /// call from `spawn_blocking` or after the runtime's request handlers have stopped.
     /// Appends already queued (and senders cloned before this call) still complete.
     pub fn shutdown(&self) -> WriterStats {
+        self.stop().map(|r| r.expect("wal thread panicked")).unwrap_or_default()
+    }
+}
+
+impl<T> Wal<T> {
+    /// Drops the sender and joins the thread (None if already stopped).
+    fn stop(&self) -> Option<std::thread::Result<WriterStats>> {
         self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
         let t = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
-        t.map(|t| t.join().expect("wal thread panicked")).unwrap_or_default()
+        t.map(JoinHandle::join)
     }
 }
 
 impl<T> Drop for Wal<T> {
     fn drop(&mut self) {
-        self.tx.get_mut().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(t) = self.thread.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = t.join();
-        }
+        let _ = self.stop();
     }
 }
 
@@ -258,14 +261,11 @@ fn writer_loop<T>(
     mut encode: impl FnMut(&mut T) -> Vec<u8>,
     mut on_durable: impl FnMut(&mut Vec<(u64, T)>),
 ) -> WriterStats {
-    let mut stats = WriterStats {
-        segments: 1,
-        ..Default::default()
-    };
+    let mut stats = WriterStats::default();
     let mut seg_len = MAGIC.len() as u64;
     let mut buf = Vec::with_capacity(opts.group_commit_max_bytes + (64 << 10));
     let mut items: Vec<(u64, T)> = Vec::new();
-    let mut acks: Vec<(oneshot::Sender<u64>, u64)> = Vec::new();
+    let mut acks: Vec<oneshot::Sender<u64>> = Vec::new();
     let die = |what: &str, e: io::Error| -> ! {
         // fsyncgate: after a failed write/fsync the page cache state is unknown. Never retry;
         // abort so the process restarts and replays from the last durable state.
@@ -276,6 +276,7 @@ fn writer_loop<T>(
 
     while let Some(first) = rx.blocking_recv() {
         let started = Instant::now();
+        let group_first = next_seq;
         let mut last_start = 0;
         let mut push = |mut a: Append<T>, buf: &mut Vec<u8>| {
             let seq = next_seq;
@@ -284,7 +285,7 @@ fn writer_loop<T>(
             last_start = buf.len();
             frame(buf, seq, &payload);
             items.push((seq, a.item));
-            acks.push((a.ack, seq));
+            acks.push(a.ack);
         };
         push(first, &mut buf);
         // Group commit: drain what is queued now; stop at 1 MiB or 10 ms after the first request.
@@ -321,7 +322,7 @@ fn writer_loop<T>(
         buf.clear();
         on_durable(&mut items);
         items.clear();
-        for (ack, seq) in acks.drain(..) {
+        for (ack, seq) in acks.drain(..).zip(group_first..) {
             let _ = ack.send(seq); // receiver gone = client hung up; the record is durable anyway
         }
         if seg_len >= opts.segment_bytes {
@@ -329,7 +330,6 @@ fn writer_loop<T>(
                 Ok(f) => file = f,
                 Err(e) => die("rotate", e),
             }
-            stats.segments += 1;
             seg_len = MAGIC.len() as u64;
         }
     }

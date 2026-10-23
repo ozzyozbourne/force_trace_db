@@ -64,9 +64,6 @@ impl Attrs {
     pub fn has(&self, k: &str) -> bool {
         self.0.get(k).is_some_and(|v| v.value.is_some())
     }
-    pub fn has_prefix(&self, p: &str) -> bool {
-        self.0.keys().any(|k| k.starts_with(p))
-    }
     /// `prefix` followed by a numeric index: `gen_ai.prompt.0.role` matches `gen_ai.prompt.`.
     pub fn has_indexed(&self, p: &str) -> bool {
         self.0.keys().any(|k| is_indexed(k, p))
@@ -207,9 +204,8 @@ fn arrayify(v: J) -> J {
 
 fn unwrap_wrapper(v: J) -> J {
     match v {
-        J::Object(mut m) if m.len() == 1 && WRAPPERS.contains(&m.keys().next().expect("len 1").as_str()) => {
-            let k = m.keys().next().expect("len 1").clone();
-            m.remove(&k).expect("present")
+        J::Object(m) if m.len() == 1 && WRAPPERS.contains(&m.keys().next().expect("len 1").as_str()) => {
+            m.into_iter().next().expect("len 1").1
         }
         v => v,
     }
