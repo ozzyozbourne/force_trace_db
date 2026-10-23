@@ -41,6 +41,8 @@ pub enum IngestError {
     /// truncate), because write/fsync failures abort the process.
     #[error(transparent)]
     Wal(#[from] wal::WalError),
+    #[error(transparent)]
+    Arrow(#[from] arrow::error::ArrowError),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -58,7 +60,7 @@ impl Classify for IngestError {
             // Closed = shutting down: retry elsewhere/later. `Io` comes only from startup (open, replay, truncate);
             // write/fsync failures abort the process, so an `Io` here is not retryable.
             Self::Wal(wal::WalError::Closed) => ErrorKind::Transient,
-            Self::Wal(_) | Self::Internal(_) => ErrorKind::Internal,
+            Self::Wal(_) | Self::Arrow(_) | Self::Internal(_) => ErrorKind::Internal,
         }
     }
     fn message(&self) -> String {

@@ -4,7 +4,6 @@
 //! (invariant 10), blob_refs and trace_index.
 //!
 //! Default: 8 seeds in 4 shards. `FORGE_PROP_SEEDS=N` (400 in quick-release), `FORGE_PROP_SEED=s` (one seed).
-#![cfg(any())] // enabled in step 5 (plans/phase-4 §5)
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use forge_ingest::compact::{CompactCtx, JobReport, job, pick};
@@ -72,7 +71,8 @@ impl SegmentStore for DelayStore {
 // ---------------------------------------------------------------------------------------------------------------
 // Coverage (printed always, asserted when >= 8 seeds ran in total).
 
-const COV: [&str; 20] = [
+const COV: [&str; 21] = [
+    "picker_suffix",
     "jobs_a",
     "jobs_b",
     "folds",
@@ -94,12 +94,12 @@ const COV: [&str; 20] = [
     "b_committed_first",
     "gc_passes",
 ];
-static TOTALS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+static TOTALS: [AtomicU64; 21] = [const { AtomicU64::new(0) }; 21];
 static SEEDS_RUN: AtomicU64 = AtomicU64::new(0);
 static SHARDS_DONE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
-struct Cov([u64; 20]);
+struct Cov([u64; 21]);
 impl Cov {
     fn bump(&mut self, name: &str, n: u64) {
         self.0[COV.iter().position(|c| *c == name).expect("counter")] += n;
@@ -659,6 +659,13 @@ impl World {
                 kind,
                 inputs,
             };
+            if kind == JobKind::L1 {
+                let in_hour: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L1).collect();
+                let hour = segs.iter().find(|s| s.id == req.inputs[0]).unwrap().partition_hour;
+                let in_hour: Vec<&SegmentMeta> = in_hour.into_iter().filter(|s| s.partition_hour == hour).collect();
+                self.cov
+                    .bump("picker_suffix", u64::from(req.inputs.len() < in_hour.len()));
+            }
             self.run(req, cfg).await;
         }
     }
@@ -877,10 +884,11 @@ fn random_cfg(r: &mut Rng, l0_trigger: usize) -> CompactionConfig {
         } else {
             bytesize::ByteSize::mib(128)
         },
-        max_job_bytes: if r.chance(50) {
-            bytesize::ByteSize::b(1)
-        } else {
-            bytesize::ByteSize::b(u64::MAX / 4)
+        // 1 B: the prefix is one L0 and no kind B fits; 64 KiB: a few groups (a suffix cut); else unbounded.
+        max_job_bytes: match r.below(3) {
+            0 => bytesize::ByteSize::b(1),
+            1 => bytesize::ByteSize::kib(64),
+            _ => bytesize::ByteSize::b(u64::MAX / 4),
         },
         l0_trigger,
         ..Default::default()
