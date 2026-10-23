@@ -1,7 +1,7 @@
 //! `/v1/sql` (D7): `{"columns":[{name,type}],"rows":[…],"row_count","truncated","elapsed_ms"}`.
 use crate::{QueryEngine, QueryError, QueryKind};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use std::io::Write;
@@ -22,32 +22,43 @@ pub const MAX_ROWS: usize = 100_000;
 /// Rows per JSON write: the body cap is checked after each slice.
 const SLICE: usize = 64;
 
-/// Timestamp(_, "UTC") -> "+00:00" (metadata only), because arrow_json without chrono-tz rejects "UTC".
-fn utc_fix(b: &RecordBatch) -> Result<RecordBatch, QueryError> {
-    let s = b.schema();
-    if !s
-        .fields()
+/// Timestamp(_, "UTC") -> "+00:00" (metadata only), because arrow_json without chrono-tz rejects "UTC". None when
+/// no field needs it.
+fn utc_schema(s: &Schema) -> Option<SchemaRef> {
+    let utc = |f: &Field| matches!(f.data_type(), DataType::Timestamp(_, Some(z)) if z.as_ref() == "UTC");
+    s.fields().iter().any(|f| utc(f)).then(|| {
+        let fields: Vec<Field> = s
+            .fields()
+            .iter()
+            .map(|f| match f.data_type() {
+                DataType::Timestamp(u, _) if utc(f) => Field::new(
+                    f.name(),
+                    DataType::Timestamp(*u, Some("+00:00".into())),
+                    f.is_nullable(),
+                ),
+                _ => f.as_ref().clone(),
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    })
+}
+
+/// `b` under `fixed` (from `utc_schema`).
+fn utc_fix(b: RecordBatch, fixed: &Option<SchemaRef>) -> Result<RecordBatch, QueryError> {
+    let Some(fixed) = fixed else { return Ok(b) };
+    let cols = b
+        .columns()
         .iter()
-        .any(|f| matches!(f.data_type(), DataType::Timestamp(_, Some(z)) if z.as_ref() == "UTC"))
-    {
-        return Ok(b.clone());
-    }
-    let mut fields = Vec::new();
-    let mut cols = Vec::new();
-    for (f, c) in s.fields().iter().zip(b.columns()) {
-        match f.data_type() {
-            DataType::Timestamp(u, Some(z)) if z.as_ref() == "UTC" => {
-                let t = DataType::Timestamp(*u, Some("+00:00".into()));
-                cols.push(cast(c, &t)?);
-                fields.push(Field::new(f.name(), t, f.is_nullable()));
+        .zip(fixed.fields())
+        .map(|(c, f)| {
+            if c.data_type() == f.data_type() {
+                Ok(c.clone())
+            } else {
+                cast(c, f.data_type())
             }
-            _ => {
-                cols.push(c.clone());
-                fields.push(f.as_ref().clone());
-            }
-        }
-    }
-    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(fixed.clone(), cols)?)
 }
 
 impl QueryEngine {
@@ -77,13 +88,14 @@ impl QueryEngine {
                 .collect();
             serde_json::to_writer(&mut buf, &cols).expect("json values serialize");
             buf.extend_from_slice(b",\"rows\":");
+            let fixed = utc_schema(&stream.schema());
             let (mut n, mut truncated) = (0usize, false);
             {
                 let mut w = arrow::json::WriterBuilder::new()
                     .with_explicit_nulls(true)
                     .build::<_, arrow::json::writer::JsonArray>(&mut buf);
                 'batches: while let Some(b) = stream.next().await {
-                    let b = utc_fix(&b?)?;
+                    let b = utc_fix(b?, &fixed)?;
                     let mut off = 0;
                     while off < b.num_rows() {
                         // More rows remain: stop here if a limit is reached (dropping the stream cancels DF's tasks).

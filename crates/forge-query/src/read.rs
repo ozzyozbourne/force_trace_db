@@ -130,17 +130,13 @@ impl ReadView {
         Ok(out)
     }
 
-    /// The memtable rows that pass `k`'s key filters, projected to `schema`; batches without a match are dropped.
+    /// The snapshot (cheap to clone: Arcs), e.g. to mask it on the blocking pool beside the I/O.
+    pub fn mem(&self) -> &MemtableSnapshot {
+        &self.mem
+    }
+
     pub fn mem_versions(&self, k: &KeyFilters, schema: &SchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
-        let mut out = Vec::new();
-        for b in self.mem.batches() {
-            match k.key_mask(b)? {
-                None => out.push(project_to(b, schema)?),
-                Some(m) if m.true_count() > 0 => out.push(filter_record_batch(&project_to(b, schema)?, &m)?),
-                Some(_) => {}
-            }
-        }
-        Ok(out)
+        mem_versions(&self.mem, k, schema)
     }
 
     /// Scans `parts`, `SCAN_CONCURRENCY` at a time.
@@ -164,6 +160,43 @@ impl ReadView {
             .await?;
         Ok(out.into_iter().flatten().collect())
     }
+}
+
+/// The memtable rows that pass `k`'s key filters (mask on the full batch, then project + filter: only the read
+/// columns are copied), projected to `schema`; batches without a match are dropped.
+pub(crate) fn mem_versions(
+    snap: &MemtableSnapshot,
+    k: &KeyFilters,
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let mut out = Vec::new();
+    for b in snap.batches() {
+        match k.key_mask(b)? {
+            None => out.push(project_to(b, schema)?),
+            Some(m) if m.true_count() > 0 => out.push(filter_record_batch(&project_to(b, schema)?, &m)?),
+            Some(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+/// `parts` (sorted by segment, then row) with the row ranges of each segment merged where the gap between them is
+/// at most `max_gap` rows (0: contiguous or overlapping only, i.e. exactly the same rows). The extra rows of a
+/// gap must be dropped by the caller's key mask.
+pub(crate) fn coalesce(parts: Vec<SegmentPart>, max_gap: u64) -> Vec<SegmentPart> {
+    let mut out: Vec<SegmentPart> = Vec::with_capacity(parts.len());
+    for p in parts {
+        if let (Some(last), RowSelection::Range(r)) = (out.last_mut(), &p.rows)
+            && last.seg.id == p.seg.id
+            && let RowSelection::Range(l) = &mut last.rows
+            && r.start <= l.end.saturating_add(max_gap)
+        {
+            l.end = l.end.max(r.end);
+            continue;
+        }
+        out.push(p);
+    }
+    out
 }
 
 fn row_start(r: &RowSelection) -> u64 {

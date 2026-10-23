@@ -158,6 +158,10 @@ async fn concurrent_ingest_and_reads() {
             let all: Vec<SpanRow> = posts(t, false).into_iter().chain(posts(t, true)).collect();
             assert_trace(&lt.rows, &all, &format!("iteration {i} trace {t}"));
         }
+        // Coverage reached: stop early (the assertions below hold).
+        if i >= 40 && both && segs - before >= 3 {
+            break;
+        }
     }
     let flushes = segments().await - before;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);

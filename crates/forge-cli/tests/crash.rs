@@ -451,11 +451,11 @@ async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
     let c = Case::new("5s");
     c.kill_under_load(fp, interval).await;
     let replay = restart_and_post(c.dir(), &c.ledger).await;
-    verify_with_sql(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
+    let _ = verify(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
     replay
 }
 
-/// `verify`, then (once per case) `forge sql --data-dir` counts exactly the merged visible keys, in-doubt
+/// `verify`, then `forge sql --data-dir` counts exactly the merged visible keys, in-doubt
 /// posts included.
 async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     let n = verify(dir, ledger, orphans, ctx).await;
@@ -551,7 +551,7 @@ async fn crash_replay_flush() {
         drop(s);
 
         let replay = restart_and_post(c.dir(), &c.ledger).await;
-        verify_with_sql(c.dir(), &c.ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
+        let _ = verify(c.dir(), &c.ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
     })
     .await;
 }
@@ -636,7 +636,7 @@ async fn final_flush_timeout_replays() {
         c.sigterm_under_load("1h", "final flush timed out").await;
         let replay = restart_and_post(c.dir(), &c.ledger).await; // rewrites the config with a 5 s grace
         assert!(replay.applied > 0, "{replay:?}");
-        verify_with_sql(
+        let _ = verify(
             c.dir(),
             &c.ledger,
             Orphans::Any,

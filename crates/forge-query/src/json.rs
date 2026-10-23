@@ -6,7 +6,6 @@ use arrow::array::{
     Array, AsArray, BinaryArray, Float64Array, Int64Array, ListArray, PrimitiveArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Float64Type, Int64Type, TimestampNanosecondType};
-use chrono::SecondsFormat;
 use forge_model::merge::Cancel;
 use forge_model::schema::{JSON_COLUMNS, col};
 use std::cell::Cell;
@@ -16,7 +15,8 @@ type Ts = PrimitiveArray<TimestampNanosecondType>;
 
 /// Typed column refs of the projected fields, in output order.
 pub(crate) struct SpanCols<'a> {
-    fields: Vec<(&'static str, Col<'a>)>,
+    /// (name, `"name":` with its leading comma except on the first field, column).
+    fields: Vec<(&'static str, Vec<u8>, Col<'a>)>,
     /// One debug log per response for invalid JSON text.
     logged: Cell<bool>,
 }
@@ -90,6 +90,11 @@ impl<'a> SpanCols<'a> {
             };
             fields.push((n, c));
         }
+        let fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, c))| (n, format!("{}\"{n}\":", if i > 0 { "," } else { "" }).into_bytes(), c))
+            .collect();
         Self {
             fields,
             logged: Cell::new(false),
@@ -98,17 +103,10 @@ impl<'a> SpanCols<'a> {
 
     /// Writes the fields of one span (no braces), then `"orphan":true` / `"cycle":true` when set.
     pub fn write_span(&self, out: &mut Vec<u8>, row: usize, orphan: bool, cycle: bool) {
-        for (i, (name, c)) in self.fields.iter().enumerate() {
-            if i > 0 {
-                out.push(b',');
-            }
-            let _ = write!(out, "\"{name}\":");
+        for (name, key, c) in &self.fields {
+            out.extend_from_slice(key);
             match c {
-                Col::Id(a) if a.is_valid(row) => {
-                    out.push(b'"');
-                    out.extend_from_slice(hex::encode(a.value(row)).as_bytes());
-                    out.push(b'"');
-                }
+                Col::Id(a) if a.is_valid(row) => hex_str(out, a.value(row)),
                 Col::Str(a) if a.is_valid(row) => json_str(out, a.value(row)),
                 Col::Json(a) if a.is_valid(row) => {
                     let v = a.value(row);
@@ -121,18 +119,24 @@ impl<'a> SpanCols<'a> {
                         json_str(out, v);
                     }
                 }
-                Col::Ts(a) if a.is_valid(row) => {
-                    let _ = write!(out, "\"{}\"", rfc3339(a.value(row)));
-                }
+                Col::Ts(a) if a.is_valid(row) => ts_str(out, a.value(row)),
                 Col::I64(a) if a.is_valid(row) => {
                     let _ = write!(out, "{}", a.value(row));
                 }
                 Col::F64(a) if a.is_valid(row) => float(out, a.value(row)),
                 Col::List(a) if a.is_valid(row) => {
                     let v = a.value(row);
-                    let v = v.as_string::<i32>();
-                    let items: Vec<Option<&str>> = v.iter().collect();
-                    serde_json::to_writer(&mut *out, &items).expect("strings serialize");
+                    out.push(b'[');
+                    for (i, x) in v.as_string::<i32>().iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        match x {
+                            Some(x) => json_str(out, x),
+                            None => out.extend_from_slice(b"null"),
+                        }
+                    }
+                    out.push(b']');
                 }
                 Col::Latency(start, end) => match (start, end) {
                     (Some(s), Some(e)) if s.is_valid(row) && e.is_valid(row) => {
@@ -165,8 +169,26 @@ fn float(out: &mut Vec<u8>, f: f64) {
     }
 }
 
-pub fn rfc3339(ns: i64) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(SecondsFormat::Nanos, true)
+/// `"<lowercase hex>"`, without allocating for ids.
+fn hex_str(out: &mut Vec<u8>, b: &[u8]) {
+    let mut buf = [0u8; 64];
+    out.push(b'"');
+    match buf.get_mut(..b.len() * 2) {
+        Some(dst) => {
+            hex::encode_to_slice(b, dst).expect("sized buffer");
+            out.extend_from_slice(dst);
+        }
+        None => out.extend_from_slice(hex::encode(b).as_bytes()),
+    }
+    out.push(b'"');
+}
+
+/// `"YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ"` (RFC3339 UTC, 9 fractional digits).
+fn ts_str(out: &mut Vec<u8>, ns: i64) {
+    let t = chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    out.push(b'"');
+    out.extend_from_slice(t.as_bytes());
+    out.push(b'"');
 }
 
 /// `{"project","trace_id","span_count","roots":[…]}` (nested, every span with `"children":[…]`) or

@@ -1,6 +1,6 @@
 //! Trace fast path (D3): `locate_trace` row ranges + memtable rows -> merge -> tree -> JSON. No DataFusion.
 use crate::filters::KeyFilters;
-use crate::read::{merge_or_filter, needs_merge, read_columns};
+use crate::read::{mem_versions, merge_or_filter, needs_merge, read_columns};
 use crate::tree::TraceTree;
 use crate::{QueryEngine, QueryError, QueryKind};
 use arrow::array::RecordBatch;
@@ -105,9 +105,15 @@ impl QueryEngine {
             let k = KeyFilters::project(&r.project, Some(r.trace));
             let cols = read_columns(&trace_columns(r.payloads));
             let schema = projected_schema(&cols);
-            let parts = view.locate_versions(&k).await?;
-            let mut batches = view.scan(&parts, &cols, None).await?;
-            let mem = view.mem_versions(&k, &schema)?;
+            // The memtable mask runs on the blocking pool while the segments are located and scanned.
+            let (snap, k2, s2) = (view.mem().clone(), k.clone(), schema.clone());
+            let mem = q.blocking(move |_| Ok(mem_versions(&snap, &k2, &s2)?));
+            let segs = async {
+                let parts = view.locate_versions(&k).await?;
+                let batches = view.scan(&parts, &cols, None).await?;
+                Ok::<_, QueryError>((parts, batches))
+            };
+            let ((parts, mut batches), mem) = tokio::try_join!(segs, mem)?;
             let merge = needs_merge(&parts, !mem.is_empty());
             batches.extend(mem);
             drop(view);

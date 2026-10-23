@@ -181,9 +181,7 @@ impl QueryCtx {
 
     /// Reserves `batches` against the call's pool: an oversized input fails like an oversized query.
     pub(crate) fn reserve(&self, name: &str, batches: &[RecordBatch]) -> Result<MemoryReservation, QueryError> {
-        let r = MemoryConsumer::new(name).register(&self.pool);
-        r.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
-        Ok(r)
+        reserve(&self.pool, name, batches)
     }
 
     /// `f` on the blocking pool under a fresh `Cancel` that dropping this future sets.
@@ -278,6 +276,17 @@ impl QueryEngine {
         })
         .await
     }
+}
+
+/// Reserves the size of `batches` against `pool`.
+pub(crate) fn reserve(
+    pool: &Arc<dyn MemoryPool>,
+    name: &str,
+    batches: &[RecordBatch],
+) -> Result<MemoryReservation, QueryError> {
+    let r = MemoryConsumer::new(name).register(pool);
+    r.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
+    Ok(r)
 }
 
 pub(crate) fn ext<E: std::error::Error + Send + Sync + 'static>(e: E) -> DataFusionError {

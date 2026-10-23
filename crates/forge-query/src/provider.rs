@@ -5,7 +5,7 @@ use crate::derived::effective_total_tokens_expr;
 use crate::ext;
 use crate::filters::{KeyFilters, classify};
 use crate::merge_exec::MergeVersionsExec;
-use crate::read::{ReadView, SegmentPart, needs_merge, read_columns};
+use crate::read::{ReadView, SegmentPart, coalesce, needs_merge, read_columns};
 use crate::scan::SegmentScanExec;
 use arrow::array::{Array, AsArray, RecordBatch, UInt32Array};
 use arrow::compute::take_record_batch;
@@ -43,7 +43,7 @@ pub(crate) struct SpansTableProvider {
 async fn plan_segments(view: &ReadView, k: &KeyFilters) -> Result<BTreeMap<String, Vec<SegmentPart>>> {
     let mut out: BTreeMap<String, Vec<SegmentPart>> = BTreeMap::new();
     if k.projects.is_some() && k.traces.is_some() {
-        for part in view.locate_versions(k).await.map_err(ext)? {
+        for part in coalesce(view.locate_versions(k).await.map_err(ext)?, 0) {
             out.entry(part.seg.project_id.to_string()).or_default().push(part);
         }
         return Ok(out);

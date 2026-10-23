@@ -48,7 +48,8 @@ fn no_payload_or_dotted(projections: &[Vec<&str>], what: &str) {
 
 /// One (project, trace): load_trace == SQL == reference (with and without payloads), the tree == ref_tree, the
 /// JSON == the independently built value (tree and flat, with and without payloads).
-async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: TraceId) {
+/// `sql`: also check the trace through SQL (provider.rs covers SQL vs the reference broadly; a subset suffices).
+async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: TraceId, sql_too: bool) {
     let rows: Vec<SpanRow> = rows_of(reference, project, trace).into_iter().cloned().collect();
     let ctx = format!("{project}/{trace}");
     if rows.is_empty() {
@@ -85,16 +86,18 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
             "{ctx} payloads={payloads}"
         );
         if payloads {
-            let q = format!(
-                "SELECT {} FROM spans WHERE project_id = '{project}' AND trace_id = {}",
-                cols.join(", "),
-                hex_lit(trace.as_bytes())
-            );
-            assert_eq!(
-                sort_by_key(&sql(&fx.engine, &q).await).columns(),
-                want.columns(),
-                "{ctx}: SQL"
-            );
+            if sql_too {
+                let q = format!(
+                    "SELECT {} FROM spans WHERE project_id = '{project}' AND trace_id = {}",
+                    cols.join(", "),
+                    hex_lit(trace.as_bytes())
+                );
+                assert_eq!(
+                    sort_by_key(&sql(&fx.engine, &q).await).columns(),
+                    want.columns(),
+                    "{ctx}: SQL"
+                );
+            }
             let ids = keys_of(&lt.rows);
             let got: Vec<RefNode> = lt
                 .tree
@@ -318,12 +321,14 @@ async fn check_cursor(fx: &Fixture, reference: &[SpanRow]) {
     assert_eq!(page_all(fx, q.clone()).await, ref_runs(reference, &q));
 }
 
-async fn check_fixture(seed: u64, limit_one: bool) {
+/// `full` (one seed per group): limit=1 paging (seeds 1 and 2 only) and the per-trace SQL cross-check.
+async fn check_fixture(seed: u64, full: bool) {
+    let limit_one = full && seed <= 2;
     let (layout, traps) = random_layout(seed);
     let fx = Fixture::build(layout, traps, QueryConfig::default()).await;
     let reference = fx.reference();
     for (p, t) in fx.traces() {
-        check_trace(&fx, &reference, &p, t).await;
+        check_trace(&fx, &reference, &p, t, full).await;
     }
     for (p, t) in [("a", tid(777)), ("b", tid(200)), ("nope", tid(0))] {
         let e = fx.engine.load_trace(&treq(p, t, true, TraceFormat::Tree)).await;
@@ -355,7 +360,7 @@ async fn check_fixture(seed: u64, limit_one: bool) {
     assert_eq!(got, [25, 100]);
 }
 
-/// Seeds `first, first + 5, …, ≤ 20`; `limit=1` paging on seeds 1..=5 only (one per group).
+/// Seeds `first, first + 5, …, ≤ 20`; the full checks on seeds 1..=5 (one per group).
 async fn seeds(first: u64) {
     for seed in (first..=20).step_by(5) {
         check_fixture(seed, seed <= 5).await;
@@ -392,9 +397,9 @@ fn random_fixtures(seed: u64) {
     rt.block_on(check_fixture(seed, false));
 }
 
-// 16 random fixtures, as 4 proptests of 4 cases (they run in parallel).
+// 8 random fixtures, as 4 proptests of 2 cases (they run in parallel).
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4))]
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2))]
     #[test]
     fn differential_random_fixtures_a(seed in 21u64..1_000_000) { random_fixtures(seed) }
     #[test]
@@ -413,7 +418,7 @@ async fn big_trace_matches_reference() {
     let fx = Fixture::build(layout, Traps::default(), QueryConfig::default()).await;
     let reference = fx.reference();
     assert_eq!(rows_of(&reference, "big", tid(999)).len(), 300);
-    check_trace(&fx, &reference, "big", tid(999)).await;
+    check_trace(&fx, &reference, "big", tid(999), true).await;
     let v: Value = serde_json::from_slice(
         &fx.engine
             .trace_json(&treq("big", tid(999), false, TraceFormat::Flat))

@@ -435,17 +435,16 @@ async fn memory_limit_is_invalid_input() {
         memory_limit: bytesize::ByteSize::kib(16),
         ..QueryConfig::default()
     };
-    let fx = Fixture::build(layout, traps, small).await;
+    let fx = Fixture::build(layout, traps, QueryConfig::default()).await;
+    let e = QueryEngine::new(fx.meta.clone(), fx.store.clone(), fx.mem.clone(), small);
     assert_eq!(
-        nodes(&physical(&fx.engine, q).await, "MergeVersionsExec"),
+        nodes(&physical(&e, q).await, "MergeVersionsExec"),
         1,
         "precondition: a merges"
     );
-    let e = fx.engine.sql_batches(q).await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
-    assert!(e.message().contains("memory limit"), "{}", e.message());
-    let (layout, traps) = random_layout(5);
-    let fx = Fixture::build(layout, traps, QueryConfig::default()).await;
+    let err = e.sql_batches(q).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    assert!(err.message().contains("memory limit"), "{}", err.message());
     assert!(sql(&fx.engine, q).await.num_rows() > 0, "control");
 }
 
@@ -498,11 +497,12 @@ async fn deadlines_cover_planning_and_scans() {
     for (i, e) in engines.iter().chain([&fx.engine]).enumerate() {
         let control = i == 2;
         let t = Instant::now();
-        let results: [Result<(), QueryError>; 3] = [
-            e.sql_batches("SELECT * FROM spans").await.map(drop),
-            e.trace_json(&trace).await.map(drop),
-            e.list_runs(&runs).await.map(drop),
-        ];
+        let (a, b, c) = tokio::join!(
+            e.sql_batches("SELECT * FROM spans"),
+            e.trace_json(&trace),
+            e.list_runs(&runs)
+        );
+        let results: [Result<(), QueryError>; 3] = [a.map(drop), b.map(drop), c.map(drop)];
         for (j, r) in results.into_iter().enumerate() {
             if control {
                 r.unwrap_or_else(|e| panic!("control {j}: {e}"));
@@ -515,7 +515,7 @@ async fn deadlines_cover_planning_and_scans() {
             }
         }
         if !control {
-            assert!(t.elapsed() < Duration::from_millis(3 * 700), "{:?}", t.elapsed());
+            assert!(t.elapsed() < Duration::from_millis(700), "{:?}", t.elapsed());
         }
     }
 }

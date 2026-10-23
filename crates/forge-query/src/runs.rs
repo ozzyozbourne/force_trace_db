@@ -8,8 +8,8 @@
 //! after the next unread segment's `max_start`. No budget: a deep page costs O(segments overlapping the window)
 //! (M3's per-hour L1 bounds that).
 use crate::filters::KeyFilters;
-use crate::read::{ReadView, SegmentPart, merge_or_filter, needs_merge, read_columns};
-use crate::{QueryCtx, QueryEngine, QueryError, QueryKind};
+use crate::read::{ReadView, SegmentPart, coalesce, mem_versions, merge_or_filter, needs_merge, read_columns};
+use crate::{QueryCtx, QueryEngine, QueryError, QueryKind, reserve};
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
@@ -19,7 +19,8 @@ use forge_model::ids::{ProjectId, SpanId, TraceId};
 use forge_model::schema::{col, projected_schema};
 use forge_storage::RowSelection;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 /// What a list returns: never payload, never dotted_order (== `trace_columns(false)`).
 pub const RUN_COLUMNS: [&str; 21] = [
@@ -183,23 +184,74 @@ pub struct RunsPage {
     pub next_cursor: Option<Cursor>,
 }
 
-/// (start, trace, span) of each row; None where start is null.
-fn positions(b: &RecordBatch) -> Vec<Option<Pos>> {
-    let s = b.schema_ref();
-    let st = b
-        .column(s.index_of(col::START_TIME).expect("start"))
-        .as_primitive::<TimestampNanosecondType>();
-    let t = b.column(s.index_of(col::TRACE_ID).expect("trace")).as_binary::<i32>();
-    let sp = b.column(s.index_of(col::SPAN_ID).expect("span")).as_binary::<i32>();
-    (0..b.num_rows())
-        .map(|i| {
-            let ids = (
-                TraceId::from_slice(t.value(i)).ok()?,
-                SpanId::from_slice(sp.value(i)).ok()?,
-            );
-            st.is_valid(i).then(|| (st.value(i), ids.0, ids.1))
+/// What candidate generation reads (`candidates`).
+const CANDIDATE_COLUMNS: [&str; 5] = [
+    col::PROJECT_ID,
+    col::TRACE_ID,
+    col::SPAN_ID,
+    col::PARENT_SPAN_ID,
+    col::START_TIME,
+];
+/// Verify reads a segment's located ranges as one scan when they are at most this many rows apart (the rows in
+/// between are dropped by the key mask).
+const VERIFY_GAP: u64 = 4096;
+/// Up to this many distinct wave span ids are pushed into the verify scans as a key filter.
+const MAX_FILTER_SPANS: usize = 256;
+
+/// The id and start columns of a batch, by name.
+struct Ids<'a> {
+    start: &'a arrow::array::TimestampNanosecondArray,
+    trace: &'a arrow::array::BinaryArray,
+    span: &'a arrow::array::BinaryArray,
+}
+
+impl<'a> Ids<'a> {
+    fn of(b: &'a RecordBatch) -> Result<Self, QueryError> {
+        let s = b.schema_ref();
+        Ok(Self {
+            start: b
+                .column(s.index_of(col::START_TIME)?)
+                .as_primitive::<TimestampNanosecondType>(),
+            trace: b.column(s.index_of(col::TRACE_ID)?).as_binary::<i32>(),
+            span: b.column(s.index_of(col::SPAN_ID)?).as_binary::<i32>(),
         })
-        .collect()
+    }
+    /// (start, trace, span) of row `i`; None where start is null.
+    fn pos(&self, i: usize) -> Option<Pos> {
+        let ids = (
+            TraceId::from_slice(self.trace.value(i)).ok()?,
+            SpanId::from_slice(self.span.value(i)).ok()?,
+        );
+        self.start.is_valid(i).then(|| (self.start.value(i), ids.0, ids.1))
+    }
+}
+
+/// The smallest `Reverse` position with start <= `start` (candidates are kept newest first).
+fn at_or_below(start: i64) -> Reverse<Pos> {
+    Reverse((start, TraceId([0xff; 16]), SpanId([0xff; 8])))
+}
+
+/// `parent_span_id IS NULL`: a first cut for candidate scans (candidates() re-checks every row).
+fn roots_filter() -> vortex::expr::Expression {
+    vortex::expr::is_null(vortex::expr::col(col::PARENT_SPAN_ID))
+}
+
+/// `span_id IN spans` (a key column: allowed below the merge, invariant 4), for at most MAX_FILTER_SPANS ids.
+fn span_filter(spans: &BTreeSet<SpanId>) -> Option<vortex::expr::Expression> {
+    use vortex::buffer::ByteBuffer;
+    use vortex::dtype::Nullability;
+    use vortex::expr::{eq, lit, or};
+    use vortex::scalar::Scalar;
+    if spans.len() > MAX_FILTER_SPANS {
+        return None;
+    }
+    spans
+        .iter()
+        .map(|s| {
+            let v = Scalar::binary(ByteBuffer::copy_from(s.as_bytes()), Nullability::NonNullable);
+            eq(vortex::expr::col(col::SPAN_ID), lit(v))
+        })
+        .reduce(or)
 }
 
 impl QueryEngine {
@@ -249,28 +301,41 @@ impl QueryEngine {
             .filter(|s| s.max_start_ns.is_some())
             .collect();
         let mut cand: BTreeSet<Reverse<Pos>> = BTreeSet::new();
-        for b in view.mem_versions(&KeyFilters::project(&r.project, None), &schema)? {
-            candidates(r, hi, &b, &mut cand);
-        }
-        let mut checked: HashSet<Pos> = HashSet::new();
+        let (snap, rr) = (view.mem().clone(), r.clone());
+        let mem = q
+            .blocking(move |_| {
+                let k = KeyFilters::project(&rr.project, None);
+                let mut v = Vec::new();
+                for b in mem_versions(&snap, &k, &projected_schema(&CANDIDATE_COLUMNS))? {
+                    v.extend(candidates(&rr, hi, &b)?);
+                }
+                Ok(v)
+            })
+            .await?;
+        cand.extend(mem.into_iter().map(Reverse));
+        // Candidates from `unchecked` on (in `cand`'s order) are not verified yet; None: all are. Segments are
+        // read in descending max_start, so every verified candidate starts above every unverified one.
+        let mut unchecked = Some(Bound::Unbounded);
         let mut merged: Vec<RecordBatch> = Vec::new();
         let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
         let mut i = 0;
         loop {
             let frontier = segs.get(i).and_then(|s| s.max_start_ns);
-            let wave: Vec<Pos> = cand
-                .iter()
-                .map(|p| p.0)
-                .filter(|p| !checked.contains(p) && frontier.is_none_or(|f| p.0 > f))
-                .collect();
-            if !wave.is_empty() {
-                let b = self.verify(q, &view, r, hi, &cols, &wave).await?;
-                checked.extend(wave);
-                for (row, p) in positions(&b).into_iter().enumerate() {
-                    verified.insert(Reverse(p.expect("verified rows have a start")), (merged.len(), row));
+            let upper = frontier.map(at_or_below);
+            if let Some(lo) = unchecked.take() {
+                let end = upper.map_or(Bound::Unbounded, Bound::Excluded);
+                let wave: Vec<Pos> = cand.range((lo, end)).map(|p| p.0).collect();
+                if !wave.is_empty() {
+                    let b = self.verify(q, &view, r, hi, &cols, &wave).await?;
+                    let ids = Ids::of(&b)?;
+                    for row in 0..b.num_rows() {
+                        let p = ids.pos(row).expect("verified rows have a start");
+                        verified.insert(Reverse(p), (merged.len(), row));
+                    }
+                    merged.push(b);
                 }
-                merged.push(b);
             }
+            unchecked = upper.map(Bound::Included);
             let kth = verified.keys().nth(k - 1).map(|p| p.0);
             if kth.is_some_and(|p| frontier.is_none_or(|f| p.0 > f)) {
                 break;
@@ -285,11 +350,22 @@ impl QueryEngine {
                 });
                 i += 1;
             }
-            for b in view.scan(&parts, &cols, None).await? {
-                candidates(r, hi, &b, &mut cand);
-            }
+            let batches = view.scan(&parts, &CANDIDATE_COLUMNS, Some(roots_filter())).await?;
+            let rr = r.clone();
+            let found = q
+                .blocking(move |cancel| {
+                    let mut v = Vec::new();
+                    for b in &batches {
+                        cancel.check()?;
+                        v.extend(candidates(&rr, hi, b)?);
+                    }
+                    Ok(v)
+                })
+                .await?;
+            cand.extend(found.into_iter().map(Reverse));
         }
-        let more = verified.len() > k || i < segs.len() || cand.iter().any(|p| !checked.contains(&p.0));
+        let unverified = unchecked.is_some_and(|lo| cand.range((lo, Bound::Unbounded)).next().is_some());
+        let more = verified.len() > k || i < segs.len() || unverified;
         let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
         let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
         let rows = if idx.is_empty() {
@@ -312,52 +388,54 @@ impl QueryEngine {
         wave: &[Pos],
     ) -> Result<RecordBatch, QueryError> {
         let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
+        let filter = span_filter(&keys.iter().map(|k| k.1).collect());
         let k = KeyFilters {
             traces: Some(keys.iter().map(|k| k.0).collect()),
             spans: Some(keys),
             ..KeyFilters::project(&r.project, None)
         };
+        let parts = coalesce(view.locate_versions(&k).await?, VERIFY_GAP);
+        let scanned = view.scan(&parts, cols, filter).await?;
         let schema: SchemaRef = projected_schema(cols);
-        let parts = view.locate_versions(&k).await?;
-        let mut batches = Vec::new();
-        for b in view.scan(&parts, cols, None).await? {
-            batches.push(match k.key_mask(&b)? {
-                Some(m) => filter_record_batch(&b, &m)?,
-                None => b,
-            });
-        }
-        let mem = view.mem_versions(&k, &schema)?;
-        let merge = needs_merge(&parts, !mem.is_empty());
-        batches.extend(mem);
-        let reservation = q.reserve("runs", &batches)?;
-        let m = q
-            .blocking(move |cancel| merge_or_filter(&schema, &batches, merge, cancel))
-            .await?;
-        drop(reservation);
-        let s = m.schema_ref();
-        let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
-        let project = m.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
-        let rt = m.column(s.index_of(col::RUN_TYPE)?).as_string::<i32>();
-        let st = m.column(s.index_of(col::STATUS)?).as_string::<i32>();
-        let name = m.column(s.index_of(col::NAME)?).as_string::<i32>();
-        let mask: BooleanArray = positions(&m)
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let Some(p) = p else { return Some(false) };
-                Some(
-                    project.value(i) == r.project.as_str()
-                        && par.is_null(i)
-                        && in_window(r, hi, &p)
-                        && in_set(&r.run_types, rt, i)
-                        && in_set(&r.statuses, st, i)
-                        && r.q
-                            .as_ref()
-                            .is_none_or(|q| name.is_valid(i) && name.value(i).to_lowercase().contains(q.as_str())),
-                )
-            })
-            .collect();
-        Ok(filter_record_batch(&m, &mask)?)
+        let (snap, pool, r) = (view.mem().clone(), q.pool.clone(), r.clone());
+        q.blocking(move |cancel| {
+            let mut batches = Vec::new();
+            for b in scanned {
+                batches.push(match k.key_mask(&b)? {
+                    Some(m) => filter_record_batch(&b, &m)?,
+                    None => b,
+                });
+            }
+            let mem = mem_versions(&snap, &k, &schema)?;
+            let merge = needs_merge(&parts, !mem.is_empty());
+            batches.extend(mem);
+            let reservation = reserve(&pool, "runs", &batches)?;
+            let m = merge_or_filter(&schema, &batches, merge, cancel)?;
+            drop((batches, reservation));
+            let s = m.schema_ref();
+            let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
+            let project = m.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
+            let rt = m.column(s.index_of(col::RUN_TYPE)?).as_string::<i32>();
+            let st = m.column(s.index_of(col::STATUS)?).as_string::<i32>();
+            let name = m.column(s.index_of(col::NAME)?).as_string::<i32>();
+            let ids = Ids::of(&m)?;
+            let mask: BooleanArray = (0..m.num_rows())
+                .map(|i| {
+                    Some(
+                        par.is_null(i)
+                            && project.value(i) == r.project.as_str()
+                            && ids.pos(i).is_some_and(|p| in_window(&r, hi, &p))
+                            && in_set(&r.run_types, rt, i)
+                            && in_set(&r.statuses, st, i)
+                            && r.q
+                                .as_ref()
+                                .is_none_or(|q| name.is_valid(i) && name.value(i).to_lowercase().contains(q.as_str())),
+                    )
+                })
+                .collect();
+            Ok(filter_record_batch(&m, &mask)?)
+        })
+        .await
     }
 }
 
@@ -372,22 +450,18 @@ fn in_window(r: &RunsRequest, hi: Option<i64>, p: &Pos) -> bool {
 }
 
 /// Pre-merge predicates used for candidate generation only (FP §2.2 safety argument, invariant 4): rows of the
-/// project that look like roots, with a start in the window, below the cursor.
-fn candidates(r: &RunsRequest, hi: Option<i64>, b: &RecordBatch, out: &mut BTreeSet<Reverse<Pos>>) {
+/// project that look like roots, with a start in the window, below the cursor. The null-parent test comes first:
+/// ids are parsed only for root-looking rows.
+fn candidates(r: &RunsRequest, hi: Option<i64>, b: &RecordBatch) -> Result<Vec<Pos>, QueryError> {
     let s = b.schema_ref();
-    let par = b.column(s.index_of(col::PARENT_SPAN_ID).expect("parent"));
-    let p = b
-        .column(s.index_of(col::PROJECT_ID).expect("project"))
-        .as_string::<i32>();
-    for (i, pos) in positions(b).into_iter().enumerate() {
-        if let Some(pos) = pos
-            && par.is_null(i)
-            && p.value(i) == r.project.as_str()
-            && in_window(r, hi, &pos)
-        {
-            out.insert(Reverse(pos));
-        }
-    }
+    let par = b.column(s.index_of(col::PARENT_SPAN_ID)?);
+    let p = b.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
+    let ids = Ids::of(b)?;
+    Ok((0..b.num_rows())
+        .filter(|&i| par.is_null(i) && p.value(i) == r.project.as_str())
+        .filter_map(|i| ids.pos(i))
+        .filter(|pos| in_window(r, hi, pos))
+        .collect())
 }
 
 #[cfg(test)]

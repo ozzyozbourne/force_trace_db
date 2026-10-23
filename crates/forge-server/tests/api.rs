@@ -406,7 +406,7 @@ async fn sql_api_limits() {
     f.ingest.submit(rows[150..].to_vec()).await.unwrap();
     let slow = Arc::new(RecordingSegmentStore::slow(
         f.segments.clone(),
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(700),
     ));
     // Timeouts.
     let api = api_router(with_engine(
@@ -447,9 +447,10 @@ async fn sql_api_limits() {
     let (st, v) = call(&api_router(f.clone()), post("/v1/sql", order)).await;
     assert_eq!((st, &v["row_count"]), (StatusCode::OK, &json!(300)));
     // Concurrency: one slot, held by a slow query; the second waits 50 ms, then 503 + Retry-After.
+    slow.take_projections();
     let one = api_router(with_engine(
         &f,
-        slow,
+        slow.clone(),
         QueryConfig {
             sql_concurrency: 1,
             ..Default::default()
@@ -459,7 +460,10 @@ async fn sql_api_limits() {
         let one = one.clone();
         async move { call(&one, post("/v1/sql", json!({"query": "SELECT name FROM spans"}))).await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The held query scans (and sleeps) only after taking the slot.
+    while slow.take_projections().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     let (st, h, _) = body(&one, post("/v1/sql", json!({"query": "SELECT 1", "timeout_ms": 50}))).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert!(h.contains_key("retry-after"));
