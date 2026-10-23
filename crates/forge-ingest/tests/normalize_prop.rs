@@ -48,7 +48,7 @@ fn any_value() -> impl Strategy<Value = AnyValue> {
         any::<f64>().prop_map(Value::DoubleValue),
         prop::collection::vec(any::<u8>(), 0..8).prop_map(Value::BytesValue),
     ];
-    let leaf = prop_oneof![9 => leaf.prop_map(|v| Some(v)), 1 => Just(None)].prop_map(|value| AnyValue { value });
+    let leaf = prop_oneof![9 => leaf.prop_map(Some), 1 => Just(None)].prop_map(|value| AnyValue { value });
     leaf.prop_recursive(3, 24, 4, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..4).prop_map(|values| AnyValue {

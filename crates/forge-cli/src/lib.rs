@@ -102,11 +102,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     init_tracing(&cli.log, &cli.log_format);
     match cli.cmd {
         Cmd::Serve => {
-            // Before any startup work, so an early SIGTERM is queued instead of killing the process.
-            let signals = ShutdownSignals::install().context("installing signal handlers")?;
+            // Before any startup work, so an early SIGTERM is handled (exit 0) instead of killing the process.
+            let mut signals = ShutdownSignals::install().context("installing signal handlers")?;
             tracing::info!("starting");
             let cfg = ForgeConfig::load(cli.config.as_deref()).context("loading config")?;
-            Forge::open(cfg).await?.serve(signals).await
+            let forge = tokio::select! {
+                r = Box::pin(Forge::open(cfg)) => r?,
+                () = signals.recv() => {
+                    // Open may be replaying the WAL or retrying a replay-time flush; exiting is a crash-equivalent
+                    // stop (the WAL replays on the next start).
+                    tracing::warn!("shutdown signal received during startup; exiting (the WAL replays on the next start)");
+                    std::process::exit(0);
+                }
+            };
+            forge.serve(signals).await
         }
         Cmd::Sql(_) => not_yet("sql", Unimplemented("M2")),
         Cmd::Inspect(InspectCmd::Segment { path, layout, verify }) => {

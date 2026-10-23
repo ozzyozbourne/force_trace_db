@@ -33,7 +33,7 @@ pub async fn inspect_segment(path: &std::path::Path, o: &InspectOptions) -> crat
     let fields = file
         .dtype()
         .as_struct_fields_opt()
-        .filter(|f| f.names().iter().any(|n| n.to_string() == col::PROJECT_ID))
+        .filter(|f| f.names().iter().any(|n| n == col::PROJECT_ID))
         .ok_or_else(|| crate::StorageError::InvalidInput("not a spans segment".into()))?
         .clone();
     writeln!(out, "file:      {} ({size} bytes)", path.display()).unwrap();
