@@ -1,6 +1,8 @@
 //! Catalog types shared by meta, storage, index, ingest and query.
 use crate::enums::str_enum;
 use crate::ids::{ProjectId, TraceId};
+use chrono::format::{Item, StrftimeItems};
+use std::sync::LazyLock;
 use std::{fmt, str::FromStr};
 
 /// Segment identity = ULID (time-sortable; Crockford base32, 26 chars, used in object paths).
@@ -61,10 +63,13 @@ impl HourBucket {
     }
     /// `yyyy-mm-dd/hh` (object layout).
     pub fn path_component(self) -> String {
+        self.path_display().to_string()
+    }
+    fn path_display(self) -> impl fmt::Display {
+        static ITEMS: LazyLock<Vec<Item<'static>>> = LazyLock::new(|| StrftimeItems::new("%Y-%m-%d/%H").collect());
         chrono::DateTime::<chrono::Utc>::from_timestamp(self.0 * 3600, 0)
             .expect("hour in range")
-            .format("%Y-%m-%d/%H")
-            .to_string()
+            .format_with_items(ITEMS.iter())
     }
 }
 
@@ -150,7 +155,7 @@ pub mod paths {
     use super::{HourBucket, Level, SegmentId};
     use crate::ids::ProjectId;
     pub fn segment_path(p: &ProjectId, level: Level, hour: HourBucket, id: SegmentId) -> String {
-        format!("segments/{p}/{}/{}/{id}.vortex", level.as_str(), hour.path_component())
+        format!("segments/{p}/{}/{}/{id}.vortex", level.as_str(), hour.path_display())
     }
     pub fn fts_path(segment_path: &str) -> String {
         format!("{}.fts", segment_path.strip_suffix(".vortex").unwrap_or(segment_path))

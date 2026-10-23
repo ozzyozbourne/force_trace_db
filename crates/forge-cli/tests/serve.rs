@@ -24,6 +24,8 @@ struct Ports {
 struct ServerProc {
     child: Child,
     logs: Arc<Mutex<Vec<String>>>,
+    /// Drains stderr; finishes at EOF, i.e. when the child exits.
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ServerProc {
@@ -44,12 +46,16 @@ impl ServerProc {
             .expect("spawn forge");
         let logs = Arc::new(Mutex::new(Vec::new()));
         let (sink, stderr) = (logs.clone(), child.stderr.take().expect("piped stderr"));
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
             }
         });
-        Self { child, logs }
+        Self {
+            child,
+            logs,
+            reader: Some(reader),
+        }
     }
 
     fn lines(&self) -> MutexGuard<'_, Vec<String>> {
@@ -84,13 +90,15 @@ impl ServerProc {
 
     /// Bound addresses from the `listening` log events (all configured addrs are port 0).
     async fn ports(&mut self) -> Ports {
+        // Lines already parsed are skipped on later polls.
+        let (mut found, mut seen) = (HashMap::new(), 0);
         self.poll(
             Duration::from_secs(30),
             "no listening lines",
             true,
             async |s: &mut Self| {
-                let mut found = HashMap::new();
-                for line in s.lines().iter() {
+                let lines = s.lines();
+                for line in &lines[seen..] {
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                         continue;
                     };
@@ -101,6 +109,8 @@ impl ServerProc {
                         found.insert(name.to_string(), addr.parse::<SocketAddr>().expect("listening addr"));
                     }
                 }
+                seen = lines.len();
+                drop(lines);
                 let get = |n: &str| found.get(n).copied();
                 Some(Ports {
                     ops: get("ops")?,
@@ -144,8 +154,12 @@ impl ServerProc {
                 s.child.try_wait().expect("try_wait")
             })
             .await;
-        // Let the stderr reader thread drain the last lines.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(r) = self.reader.take() {
+            tokio::task::spawn_blocking(move || r.join())
+                .await
+                .expect("join")
+                .expect("stderr reader");
+        }
         st
     }
 
@@ -264,14 +278,14 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
 #[tokio::test]
 async fn half_open_connection_hits_drain_deadline_and_still_exits_0() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut s, p) = start(tmp.path(), "2s").await;
+    let (mut s, p) = start(tmp.path(), "500ms").await;
     let _grpc = std::net::TcpStream::connect(p.otlp_grpc).expect("connect grpc");
     let mut api = std::net::TcpStream::connect(p.api).expect("connect api");
     api.write_all(b"GET /v1/projects HTTP/1.1\r\nHost: x\r\n")
         .expect("partial request");
     tokio::time::sleep(Duration::from_millis(200)).await;
     s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(7)).await;
+    let st = s.wait_exit(Duration::from_secs(6)).await;
     let logs = s.logs();
     assert!(st.success(), "{st}\n{logs}");
     assert!(logs.contains("drain deadline exceeded"), "{logs}");

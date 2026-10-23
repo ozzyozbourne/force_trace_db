@@ -135,8 +135,7 @@ async fn concurrent_first_open() {
 
 #[tokio::test]
 async fn projects() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = db(dir.path());
+    let s = SqliteMetastore::open_in_memory().unwrap();
     let a = Project {
         api_key_hash: Some([7; 32]),
         retention_days: Some(30),
@@ -161,8 +160,7 @@ async fn projects() {
 
 #[tokio::test]
 async fn commit_flush_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = db(dir.path());
+    let s = SqliteMetastore::open_in_memory().unwrap();
     let a = seg("p", Level::L0, Some((10, 20)), 0, 7);
     let mut b = seg("q", Level::L0, Some((30, 40)), 0, 9);
     b.traces.push(TraceRange {
@@ -237,8 +235,7 @@ async fn commit_flush_round_trip() {
 
 #[tokio::test]
 async fn auto_create_ignores_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = db(dir.path());
+    let s = SqliteMetastore::open_in_memory().unwrap();
     assert_eq!(s.max_version().await.unwrap(), 0);
     s.create_project(proj("a", "b")).await.unwrap();
     s.commit_flush(flush(vec![seg("b", Level::L0, None, 20, 1)], 1, 1))
@@ -250,8 +247,7 @@ async fn auto_create_ignores_names() {
 
 #[tokio::test]
 async fn failed_commit_changes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = db(dir.path());
+    let s = SqliteMetastore::open_in_memory().unwrap();
     let first = seg("p", Level::L0, Some((1, 2)), 0, 1);
     s.commit_flush(flush(vec![first.clone()], 5, 1)).await.unwrap();
 
@@ -286,8 +282,7 @@ async fn u64_overflow_is_an_error() {
 
 #[tokio::test]
 async fn list_segments_filters_and_orders() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = db(dir.path());
+    let s = SqliteMetastore::open_in_memory().unwrap();
     let early = seg("p", Level::L0, Some((100, 200)), 0, 1);
     let late = seg("p", Level::L1, Some((300, 400)), 0, 1);
     let nulls = seg("p", Level::L0, Some((900, 950)), 3, 1);

@@ -22,7 +22,9 @@ impl Forge {
     /// Opens (and migrates) the metastore, then builds the object store and segment store.
     pub async fn open(config: ForgeConfig) -> anyhow::Result<Arc<Self>> {
         let meta = forge_meta::open(&config.metastore).await?;
-        let built = forge_storage::build_object_store(&config.storage)?;
+        // Directory creation is blocking work, like the metastore open.
+        let storage = config.storage.clone();
+        let built = tokio::task::spawn_blocking(move || forge_storage::build_object_store(&storage)).await??;
         Ok(Arc::new(Self {
             config,
             meta,

@@ -5,6 +5,7 @@ use crate::{
     WrittenSegment,
 };
 use arrow::array::{Array, AsArray};
+use arrow::compute::{max, min};
 use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -17,7 +18,7 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use object_store::{PutMode, PutOptions, PutPayload};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
@@ -47,6 +48,16 @@ impl VortexSegmentStore {
     pub fn local_root(&self) -> Option<&std::path::Path> {
         self.local_root.as_deref()
     }
+}
+
+#[derive(Default)]
+struct Ingest {
+    stats: SegmentStats,
+    err: Option<StorageError>,
+}
+
+fn lock(m: &Mutex<Ingest>) -> MutexGuard<'_, Ingest> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Default)]
@@ -82,28 +93,32 @@ impl SegmentStats {
                     "row project {proj} != segment project {spec_project}"
                 )));
             }
-            let tid = TraceId::from_slice(t.value(i)).map_err(|e| StorageError::Unsorted(e.to_string()))?;
+            let raw = t.value(i);
             match self.traces.last_mut() {
-                Some(last) if last.trace_id == tid => last.row_count += 1,
-                Some(last) if last.trace_id > tid => {
+                Some(last) if last.trace_id.as_bytes()[..] == *raw => last.row_count += 1,
+                Some(last) if last.trace_id.as_bytes()[..] > *raw => {
+                    let tid = TraceId::from_slice(raw).map_err(|e| StorageError::Unsorted(e.to_string()))?;
                     return Err(StorageError::Unsorted(format!(
                         "trace_id {tid} after {}",
                         last.trace_id
                     )));
                 }
                 _ => self.traces.push(TraceRange {
-                    trace_id: tid,
-                    row_start: self.rows,
+                    trace_id: TraceId::from_slice(raw).map_err(|e| StorageError::Unsorted(e.to_string()))?,
+                    row_start: self.rows + i as u64,
                     row_count: 1,
                 }),
             }
-            if s.is_null(i) {
-                self.start_nulls += 1;
-            } else {
-                widen(&mut self.min_start, &mut self.max_start, s.value(i));
-            }
-            widen(&mut self.min_version, &mut self.max_version, v.value(i) as u64);
-            self.rows += 1;
+        }
+        self.rows += b.num_rows() as u64;
+        self.start_nulls += s.null_count() as u64;
+        if let (Some(lo), Some(hi)) = (min(s), max(s)) {
+            widen(&mut self.min_start, &mut self.max_start, lo);
+            widen(&mut self.min_start, &mut self.max_start, hi);
+        }
+        if let (Some(lo), Some(hi)) = (min(v), max(v)) {
+            widen(&mut self.min_version, &mut self.max_version, lo as u64);
+            widen(&mut self.min_version, &mut self.max_version, hi as u64);
         }
         Ok(())
     }
@@ -112,26 +127,41 @@ impl SegmentStats {
 #[async_trait]
 impl SegmentStore for VortexSegmentStore {
     async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
-        let batches: Vec<RecordBatch> = rows.try_collect().await?;
-        let mut stats = SegmentStats::default();
-        for b in &batches {
-            validate_batch(b)?;
-            stats.push(spec.project_id.as_str(), b)?;
+        // Batches are validated and measured as the writer pulls them. A failure is stashed so the caller
+        // gets the original StorageError rather than its Vortex wrapping.
+        let state = Arc::new(Mutex::new(Ingest::default()));
+        let schema = spans_schema();
+        let dtype = self.session.arrow().from_arrow_schema(&schema)?;
+        let (st, session, project) = (state.clone(), self.session.clone(), spec.project_id.clone());
+        let stream = rows.map(move |b| -> VortexResult<ArrayRef> {
+            let checked = b.and_then(|b| {
+                validate_batch(&b)?;
+                lock(&st).stats.push(project.as_str(), &b)?;
+                Ok(b)
+            });
+            match checked {
+                Ok(b) => session.arrow().from_arrow_record_batch(b, &schema),
+                Err(e) => {
+                    let msg = e.to_string();
+                    lock(&st).err.get_or_insert(e);
+                    Err(vortex::error::vortex_err!("{msg}"))
+                }
+            }
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        let written = self
+            .session
+            .write_options()
+            .write(&mut buf, ArrayStreamAdapter::new(dtype, stream))
+            .await;
+        let Ingest { stats, err } = std::mem::take(&mut *lock(&state));
+        if let Some(e) = err {
+            return Err(e);
         }
         if stats.rows == 0 {
             return Err(StorageError::EmptySegment);
         }
-        let schema = spans_schema();
-        let dtype = self.session.arrow().from_arrow_schema(&schema)?;
-        let s2 = self.session.clone();
-        let sch2 = schema.clone();
-        let stream = futures::stream::iter(batches)
-            .map(move |b| -> VortexResult<ArrayRef> { s2.arrow().from_arrow_record_batch(b, &sch2) });
-        let mut buf: Vec<u8> = Vec::new();
-        self.session
-            .write_options()
-            .write(&mut buf, ArrayStreamAdapter::new(dtype, stream))
-            .await?;
+        written?;
         let path = paths::segment_path(&spec.project_id, spec.level, spec.partition_hour, spec.id);
         let byte_size = u64::try_from(buf.len()).unwrap_or(u64::MAX);
         self.store

@@ -30,7 +30,9 @@ fn apply(c: &mut Connection, migrations: &[(u32, &str, &str)]) -> MetaResult<u32
     )?;
     let latest = migrations.last().map_or(0, |m| m.0);
     let too_new = |db: u32| MetaError::SchemaTooNew { db, binary: latest };
-    for &(version, name, sql) in migrations {
+    // Fast path: an up-to-date database takes no write lock (re-checked inside each txn when applying).
+    let pending = if current_version(c)? < latest { migrations } else { &[] };
+    for &(version, name, sql) in pending {
         let failed = |e: rusqlite::Error| MetaError::Migration {
             version,
             msg: e.to_string(),

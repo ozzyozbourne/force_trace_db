@@ -22,15 +22,21 @@ macro_rules! byte_id {
             pub fn is_zero(&self) -> bool {
                 self.0 == [0u8; $n]
             }
+            /// Lowercase hex into a stack buffer (no allocation).
+            fn with_hex<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+                let mut buf = [0u8; 2 * $n];
+                hex::encode_to_slice(self.0, &mut buf).expect("buffer is 2x the id");
+                f(std::str::from_utf8(&buf).expect("hex is ascii"))
+            }
         }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&hex::encode(self.0))
+                self.with_hex(|h| f.write_str(h))
             }
         }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, concat!(stringify!($name), "({})"), hex::encode(self.0))
+                self.with_hex(|h| write!(f, concat!(stringify!($name), "({})"), h))
             }
         }
         impl FromStr for $name {
@@ -43,7 +49,7 @@ macro_rules! byte_id {
         }
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-                s.serialize_str(&hex::encode(self.0))
+                self.with_hex(|h| s.serialize_str(h))
             }
         }
         impl<'de> serde::Deserialize<'de> for $name {

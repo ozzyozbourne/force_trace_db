@@ -1,5 +1,8 @@
 use crate::ids::SpanId;
+use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Utc};
+use std::fmt::Write;
+use std::sync::LazyLock;
 
 /// Length of one segment: 22-char timestamp + 16 hex chars.
 pub const SEGMENT_LEN: usize = 22 + 16;
@@ -7,20 +10,31 @@ pub const SEGMENT_LEN: usize = 22 + 16;
 /// One path element, LangSmith-compatible timestamp prefix: `%Y%m%dT%H%M%S%6fZ` + span_id hex.
 /// e.g. `20261022T100000040000Zb7ad6b7169203331`. Sorts as (start µs, span_id).
 pub fn dotted_segment(start_time_ns: i64, span_id: SpanId) -> String {
-    let ts = DateTime::<Utc>::from_timestamp_nanos(start_time_ns);
-    format!("{}{}", ts.format("%Y%m%dT%H%M%S%6fZ"), span_id)
+    let mut out = String::with_capacity(SEGMENT_LEN);
+    push_segment(&mut out, start_time_ns, span_id);
+    out
 }
 /// Child = parent + "." + segment; root = segment.
 pub fn dotted_order(parent: Option<&str>, start_time_ns: i64, span_id: SpanId) -> String {
-    let seg = dotted_segment(start_time_ns, span_id);
-    match parent {
-        Some(p) => format!("{p}.{seg}"),
-        None => seg,
+    let mut out = String::with_capacity(parent.map_or(0, |p| p.len() + 1) + SEGMENT_LEN);
+    if let Some(p) = parent {
+        out.push_str(p);
+        out.push('.');
     }
+    push_segment(&mut out, start_time_ns, span_id);
+    out
+}
+
+/// The timestamp pattern, parsed once.
+static TS_ITEMS: LazyLock<Vec<Item<'static>>> = LazyLock::new(|| StrftimeItems::new("%Y%m%dT%H%M%S%6fZ").collect());
+
+fn push_segment(out: &mut String, start_time_ns: i64, span_id: SpanId) {
+    let ts = DateTime::<Utc>::from_timestamp_nanos(start_time_ns);
+    write!(out, "{}{span_id}", ts.format_with_items(TS_ITEMS.iter())).expect("writing to a String");
 }
 /// Number of ancestors + 1. Works for LangSmith (UUID) and Forge (hex16) segments alike.
 pub fn depth(dotted: &str) -> usize {
-    dotted.split('.').count()
+    dotted.bytes().filter(|&b| b == b'.').count() + 1
 }
 
 #[cfg(test)]

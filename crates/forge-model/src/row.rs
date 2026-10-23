@@ -1,10 +1,10 @@
 use crate::enums::{RunType, SpanStatus};
 use crate::error::{ModelError, Result};
 use crate::ids::{ProjectId, SpanId, TraceId};
-use crate::schema::{TIMEZONE, col, spans_schema, tags_item_field};
+use crate::schema::{TIMEZONE, col, col_idx, spans_schema, tags_item_field};
 use arrow::array::*;
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// One upsert of one span, as produced by normalization. `None` = "this upsert does not set the
 /// field" (latest non-null wins). JSON columns hold already-serialized JSON text.
@@ -98,7 +98,8 @@ impl SpanBatchBuilder {
             total_tokens: Int64Builder::with_capacity(rows),
             cost_usd: Float64Builder::with_capacity(rows),
             session_id: s(),
-            tags: ListBuilder::new(StringBuilder::new()).with_field(tags_item_field()),
+            tags: ListBuilder::with_capacity(StringBuilder::with_capacity(rows, rows * 8), rows)
+                .with_field(tags_item_field()),
             metadata: s(),
             attributes: s(),
             events: s(),
@@ -195,16 +196,26 @@ impl SpanBatchBuilder {
 
 /// Checks schema equality and id byte lengths. Call on WAL replay, before segment write, and in tests.
 pub fn validate_batch(b: &RecordBatch) -> Result<()> {
-    if b.schema() != spans_schema() {
-        return Err(ModelError::Schema(format!("schema mismatch: {:?}", b.schema())));
+    let schema = b.schema();
+    if !Arc::ptr_eq(&schema, &spans_schema()) && schema != spans_schema() {
+        return Err(ModelError::Schema(format!("schema mismatch: {schema:?}")));
     }
-    for (name, len) in [
-        (col::TRACE_ID, TraceId::LEN),
-        (col::SPAN_ID, SpanId::LEN),
-        (col::PARENT_SPAN_ID, SpanId::LEN),
-    ] {
-        let a = b.column_by_name(name).unwrap().as_binary::<i32>();
-        if a.iter().flatten().any(|v| v.len() != len) {
+    static ID_COLS: LazyLock<[(&str, usize, usize); 3]> = LazyLock::new(|| {
+        [
+            (col::TRACE_ID, TraceId::LEN),
+            (col::SPAN_ID, SpanId::LEN),
+            (col::PARENT_SPAN_ID, SpanId::LEN),
+        ]
+        .map(|(name, len)| (name, col_idx(name), len))
+    });
+    for &(name, idx, len) in ID_COLS.iter() {
+        let a = b.column(idx).as_binary::<i32>();
+        let bad = a
+            .value_offsets()
+            .windows(2)
+            .enumerate()
+            .any(|(i, w)| w[1] - w[0] != len as i32 && a.is_valid(i));
+        if bad {
             return Err(ModelError::Schema(format!("{name} must be {len} bytes")));
         }
     }

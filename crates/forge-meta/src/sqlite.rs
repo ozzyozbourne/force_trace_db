@@ -9,7 +9,7 @@ use forge_model::ids::{ProjectId, TraceId};
 use forge_model::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "busy_timeout", 5000)?;
@@ -42,6 +42,44 @@ pub struct SqliteMetastore {
 }
 
 const PROJECT_COLS: &str = "id, name, api_key_hash, retention_days, created_at_ms";
+// SQL is built once; every statement goes through prepare_cached.
+static INSERT_PROJECT: LazyLock<String> =
+    LazyLock::new(|| format!("INSERT INTO projects ({PROJECT_COLS}) VALUES (?1,?2,?3,?4,?5)"));
+static INSERT_PROJECT_IF_ABSENT: LazyLock<String> =
+    LazyLock::new(|| format!("{} ON CONFLICT(id) DO NOTHING", *INSERT_PROJECT));
+static GET_PROJECT: LazyLock<String> = LazyLock::new(|| format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"));
+static LIST_PROJECTS: LazyLock<String> = LazyLock::new(|| format!("SELECT {PROJECT_COLS} FROM projects ORDER BY id"));
+static INSERT_SEGMENT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT INTO segments ({SEGMENT_COLS}) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"
+    )
+});
+static GET_SEGMENT: LazyLock<String> = LazyLock::new(|| format!("SELECT {SEGMENT_COLS} FROM segments WHERE id = ?1"));
+static LIST_SEGMENTS_BY_ID: LazyLock<String> = LazyLock::new(|| list_segments_sql("id"));
+static LIST_SEGMENTS_NEWEST: LazyLock<String> =
+    LazyLock::new(|| list_segments_sql("max_start_ns DESC NULLS FIRST, id DESC"));
+static LOCATE_TRACE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SEGMENT_COLS}, ti_start, ti_count FROM segments JOIN \
+         (SELECT segment_id, row_start AS ti_start, row_count AS ti_count FROM trace_index \
+          WHERE project_id = ?1 AND trace_id = ?2) ON id = segment_id \
+         WHERE state <> 'deleted' ORDER BY id"
+    )
+});
+const INSERT_TRACE: &str =
+    "INSERT INTO trace_index (project_id, trace_id, segment_id, row_start, row_count) VALUES (?1,?2,?3,?4,?5)";
+const UPSERT_CHECKPOINT: &str = "INSERT INTO wal_checkpoints (node_id, flushed_seq, max_version, updated_at_ms) \
+     VALUES (?1, ?2, ?3, ?4) ON CONFLICT(node_id) DO UPDATE SET flushed_seq = MAX(flushed_seq, excluded.flushed_seq), \
+     max_version = MAX(max_version, excluded.max_version), updated_at_ms = excluded.updated_at_ms";
+
+fn list_segments_sql(order: &str) -> String {
+    format!(
+        "SELECT {SEGMENT_COLS} FROM segments \
+         WHERE (?1 IS NULL OR project_id = ?1) AND (state <> 'deleted' OR ?2) ORDER BY {order}"
+    )
+}
+
 const SEGMENT_COLS: &str = "id, project_id, level, partition_hour, path, row_count, byte_size, fts_byte_size, \
     min_start_ns, max_start_ns, start_time_nulls, min_trace_id, max_trace_id, min_version, max_version, \
     schema_version, created_at_ms, state, deleted_at_ms";
@@ -79,13 +117,27 @@ fn to_i64(v: u64) -> MetaResult<i64> {
     i64::try_from(v).map_err(|_| MetaError::Conflict(format!("value {v} exceeds i64")))
 }
 
+/// Borrows column `i` as text or blob (no allocation); a wrong type gives the same error as `Row::get`.
+fn text<'r>(r: &'r Row<'_>, i: usize) -> MetaResult<&'r str> {
+    let v = r.get_ref(i)?;
+    v.as_str().map_err(|_| type_err(r, i, v))
+}
+fn blob<'r>(r: &'r Row<'_>, i: usize) -> MetaResult<&'r [u8]> {
+    let v = r.get_ref(i)?;
+    v.as_blob().map_err(|_| type_err(r, i, v))
+}
+fn type_err(r: &Row<'_>, i: usize, v: rusqlite::types::ValueRef<'_>) -> MetaError {
+    let name = r.as_ref().column_name(i).map_or_else(|_| String::new(), str::to_string);
+    rusqlite::Error::InvalidColumnType(i, name, v.data_type()).into()
+}
+
 fn segment_from_row(r: &Row<'_>) -> MetaResult<SegmentMeta> {
-    let id: String = r.get(0)?;
-    let project: String = r.get(1)?;
+    let id = text(r, 0)?;
+    let project = text(r, 1)?;
     let level: u8 = r.get(2)?;
-    let min_tid: Vec<u8> = r.get(11)?;
-    let max_tid: Vec<u8> = r.get(12)?;
-    let state: String = r.get(17)?;
+    let min_tid = blob(r, 11)?;
+    let max_tid = blob(r, 12)?;
+    let state = text(r, 17)?;
     let bad = |m: String| corrupt("segments", m);
     let num = |i: usize| to_u64("segments", r.get(i)?);
     Ok(SegmentMeta {
@@ -100,21 +152,20 @@ fn segment_from_row(r: &Row<'_>) -> MetaResult<SegmentMeta> {
         min_start_ns: r.get(8)?,
         max_start_ns: r.get(9)?,
         start_time_nulls: num(10)?,
-        min_trace_id: TraceId::from_slice(&min_tid).map_err(|e| bad(e.to_string()))?,
-        max_trace_id: TraceId::from_slice(&max_tid).map_err(|e| bad(e.to_string()))?,
+        min_trace_id: TraceId::from_slice(min_tid).map_err(|e| bad(e.to_string()))?,
+        max_trace_id: TraceId::from_slice(max_tid).map_err(|e| bad(e.to_string()))?,
         min_version: num(13)?,
         max_version: num(14)?,
         schema_version: r.get(15)?,
         created_at_ms: r.get(16)?,
-        state: SegmentState::parse(&state).ok_or_else(|| bad(format!("state {state}")))?,
+        state: SegmentState::parse(state).ok_or_else(|| bad(format!("state {state}")))?,
         deleted_at_ms: r.get(18)?,
     })
 }
 
 fn project_from_row(r: &Row<'_>) -> MetaResult<Project> {
-    let id: String = r.get(0)?;
     Ok(Project {
-        id: ProjectId::new(id).map_err(|e| corrupt("projects", e))?,
+        id: ProjectId::new(text(r, 0)?).map_err(|e| corrupt("projects", e))?,
         name: r.get(1)?,
         api_key_hash: r.get(2)?,
         retention_days: r.get(3)?,
@@ -126,44 +177,37 @@ fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<
     let m = &s.meta;
     let id = m.id.to_string();
     let p = Project::new(m.project_id.clone(), None, None, now)?;
-    tx.prepare_cached(&format!(
-        "INSERT INTO projects ({PROJECT_COLS}) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING"
-    ))?
-    .execute(params![
+    tx.prepare_cached(&INSERT_PROJECT_IF_ABSENT)?.execute(params![
         p.id.as_str(),
         p.name,
         p.api_key_hash,
         p.retention_days,
         p.created_at_ms
     ])?;
-    tx.prepare_cached(&format!(
-        "INSERT INTO segments ({SEGMENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"
-    ))?
-    .execute(params![
-        id,
-        m.project_id.as_str(),
-        m.level.as_u8(),
-        m.partition_hour.0,
-        m.path,
-        to_i64(m.row_count)?,
-        to_i64(m.byte_size)?,
-        m.fts_byte_size.map(to_i64).transpose()?,
-        m.min_start_ns,
-        m.max_start_ns,
-        to_i64(m.start_time_nulls)?,
-        m.min_trace_id.as_bytes(),
-        m.max_trace_id.as_bytes(),
-        to_i64(m.min_version)?,
-        to_i64(m.max_version)?,
-        m.schema_version,
-        m.created_at_ms,
-        SegmentState::Live.as_str(),
-        Option::<i64>::None,
-    ])
-    .map_err(|e| map_err(e, &format!("segment {id} ({})", m.path)))?;
-    let mut st = tx.prepare_cached(
-        "INSERT INTO trace_index (project_id, trace_id, segment_id, row_start, row_count) VALUES (?1,?2,?3,?4,?5)",
-    )?;
+    tx.prepare_cached(&INSERT_SEGMENT)?
+        .execute(params![
+            id,
+            m.project_id.as_str(),
+            m.level.as_u8(),
+            m.partition_hour.0,
+            m.path,
+            to_i64(m.row_count)?,
+            to_i64(m.byte_size)?,
+            m.fts_byte_size.map(to_i64).transpose()?,
+            m.min_start_ns,
+            m.max_start_ns,
+            to_i64(m.start_time_nulls)?,
+            m.min_trace_id.as_bytes(),
+            m.max_trace_id.as_bytes(),
+            to_i64(m.min_version)?,
+            to_i64(m.max_version)?,
+            m.schema_version,
+            m.created_at_ms,
+            SegmentState::Live.as_str(),
+            Option::<i64>::None,
+        ])
+        .map_err(|e| map_err(e, &format!("segment {id} ({})", m.path)))?;
+    let mut st = tx.prepare_cached(INSERT_TRACE)?;
     for t in &s.traces {
         st.execute(params![
             m.project_id.as_str(),
@@ -240,11 +284,15 @@ impl Metastore for SqliteMetastore {
 
     async fn create_project(&self, p: Project) -> MetaResult<()> {
         self.write(move |tx| {
-            tx.execute(
-                &format!("INSERT INTO projects ({PROJECT_COLS}) VALUES (?1,?2,?3,?4,?5)"),
-                params![p.id.as_str(), p.name, p.api_key_hash, p.retention_days, p.created_at_ms],
-            )
-            .map_err(|e| map_err(e, &format!("project {}", p.id)))?;
+            tx.prepare_cached(&INSERT_PROJECT)?
+                .execute(params![
+                    p.id.as_str(),
+                    p.name,
+                    p.api_key_hash,
+                    p.retention_days,
+                    p.created_at_ms
+                ])
+                .map_err(|e| map_err(e, &format!("project {}", p.id)))?;
             Ok(())
         })
         .await
@@ -253,20 +301,17 @@ impl Metastore for SqliteMetastore {
     async fn get_project(&self, id: &ProjectId) -> MetaResult<Option<Project>> {
         let id = id.clone();
         self.read(move |c| {
-            c.query_row(
-                &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
-                [id.as_str()],
-                |r| Ok(project_from_row(r)),
-            )
-            .optional()?
-            .transpose()
+            c.prepare_cached(&GET_PROJECT)?
+                .query_row([id.as_str()], |r| Ok(project_from_row(r)))
+                .optional()?
+                .transpose()
         })
         .await
     }
 
     async fn list_projects(&self) -> MetaResult<Vec<Project>> {
         self.read(|c| {
-            let mut st = c.prepare_cached(&format!("SELECT {PROJECT_COLS} FROM projects ORDER BY id"))?;
+            let mut st = c.prepare_cached(&LIST_PROJECTS)?;
             let rows = st.query_map([], |r| Ok(project_from_row(r)))?;
             rows.map(|r| r?).collect()
         })
@@ -280,12 +325,8 @@ impl Metastore for SqliteMetastore {
             for s in &c.segments {
                 insert_segment(tx, s, now)?;
             }
-            tx.execute(
-                "INSERT INTO wal_checkpoints (node_id, flushed_seq, max_version, updated_at_ms) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(node_id) DO UPDATE SET flushed_seq = MAX(flushed_seq, excluded.flushed_seq), \
-                 max_version = MAX(max_version, excluded.max_version), updated_at_ms = excluded.updated_at_ms",
-                params![c.node_id, seq, max_version, now],
-            )?;
+            tx.prepare_cached(UPSERT_CHECKPOINT)?
+                .execute(params![c.node_id, seq, max_version, now])?;
             Ok(())
         })
         .await
@@ -295,11 +336,8 @@ impl Metastore for SqliteMetastore {
         let node = node_id.to_string();
         self.read(move |c| {
             let r: Option<(i64, i64)> = c
-                .query_row(
-                    "SELECT flushed_seq, max_version FROM wal_checkpoints WHERE node_id = ?1",
-                    [node],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .prepare_cached("SELECT flushed_seq, max_version FROM wal_checkpoints WHERE node_id = ?1")?
+                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
             r.map(|(s, v)| {
                 Ok(WalCheckpoint {
@@ -314,12 +352,12 @@ impl Metastore for SqliteMetastore {
 
     async fn max_version(&self) -> MetaResult<u64> {
         self.read(|c| {
-            let v: i64 = c.query_row(
-                "SELECT MAX(COALESCE((SELECT MAX(max_version) FROM segments), 0), \
-                            COALESCE((SELECT MAX(max_version) FROM wal_checkpoints), 0))",
-                [],
-                |r| r.get(0),
-            )?;
+            let v: i64 = c
+                .prepare_cached(
+                    "SELECT MAX(COALESCE((SELECT MAX(max_version) FROM segments), 0), \
+                                COALESCE((SELECT MAX(max_version) FROM wal_checkpoints), 0))",
+                )?
+                .query_row([], |r| r.get(0))?;
             to_u64("segments", v)
         })
         .await
@@ -327,13 +365,10 @@ impl Metastore for SqliteMetastore {
 
     async fn get_segment(&self, id: SegmentId) -> MetaResult<Option<SegmentMeta>> {
         self.read(move |c| {
-            c.query_row(
-                &format!("SELECT {SEGMENT_COLS} FROM segments WHERE id = ?1"),
-                [id.to_string()],
-                |r| Ok(segment_from_row(r)),
-            )
-            .optional()?
-            .transpose()
+            c.prepare_cached(&GET_SEGMENT)?
+                .query_row([id.to_string()], |r| Ok(segment_from_row(r)))
+                .optional()?
+                .transpose()
         })
         .await
     }
@@ -341,15 +376,12 @@ impl Metastore for SqliteMetastore {
     async fn list_segments(&self, f: &SegmentFilter) -> MetaResult<Vec<SegmentMeta>> {
         let f = f.clone();
         self.read(move |c| {
-            let order = if f.newest_first {
-                "max_start_ns DESC NULLS FIRST, id DESC"
+            let sql = if f.newest_first {
+                &LIST_SEGMENTS_NEWEST
             } else {
-                "id"
+                &LIST_SEGMENTS_BY_ID
             };
-            let mut st = c.prepare_cached(&format!(
-                "SELECT {SEGMENT_COLS} FROM segments \
-                 WHERE (?1 IS NULL OR project_id = ?1) AND (state <> 'deleted' OR ?2) ORDER BY {order}"
-            ))?;
+            let mut st = c.prepare_cached(sql)?;
             let rows = st.query_map(
                 params![f.project_id.as_ref().map(ProjectId::as_str), f.include_deleted],
                 |r| Ok(segment_from_row(r)),
@@ -372,12 +404,7 @@ impl Metastore for SqliteMetastore {
     async fn locate_trace(&self, project: &ProjectId, trace: TraceId) -> MetaResult<Vec<TraceLocation>> {
         let project = project.clone();
         self.read(move |c| {
-            let mut st = c.prepare_cached(&format!(
-                "SELECT {SEGMENT_COLS}, ti_start, ti_count FROM segments JOIN \
-                 (SELECT segment_id, row_start AS ti_start, row_count AS ti_count FROM trace_index \
-                  WHERE project_id = ?1 AND trace_id = ?2) ON id = segment_id \
-                 WHERE state <> 'deleted' ORDER BY id"
-            ))?;
+            let mut st = c.prepare_cached(&LOCATE_TRACE)?;
             let rows = st.query_map(params![project.as_str(), trace.as_bytes()], |r| {
                 Ok((
                     segment_from_row(r),
