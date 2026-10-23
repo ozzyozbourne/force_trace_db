@@ -111,6 +111,10 @@ pub struct LatencyStore {
     delay_us: std::sync::atomic::AtomicU64,
     /// Read requests so far.
     pub gets: std::sync::atomic::AtomicU64,
+    in_flight: std::sync::atomic::AtomicU64,
+    /// Read requests that started while none was in flight: a lower bound on sequential round trips (exact for
+    /// one query).
+    pub waves: std::sync::atomic::AtomicU64,
 }
 
 mod latency {
@@ -132,18 +136,27 @@ mod latency {
                 inner,
                 delay_us: 0.into(),
                 gets: 0.into(),
+                in_flight: 0.into(),
+                waves: 0.into(),
             }
         }
         pub fn set_delay(&self, d: Duration) {
             self.delay_us
                 .store(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
         }
-        async fn read(&self) {
+        /// `call` after the delay, counted as in flight from start to end.
+        async fn read<T>(&self, call: impl Future<Output = T>) -> T {
             self.gets.fetch_add(1, Ordering::Relaxed);
+            if self.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.waves.fetch_add(1, Ordering::SeqCst);
+            }
             let us = self.delay_us.load(Ordering::Relaxed);
             if us > 0 {
                 tokio::time::sleep(Duration::from_micros(us)).await;
             }
+            let r = call.await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            r
         }
     }
 
@@ -166,13 +179,11 @@ mod latency {
             self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.read().await;
-            self.inner.get_opts(location, options).await
+            self.read(self.inner.get_opts(location, options)).await
         }
         /// One wave: the default would re-enter `get_range` (and the delay) per coalesced range.
         async fn get_ranges(&self, location: &Path, ranges: &[std::ops::Range<u64>]) -> Result<Vec<bytes::Bytes>> {
-            self.read().await;
-            self.inner.get_ranges(location, ranges).await
+            self.read(self.inner.get_ranges(location, ranges)).await
         }
         fn delete_stream(&self, locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
             self.inner.delete_stream(locations)
