@@ -2,228 +2,13 @@
 
 mod common;
 
+use common::*;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use serde_json::json;
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy)]
-struct Ports {
-    ops: SocketAddr,
-    api: SocketAddr,
-    otlp_http: SocketAddr,
-    otlp_grpc: SocketAddr,
-}
-
-struct ServerProc {
-    child: Child,
-    logs: Arc<Mutex<Vec<String>>>,
-    /// Drains stderr; finishes at EOF, i.e. when the child exits.
-    reader: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ServerProc {
-    fn spawn(dir: &Path, cfg: Option<&Path>, env: &[(&str, &str)]) -> Self {
-        let mut cmd = common::forge_cmd();
-        cmd.arg("serve");
-        if let Some(cfg) = cfg {
-            cmd.arg("--config").arg(cfg);
-        }
-        cmd.current_dir(dir)
-            .env("FORGE_LOG_FORMAT", "json")
-            .env("RUST_LOG", "info");
-        cmd.envs(env.iter().copied());
-        let mut child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn forge");
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let (sink, stderr) = (logs.clone(), child.stderr.take().expect("piped stderr"));
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
-            }
-        });
-        Self {
-            child,
-            logs,
-            reader: Some(reader),
-        }
-    }
-
-    fn lines(&self) -> MutexGuard<'_, Vec<String>> {
-        self.logs.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn logs(&self) -> String {
-        self.lines().join("\n")
-    }
-
-    /// Calls `f` every 50 ms until it returns Some; panics with `what` and the server logs after `within`.
-    /// With `alive`, also panics as soon as the server exits.
-    async fn poll<T>(
-        &mut self,
-        within: Duration,
-        what: &str,
-        alive: bool,
-        mut f: impl AsyncFnMut(&mut Self) -> Option<T>,
-    ) -> T {
-        let start = Instant::now();
-        loop {
-            if let Some(v) = f(self).await {
-                return v;
-            }
-            if alive && let Some(status) = self.child.try_wait().expect("try_wait") {
-                panic!("forge exited early: {status}\n--- server stderr ---\n{}", self.logs());
-            }
-            assert!(start.elapsed() < within, "{what} within {within:?}\n{}", self.logs());
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// Bound addresses from the `listening` log events (all configured addrs are port 0).
-    async fn ports(&mut self) -> Ports {
-        // Lines already parsed are skipped on later polls.
-        let (mut found, mut seen) = (HashMap::new(), 0);
-        self.poll(
-            Duration::from_secs(30),
-            "no listening lines",
-            true,
-            async |s: &mut Self| {
-                let lines = s.lines();
-                for line in &lines[seen..] {
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                        continue;
-                    };
-                    let f = &v["fields"];
-                    if f["message"] == "listening"
-                        && let (Some(name), Some(addr)) = (f["name"].as_str(), f["addr"].as_str())
-                    {
-                        found.insert(name.to_string(), addr.parse::<SocketAddr>().expect("listening addr"));
-                    }
-                }
-                seen = lines.len();
-                drop(lines);
-                let get = |n: &str| found.get(n).copied();
-                Some(Ports {
-                    ops: get("ops")?,
-                    api: get("api")?,
-                    otlp_http: get("otlp-http")?,
-                    otlp_grpc: get("otlp-grpc")?,
-                })
-            },
-        )
-        .await
-    }
-
-    async fn wait_healthy(&mut self, ops: SocketAddr) {
-        let c = reqwest::Client::new();
-        let url = format!("http://{ops}/healthz");
-        let body = self
-            .poll(
-                Duration::from_secs(30),
-                "/healthz never 200",
-                true,
-                async |_: &mut Self| {
-                    let r = c.get(&url).send().await.ok().filter(|r| r.status() == 200)?;
-                    Some(r.text().await.expect("body"))
-                },
-            )
-            .await;
-        assert_eq!(body, "ok");
-    }
-
-    fn signal(&self, sig: &str) {
-        let st = Command::new("kill")
-            .args([&format!("-{sig}"), &self.child.id().to_string()])
-            .status()
-            .expect("run kill");
-        assert!(st.success(), "kill -{sig} failed: {st}");
-    }
-
-    fn sigterm(&self) {
-        self.signal("TERM");
-    }
-
-    async fn wait_exit(&mut self, within: Duration) -> ExitStatus {
-        let st = self
-            .poll(within, "forge did not exit", false, async |s: &mut Self| {
-                s.child.try_wait().expect("try_wait")
-            })
-            .await;
-        if let Some(r) = self.reader.take() {
-            tokio::task::spawn_blocking(move || r.join())
-                .await
-                .expect("join")
-                .expect("stderr reader");
-        }
-        st
-    }
-
-    async fn wait_for_log(&mut self, needle: &str, within: Duration) {
-        let what = format!("log {needle:?} not seen");
-        self.poll(within, &what, false, async |s: &mut Self| {
-            s.lines().iter().any(|l| l.contains(needle)).then_some(())
-        })
-        .await;
-    }
-}
-
-impl Drop for ServerProc {
-    fn drop(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-fn write_config(dir: &Path, grace: &str) -> PathBuf {
-    let d = dir.display();
-    let s = format!(
-        r#"[storage]
-url = "file://{d}/data"
-
-[metastore]
-url = "sqlite://{d}/meta.db"
-
-[wal]
-dir = "{d}/wal"
-
-[cache]
-disk_dir = "{d}/cache"
-
-[server]
-otlp_grpc_addr = "127.0.0.1:0"
-otlp_http_addr = "127.0.0.1:0"
-api_addr = "127.0.0.1:0"
-admin_addr = "127.0.0.1:0"
-shutdown_grace = "{grace}"
-"#
-    );
-    let path = dir.join("forge.toml");
-    std::fs::write(&path, s).expect("write config");
-    path
-}
-
-/// Spawns `forge serve` and waits until all listeners are up and /healthz answers.
-async fn spawn_ready(dir: &Path, cfg: Option<&Path>, env: &[(&str, &str)]) -> (ServerProc, Ports) {
-    let mut s = ServerProc::spawn(dir, cfg, env);
-    let p = s.ports().await;
-    s.wait_healthy(p.ops).await;
-    (s, p)
-}
-
-async fn start(dir: &Path, grace: &str) -> (ServerProc, Ports) {
-    spawn_ready(dir, Some(&write_config(dir, grace)), &[]).await
-}
+use std::time::Duration;
 
 async fn project_list(c: &reqwest::Client, api: SocketAddr) -> String {
     let r = c.get(format!("http://{api}/v1/projects")).send().await.expect("get");
@@ -342,7 +127,7 @@ async fn projects_persist_across_restart() {
 }
 
 #[tokio::test]
-async fn signal_during_startup_is_queued_and_drains() {
+async fn signal_during_startup_exits_0() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = write_config(tmp.path(), "2s");
     // Hold an exclusive lock on meta.db so startup blocks in the metastore open, after signal install.
@@ -353,12 +138,12 @@ async fn signal_during_startup_is_queued_and_drains() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!s.logs().contains("listening"), "startup was not blocked\n{}", s.logs());
     s.sigterm();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    drop(lock);
+    // Exits while startup is still blocked: the lock is held until after the exit.
     let st = s.wait_exit(Duration::from_secs(15)).await;
     let logs = s.logs();
     assert!(st.success(), "{st}\n{logs}");
-    assert!(logs.contains("shutdown signal received"), "{logs}");
+    assert!(logs.contains("shutdown signal received during startup"), "{logs}");
+    drop(lock);
 }
 
 #[tokio::test]

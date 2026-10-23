@@ -32,6 +32,9 @@ tempfile.workspace = true
 serde_json.workspace = true
 tonic.workspace = true
 opentelemetry-proto.workspace = true
+flate2.workspace = true
+hex.workspace = true
+arrow.workspace = true
 
 [[bin]]
 name = "forge"

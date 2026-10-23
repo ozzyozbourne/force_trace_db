@@ -1387,13 +1387,16 @@ name = "forge-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "clap",
+ "flate2",
  "forge-ingest",
  "forge-meta",
  "forge-model",
  "forge-server",
  "forge-storage",
  "futures",
+ "hex",
  "opentelemetry-proto",
  "prost",
  "reqwest",
