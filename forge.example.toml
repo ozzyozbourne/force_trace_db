@@ -28,6 +28,8 @@ concurrency = 2
 [query]
 memory_limit = "2GiB"
 timeout = "30s"
+sql_concurrency = 0          # concurrent /v1/sql queries; 0 = max(2, cpus / 2)
+max_response_bytes = "64MiB" # /v1/sql body cap (truncated: true past it)
 
 [ingest]
 default_project = "default"
