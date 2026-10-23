@@ -14,14 +14,15 @@ use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use forge_index::{Analyzer, FtsColumn, FtsPredicate, Matcher};
 use forge_meta::SegmentFilter;
+use forge_model::catalog::SegmentMeta;
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
 use forge_model::schema::{col, projected_schema};
 use forge_storage::RowSelection;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 
 /// What a list returns: never payload, never dotted_order (== `trace_columns(false)`).
 pub const RUN_COLUMNS: [&str; 21] = [
@@ -67,7 +68,7 @@ pub struct RunsRequest {
     /// Empty = any.
     pub run_types: BTreeSet<RunType>,
     pub statuses: BTreeSet<SpanStatus>,
-    /// Lowercased case-insensitive substring of `name` (FTS in M4).
+    /// `search(name, q)` (M4: the FTS query syntax and analyzer, on the merged name).
     pub q: Option<String>,
     /// 1..=1000.
     pub limit: usize,
@@ -87,11 +88,11 @@ pub struct RunsParams {
     pub cursor: Option<String>,
 }
 
-fn bad(msg: impl Into<String>) -> QueryError {
+pub(crate) fn bad(msg: impl Into<String>) -> QueryError {
     QueryError::InvalidInput(msg.into())
 }
 
-fn parse_list<T: Ord + std::str::FromStr<Err = forge_model::error::ModelError>>(
+pub(crate) fn parse_list<T: Ord + std::str::FromStr<Err = forge_model::error::ModelError>>(
     s: Option<&str>,
 ) -> Result<BTreeSet<T>, QueryError> {
     s.into_iter()
@@ -101,7 +102,7 @@ fn parse_list<T: Ord + std::str::FromStr<Err = forge_model::error::ModelError>>(
         .collect()
 }
 
-fn parse_time(what: &str, s: Option<&str>) -> Result<Option<i64>, QueryError> {
+pub(crate) fn parse_time(what: &str, s: Option<&str>) -> Result<Option<i64>, QueryError> {
     s.map(|s| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -118,7 +119,8 @@ impl RunsRequest {
         if !(1..=MAX_LIMIT).contains(&limit) {
             return Err(bad(format!("limit must be 1..={MAX_LIMIT}, got {limit}")));
         }
-        let q = p.q.filter(|q| !q.is_empty()).map(|q| q.to_lowercase());
+        // Not lowercased: the analyzer folds case, and `OR` is an operator.
+        let q = p.q.filter(|q| !q.trim().is_empty());
         if q.as_ref().is_some_and(|q| q.len() > MAX_Q) {
             return Err(bad(format!("q is longer than {MAX_Q} bytes")));
         }
@@ -195,7 +197,7 @@ const CANDIDATE_COLUMNS: [&str; 5] = [
 ];
 /// Verify reads a segment's located ranges as one scan when they are at most this many rows apart (the rows in
 /// between are dropped by the key mask).
-const VERIFY_GAP: u64 = 4096;
+pub(crate) const VERIFY_GAP: u64 = 4096;
 /// Up to this many distinct wave span ids are pushed into the verify scans as a key filter.
 const MAX_FILTER_SPANS: usize = 256;
 
@@ -225,11 +227,6 @@ impl<'a> Ids<'a> {
         );
         self.start.is_valid(i).then(|| (self.start.value(i), ids.0, ids.1))
     }
-}
-
-/// The smallest `Reverse` position with start <= `start` (candidates are kept newest first).
-fn at_or_below(start: i64) -> Reverse<Pos> {
-    Reverse((start, TraceId([0xff; 16]), SpanId([0xff; 8])))
 }
 
 /// `parent_span_id IS NULL`: a first cut for candidate scans (candidates() re-checks every row).
@@ -272,7 +269,7 @@ impl QueryEngine {
                 let held = res.size();
                 res.try_grow(page.rows.get_array_memory_size())?;
                 let mut out = Vec::with_capacity(page.rows.get_array_memory_size());
-                crate::json::write_runs(&mut out, &page.rows, cursor.as_deref(), cancel)?;
+                crate::json::write_runs(&mut out, "runs", &page.rows, cursor.as_deref(), cancel)?;
                 res.try_resize(held + out.capacity())?;
                 Ok(out)
             })
@@ -287,16 +284,9 @@ impl QueryEngine {
         q: &QueryCtx,
         r: &RunsRequest,
     ) -> Result<(RunsPage, MemoryReservation), QueryError> {
-        let k = r.limit.max(1);
-        let mut res = MemoryConsumer::new("runs").register(&q.pool);
         let view = self.read_view(); // FIRST (invariant 1)
         let cols = read_columns(&RUN_COLUMNS);
-        let schema = projected_schema(&cols);
-        // Exclusive upper bound on start: the window end and, via the cursor, start <= cursor.start.
-        let hi = match r.cursor.and_then(|Cursor(c)| c.0.checked_add(1)) {
-            Some(c) => Some(r.end_ns.map_or(c, |e| e.min(c))),
-            None => r.end_ns,
-        };
+        let hi = upper_bound(r.end_ns, r.cursor);
         let filter = SegmentFilter {
             project_id: Some(r.project.clone()),
             start_ns: r.start_ns,
@@ -304,164 +294,311 @@ impl QueryEngine {
             newest_first: true,
             ..Default::default()
         };
-        // All-null-start segments hold no candidates (their rows are still read by verify via locate_traces).
-        let segs: Vec<_> = view
-            .list_segments(&filter)
-            .await?
-            .into_iter()
-            .filter(|s| s.max_start_ns.is_some())
-            .collect();
-        let mut cand: BTreeSet<Reverse<Pos>> = BTreeSet::new();
-        let (snap, rr) = (view.mem().clone(), r.clone());
-        let mem = q
-            .blocking("runs.mem", move |cancel| {
-                let k = KeyFilters::project(&rr.project, None);
-                let mut v = Vec::new();
-                for b in mem_versions(&snap, &k, &projected_schema(&CANDIDATE_COLUMNS), cancel)? {
-                    v.extend(candidates(&rr, hi, &b)?);
-                }
-                Ok(v)
-            })
-            .await?;
-        cand.extend(mem.into_iter().map(Reverse));
-        // Candidates from `unchecked` on (in `cand`'s order) are not verified yet; None: all are. Segments are
-        // read in descending max_start, so every verified candidate starts above every unverified one.
-        let mut unchecked = Some(Bound::Unbounded);
-        // The verified rows of every wave. Only the last wave can take `verified` past K (the loop stops at the
-        // first wave that reaches K), so they stay bounded by K + one wave.
-        let mut merged: Vec<RecordBatch> = Vec::new();
-        let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
-        let mut i = 0;
-        loop {
-            let frontier = segs.get(i).and_then(|s| s.max_start_ns);
-            let upper = frontier.map(at_or_below);
-            if let Some(lo) = unchecked.take() {
-                let end = upper.map_or(Bound::Unbounded, Bound::Excluded);
-                let wave: Vec<Pos> = cand.range((lo, end)).map(|p| p.0).collect();
-                if !wave.is_empty() {
-                    let (b, r2) = self.verify(q, &view, r, hi, &cols, &wave, res).await?;
-                    res = r2;
-                    let ids = Ids::of(&b)?;
-                    for row in 0..b.num_rows() {
-                        let p = ids.pos(row).expect("verified rows have a start");
-                        verified.insert(Reverse(p), (merged.len(), row));
-                    }
-                    merged.push(b);
-                }
-            }
-            unchecked = upper.map(Bound::Included);
-            let kth = verified.keys().nth(k - 1).map(|p| p.0);
-            if kth.is_some_and(|p| frontier.is_none_or(|f| p.0 > f)) {
-                break;
-            }
-            let Some(f) = frontier else { break };
-            // Read segs[i] and every following segment with the same max_start (ties together).
-            let mut parts = Vec::new();
-            while segs.get(i).is_some_and(|s| s.max_start_ns == Some(f)) {
-                parts.push(SegmentPart {
-                    seg: segs[i].clone(),
-                    rows: RowSelection::All,
-                });
-                i += 1;
-            }
-            let batches = view.scan(&parts, &CANDIDATE_COLUMNS, Some(roots_filter())).await?;
-            let rr = r.clone();
-            let found = q
-                .blocking("runs.candidates", move |cancel| {
-                    let mut v = Vec::new();
-                    for b in &batches {
-                        cancel.check()?;
-                        v.extend(candidates(&rr, hi, b)?);
-                    }
-                    Ok(v)
-                })
-                .await?;
-            cand.extend(found.into_iter().map(Reverse));
-        }
-        let unverified = unchecked.is_some_and(|lo| cand.range((lo, Bound::Unbounded)).next().is_some());
-        let more = verified.len() > k || i < segs.len() || unverified;
-        let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
-        let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
-        let rows = if idx.is_empty() {
-            RecordBatch::new_empty(schema)
-        } else {
-            interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?
-        };
-        res.resize(rows.get_array_memory_size());
-        Ok((RunsPage { rows, next_cursor }, res))
+        let segs = view.list_segments(&filter).await?;
+        let src = RootScan { r, hi, cols: &cols };
+        page(q, &view, &src, segs, r.limit, &projected_schema(&cols)).await
     }
+}
 
-    /// Every version of the wave's keys (all `locate_traces` locations, range-scanned, + the memtable), merged;
-    /// the merged rows that pass EVERY filter. `res` (holding the rows kept so far) grows by the wave's input and
-    /// merged rows and ends at what was kept plus the returned rows.
-    #[allow(clippy::too_many_arguments)]
+/// Exclusive upper bound on start: the window end and, via the cursor, start <= cursor.start.
+pub(crate) fn upper_bound(end_ns: Option<i64>, cursor: Option<Cursor>) -> Option<i64> {
+    match cursor.and_then(|Cursor(c)| c.0.checked_add(1)) {
+        Some(c) => Some(end_ns.map_or(c, |e| e.min(c))),
+        None => end_ns,
+    }
+}
+
+/// Where candidate positions come from (runs: root-looking rows; search: index hits).
+#[async_trait::async_trait]
+pub(crate) trait CandidateSource: Send + Sync {
+    /// Upper bound on the merged start_time of every row this segment can contribute (None: none).
+    fn frontier(&self, s: &SegmentMeta) -> Option<i64>;
+    /// Optional lookahead for the next segments in frontier order (search: index lookups, D9).
+    async fn prefetch(&self, _q: &QueryCtx, _view: &ReadView, _next: &[SegmentMeta]) -> Result<(), QueryError> {
+        Ok(())
+    }
+    /// Positions in the memtable snapshot (called once).
+    async fn mem(&self, q: &QueryCtx, view: &ReadView) -> Result<Vec<Candidate>, QueryError>;
+    /// Positions in `parts` (up to READ_GROUP segments, read concurrently).
+    async fn segments(
+        &self,
+        q: &QueryCtx,
+        view: &ReadView,
+        parts: &[SegmentPart],
+    ) -> Result<Vec<Candidate>, QueryError>;
+    /// The merged rows of `wave` that pass every filter.
     async fn verify(
         &self,
         q: &QueryCtx,
         view: &ReadView,
-        r: &RunsRequest,
-        hi: Option<i64>,
-        cols: &[&'static str],
-        wave: &[Pos],
+        wave: &[Candidate],
         res: MemoryReservation,
-    ) -> Result<(RecordBatch, MemoryReservation), QueryError> {
-        let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
-        let filter = span_filter(&keys.iter().map(|k| k.1).collect());
-        let k = KeyFilters {
-            traces: Some(keys.iter().map(|k| k.0).collect()),
-            spans: Some(keys),
-            ..KeyFilters::project(&r.project, None)
-        };
-        let parts = coalesce(view.locate_versions(&k).await?, VERIFY_GAP);
-        let scanned = view.scan(&parts, cols, filter).await?;
-        let schema: SchemaRef = projected_schema(cols);
-        let (snap, r) = (view.mem().clone(), r.clone());
-        q.blocking("runs.verify", move |cancel| {
-            let mut batches = Vec::new();
-            for b in scanned {
-                batches.push(match k.key_mask(&b)? {
-                    Some(m) => filter_record_batch(&b, &m)?,
-                    None => b,
-                });
-            }
-            let mem = mem_versions(&snap, &k, &schema, cancel)?;
-            let merge = needs_merge(&parts, !mem.is_empty());
-            batches.extend(mem);
-            let kept = res.size();
-            res.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
-            let m = merge_or_filter(&schema, &batches, merge, cancel)?;
-            res.try_grow(m.get_array_memory_size())?;
-            drop(batches);
-            res.resize(kept + m.get_array_memory_size());
-            let s = m.schema_ref();
-            let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
-            let project = m.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
-            let rt = m.column(s.index_of(col::RUN_TYPE)?).as_string::<i32>();
-            let st = m.column(s.index_of(col::STATUS)?).as_string::<i32>();
-            let name = m.column(s.index_of(col::NAME)?).as_string::<i32>();
-            let ids = Ids::of(&m)?;
-            let mask: BooleanArray = (0..m.num_rows())
-                .map(|i| {
-                    Some(
-                        par.is_null(i)
-                            && project.value(i) == r.project.as_str()
-                            && ids.pos(i).is_some_and(|p| in_window(&r, hi, &p))
-                            && in_set(&r.run_types, rt, i)
-                            && in_set(&r.statuses, st, i)
-                            && r.q
-                                .as_ref()
-                                .is_none_or(|q| name.is_valid(i) && name.value(i).to_lowercase().contains(q.as_str())),
-                    )
-                })
+    ) -> Result<(RecordBatch, MemoryReservation), QueryError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Candidate {
+    At(Pos),
+    /// A hit row with a null start (a patch): verified with the current wave (search only).
+    Unpositioned(TraceId, SpanId),
+}
+
+impl Candidate {
+    pub(crate) fn key(&self) -> (TraceId, SpanId) {
+        match *self {
+            Candidate::At((_, t, s)) | Candidate::Unpositioned(t, s) => (t, s),
+        }
+    }
+}
+
+pub(crate) const READ_GROUP: usize = 8; // D8
+pub(crate) const PREFETCH: usize = 64; // D9
+const MIN_CHUNK: usize = 256;
+
+/// The shared early-stop loop (D8): the newest `k` verified rows of `src` over `segs`, as a page.
+pub(crate) async fn page(
+    q: &QueryCtx,
+    view: &ReadView,
+    src: &dyn CandidateSource,
+    mut segs: Vec<SegmentMeta>,
+    k: usize,
+    schema: &SchemaRef,
+) -> Result<(RunsPage, MemoryReservation), QueryError> {
+    let k = k.max(1);
+    segs.retain(|s| src.frontier(s).is_some());
+    segs.sort_by_key(|s| Reverse((src.frontier(s), s.id)));
+    let mut res = MemoryConsumer::new("page").register(&q.pool);
+    let mut cand: BTreeSet<Reverse<Pos>> = BTreeSet::new();
+    let mut pending: Vec<Candidate> = Vec::new();
+    let push = |cand: &mut BTreeSet<Reverse<Pos>>, pending: &mut Vec<Candidate>, c: Candidate| match c {
+        Candidate::At(p) => {
+            cand.insert(Reverse(p));
+        }
+        u @ Candidate::Unpositioned(..) => pending.push(u),
+    };
+    for c in src.mem(q, view).await? {
+        push(&mut cand, &mut pending, c);
+    }
+    let mut merged: Vec<RecordBatch> = Vec::new();
+    let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
+    let mut seen: BTreeSet<(TraceId, SpanId)> = BTreeSet::new();
+    let chunk = MIN_CHUNK.max(2 * k);
+    let mut i = 0;
+    loop {
+        let frontier = segs.get(i).and_then(|s| src.frontier(s));
+        let above = |p: &Pos| frontier.is_none_or(|f| p.0 > f);
+        // Done when the K-th verified row is above the frontier AND no unverified candidate is newer than it: a row
+        // verified from an Unpositioned candidate can land below positioned candidates not yet verified.
+        // and no Unpositioned candidate is pending (its merged position is unknown until verified).
+        let kth_above =
+            |v: &BTreeMap<Reverse<Pos>, (usize, usize)>, cand: &BTreeSet<Reverse<Pos>>, pending: &[Candidate]| {
+                pending.is_empty()
+                    && v.keys()
+                        .nth(k - 1)
+                        .is_some_and(|p| above(&p.0) && cand.first().is_none_or(|c| c.0 < p.0))
+            };
+        // Newest-first chunks above the frontier (+ every unpositioned candidate) until K are verified.
+        while !kth_above(&verified, &cand, &pending) {
+            let wave: Vec<Candidate> = cand
+                .iter()
+                .take_while(|p| above(&p.0))
+                .take(chunk)
+                .map(|p| Candidate::At(p.0))
+                .chain(pending.drain(..))
                 .collect();
-            let out = filter_record_batch(&m, &mask)?;
-            res.try_grow(out.get_array_memory_size())?;
-            drop(m);
-            res.resize(kept + out.get_array_memory_size());
-            Ok((out, res))
+            if wave.is_empty() {
+                break;
+            }
+            for c in &wave {
+                if let Candidate::At(p) = c {
+                    cand.remove(&Reverse(*p));
+                }
+                seen.insert(c.key());
+            }
+            let (b, r2) = src.verify(q, view, &wave, res).await?;
+            res = r2;
+            let ids = Ids::of(&b)?;
+            for row in 0..b.num_rows() {
+                let p = ids.pos(row).expect("verified rows have a start");
+                verified.insert(Reverse(p), (merged.len(), row));
+            }
+            merged.push(b);
+        }
+        if kth_above(&verified, &cand, &pending) || frontier.is_none() {
+            break;
+        }
+        src.prefetch(q, view, &segs[i..(i + PREFETCH).min(segs.len())]).await?;
+        let end = (i + READ_GROUP).min(segs.len());
+        let parts: Vec<SegmentPart> = segs[i..end]
+            .iter()
+            .map(|s| SegmentPart {
+                seg: s.clone(),
+                rows: RowSelection::All,
+            })
+            .collect();
+        i = end;
+        for c in src.segments(q, view, &parts).await? {
+            // A key verified once yields the same merged row again.
+            if !seen.contains(&c.key()) {
+                push(&mut cand, &mut pending, c);
+            }
+        }
+    }
+    let more = verified.len() > k || i < segs.len() || !cand.is_empty();
+    let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
+    let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
+    let rows = if idx.is_empty() {
+        RecordBatch::new_empty(schema.clone())
+    } else {
+        interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?
+    };
+    res.resize(rows.get_array_memory_size());
+    Ok((RunsPage { rows, next_cursor }, res))
+}
+
+/// Runs: candidates are root-looking rows (`candidates`), verified by `verify`.
+struct RootScan<'a> {
+    r: &'a RunsRequest,
+    hi: Option<i64>,
+    cols: &'a [&'static str],
+}
+
+#[async_trait::async_trait]
+impl CandidateSource for RootScan<'_> {
+    fn frontier(&self, s: &SegmentMeta) -> Option<i64> {
+        // All-null-start segments hold no candidates (their rows are still read by verify via locate_traces).
+        s.max_start_ns
+    }
+
+    async fn mem(&self, q: &QueryCtx, view: &ReadView) -> Result<Vec<Candidate>, QueryError> {
+        let (snap, rr, hi) = (view.mem().clone(), self.r.clone(), self.hi);
+        q.blocking("runs.mem", move |cancel| {
+            let k = KeyFilters::project(&rr.project, None);
+            let mut v = Vec::new();
+            for b in mem_versions(&snap, &k, &projected_schema(&CANDIDATE_COLUMNS), cancel)? {
+                v.extend(candidates(&rr, hi, &b)?.into_iter().map(Candidate::At));
+            }
+            Ok(v)
         })
         .await
     }
+
+    async fn segments(
+        &self,
+        q: &QueryCtx,
+        view: &ReadView,
+        parts: &[SegmentPart],
+    ) -> Result<Vec<Candidate>, QueryError> {
+        let batches = view.scan(parts, &CANDIDATE_COLUMNS, Some(roots_filter())).await?;
+        let (rr, hi) = (self.r.clone(), self.hi);
+        q.blocking("runs.candidates", move |cancel| {
+            let mut v = Vec::new();
+            for b in &batches {
+                cancel.check()?;
+                v.extend(candidates(&rr, hi, b)?.into_iter().map(Candidate::At));
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    async fn verify(
+        &self,
+        q: &QueryCtx,
+        view: &ReadView,
+        wave: &[Candidate],
+        res: MemoryReservation,
+    ) -> Result<(RecordBatch, MemoryReservation), QueryError> {
+        let wave: Vec<Pos> = wave
+            .iter()
+            .map(|c| match c {
+                Candidate::At(p) => *p,
+                Candidate::Unpositioned(..) => unreachable!("a root candidate has a start"),
+            })
+            .collect();
+        verify(q, view, self.r, self.hi, self.cols, &wave, res).await
+    }
+}
+
+/// Every version of the wave's keys (all `locate_traces` locations, range-scanned, + the memtable), merged;
+/// the merged rows that pass EVERY filter. `res` (holding the rows kept so far) grows by the wave's input and
+/// merged rows and ends at what was kept plus the returned rows.
+async fn verify(
+    q: &QueryCtx,
+    view: &ReadView,
+    r: &RunsRequest,
+    hi: Option<i64>,
+    cols: &[&'static str],
+    wave: &[Pos],
+    res: MemoryReservation,
+) -> Result<(RecordBatch, MemoryReservation), QueryError> {
+    let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
+    let filter = span_filter(&keys.iter().map(|k| k.1).collect());
+    let k = KeyFilters {
+        traces: Some(keys.iter().map(|k| k.0).collect()),
+        spans: Some(keys),
+        ..KeyFilters::project(&r.project, None)
+    };
+    let parts = coalesce(view.locate_versions(&k).await?, VERIFY_GAP);
+    let scanned = view.scan(&parts, cols, filter).await?;
+    let schema: SchemaRef = projected_schema(cols);
+    let name_q =
+        r.q.as_ref()
+            .map(|q| {
+                let p = FtsPredicate::Search {
+                    column: FtsColumn::Name,
+                    query: q.clone(),
+                };
+                Matcher::new(&mut Analyzer::default(), &p)
+            })
+            .transpose()?;
+    let (snap, r) = (view.mem().clone(), r.clone());
+    q.blocking("runs.verify", move |cancel| {
+        let mut batches = Vec::new();
+        for b in scanned {
+            batches.push(match k.key_mask(&b)? {
+                Some(m) => filter_record_batch(&b, &m)?,
+                None => b,
+            });
+        }
+        let mem = mem_versions(&snap, &k, &schema, cancel)?;
+        let merge = needs_merge(&parts, !mem.is_empty());
+        batches.extend(mem);
+        let kept = res.size();
+        res.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
+        let m = merge_or_filter(&schema, &batches, merge, cancel)?;
+        res.try_grow(m.get_array_memory_size())?;
+        drop(batches);
+        res.resize(kept + m.get_array_memory_size());
+        let s = m.schema_ref();
+        let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
+        let project = m.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
+        let rt = m.column(s.index_of(col::RUN_TYPE)?).as_string::<i32>();
+        let st = m.column(s.index_of(col::STATUS)?).as_string::<i32>();
+        let name = m.column(s.index_of(col::NAME)?).as_string::<i32>();
+        let ids = Ids::of(&m)?;
+        let mut an = Analyzer::default();
+        let mask: BooleanArray = (0..m.num_rows())
+            .map(|i| {
+                Some(
+                    par.is_null(i)
+                        && project.value(i) == r.project.as_str()
+                        && ids.pos(i).is_some_and(|p| in_window(&r, hi, &p))
+                        && in_set(&r.run_types, rt, i)
+                        && in_set(&r.statuses, st, i)
+                        && name_q
+                            .as_ref()
+                            .is_none_or(|m| name.is_valid(i) && m.matches(&mut an, name.value(i))),
+                )
+            })
+            .collect();
+        let out = filter_record_batch(&m, &mask)?;
+        res.try_grow(out.get_array_memory_size())?;
+        drop(m);
+        res.resize(kept + out.get_array_memory_size());
+        Ok((out, res))
+    })
+    .await
 }
 
 /// Row `i` of `a` parses to a member of `set` (an empty set matches anything).

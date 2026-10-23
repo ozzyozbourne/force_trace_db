@@ -1,9 +1,11 @@
+use crate::fts;
 use crate::provider::SpansTableProvider;
 use crate::{QueryCtx, QueryEngine, QueryError, QueryKind, external_kind};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use forge_model::error::{Classify, ErrorKind};
 use std::sync::Arc;
@@ -32,8 +34,20 @@ impl QueryEngine {
             meta: self.meta.clone(),
             segments: self.store.clone(),
             memtable: self.mem.clone(),
+            index: self.index.clone(),
         };
         ctx.register_table("spans", Arc::new(provider))?;
+        ctx.register_udf(ScalarUDF::new_from_impl(fts::SearchUdf::default()));
+        ctx.register_udf(ScalarUDF::new_from_impl(fts::JsonKeySearchUdf::default()));
+        ctx.register_udf(ScalarUDF::new_from_impl(fts::JsonKeyUdf::default()));
+        ctx.register_udtf(
+            "trace_tree",
+            Arc::new(fts::TraceTreeFunc {
+                meta: self.meta.clone(),
+                store: self.store.clone(),
+                mem: self.mem.clone(),
+            }),
+        );
         Ok(ctx)
     }
 }

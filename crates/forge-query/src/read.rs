@@ -129,19 +129,26 @@ impl ReadView {
     /// Every location of `k`'s traces in each of its projects (one `locate_traces` per project, D16), minus
     /// segments outside `k`'s time range, in (segment, row) order. `k.projects` and `k.traces` must be set.
     pub async fn locate_versions(&self, k: &KeyFilters) -> MetaResult<Vec<SegmentPart>> {
+        Ok(self.locate_by_trace(k).await?.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// `locate_versions` with the trace of each location.
+    pub async fn locate_by_trace(&self, k: &KeyFilters) -> MetaResult<Vec<(TraceId, SegmentPart)>> {
         let (Some(ps), Some(ts)) = (&k.projects, &k.traces) else {
             unreachable!("locate_versions needs project and trace keys")
         };
         let traces: Vec<TraceId> = ts.iter().copied().collect();
         let mut out = Vec::new();
         for p in ps {
-            for loc in self.meta.locate_traces(p, &traces).await?.into_values().flatten() {
-                if loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
-                    out.push(SegmentPart::from(&loc));
+            for (t, locs) in self.meta.locate_traces(p, &traces).await? {
+                for loc in locs {
+                    if loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
+                        out.push((t, SegmentPart::from(&loc)));
+                    }
                 }
             }
         }
-        out.sort_by_key(|p| (p.seg.id, row_start(&p.rows)));
+        out.sort_by_key(|(_, p)| (p.seg.id, p.rows.first_row()));
         Ok(out)
     }
 
@@ -206,10 +213,10 @@ pub(crate) fn mem_versions(
 pub(crate) fn coalesce(parts: Vec<SegmentPart>, max_gap: u64) -> Vec<SegmentPart> {
     let range = |p: &SegmentPart| match &p.rows {
         RowSelection::Range(r) => Some(r.clone()),
-        RowSelection::All => None,
+        RowSelection::All | RowSelection::Rows(_) => None,
     };
     let mut out: Vec<SegmentPart> = Vec::with_capacity(parts.len());
-    // Runs of consecutive ranges of one segment; an `All` part stays alone.
+    // Runs of consecutive ranges of one segment; an `All` or `Rows` part stays alone.
     let is_range = |p: &SegmentPart| matches!(p.rows, RowSelection::Range(_));
     for run in parts.chunk_by(|a, b| a.seg.id == b.seg.id && is_range(a) && is_range(b)) {
         match run.iter().map(range).collect::<Option<Vec<_>>>() {
@@ -221,13 +228,6 @@ pub(crate) fn coalesce(parts: Vec<SegmentPart>, max_gap: u64) -> Vec<SegmentPart
         }
     }
     out
-}
-
-fn row_start(r: &RowSelection) -> u64 {
-    match r {
-        RowSelection::All => 0,
-        RowSelection::Range(r) => r.start,
-    }
 }
 
 #[cfg(test)]

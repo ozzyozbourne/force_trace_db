@@ -12,6 +12,7 @@ use forge_model::error::Unimplemented;
 use forge_model::ids::ProjectId;
 use forge_model::time::now_ms;
 use forge_query::runs::{RunsParams, RunsRequest};
+use forge_query::search::{SearchBody, SearchRequest};
 use forge_query::sql::SqlRequest;
 use forge_query::trace::TraceRequest;
 use serde::{Deserialize, Serialize};
@@ -80,7 +81,7 @@ pub fn api_router(state: AppState) -> Router {
         .route("/v1/runs/batch", post(stub("M6")))
         .route("/v1/traces/{trace_id}", get(trace))
         .route("/v1/sql", post(sql))
-        .route("/v1/search", post(stub("M4")))
+        .route("/v1/search", post(search))
         .layer(CompressionLayer::new().gzip(true))
         .with_state(state)
 }
@@ -140,6 +141,18 @@ async fn runs(
     let project = project(&s, q.project.take(), &headers)?;
     let req = RunsRequest::parse(q, project)?;
     Ok(json_body(s.query.runs_json(&req).await?))
+}
+
+/// `POST /v1/search {"q", "project"?, "columns"?, "filters"?, "limit"?, "cursor"?}`.
+async fn search(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    req: Result<Json<SearchBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let mut b = json_params(req)?;
+    let project = project(&s, b.project.take(), &headers)?;
+    let req = SearchRequest::parse(b, project)?;
+    Ok(json_body(s.query.search_json(&req).await?))
 }
 
 /// `POST /v1/sql {"query", "max_rows"?, "timeout_ms"?}`.

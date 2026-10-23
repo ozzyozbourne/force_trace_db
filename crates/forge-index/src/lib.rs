@@ -1,4 +1,19 @@
-//! forge-index: full-text search over `.fts` sidecars (M4). M0 defines the read-side types only.
+//! forge-index: full-text search over `.fts` sidecars (M4): the analyzer shared with the memtable scan, the
+//! file format, the builder and the reader.
+
+pub mod analyzer;
+pub mod build;
+pub mod format;
+pub mod matcher;
+pub mod query;
+pub mod read;
+#[cfg(test)]
+mod tests_fts;
+
+pub use analyzer::Analyzer;
+pub use build::{BuildStats, FtsBuilder};
+pub use matcher::Matcher;
+pub use read::FtsFile;
 
 use async_trait::async_trait;
 use forge_model::catalog::SegmentMeta;
@@ -11,6 +26,8 @@ pub enum IndexError {
     Corrupt { path: String, msg: String },
     #[error("invalid search query: {0}")]
     Query(String),
+    #[error("building .fts: {0}")]
+    Build(String),
     #[error(transparent)]
     Unimplemented(#[from] Unimplemented),
 }
@@ -21,7 +38,7 @@ impl Classify for IndexError {
         match self {
             Self::Query(_) => ErrorKind::InvalidInput,
             Self::Unimplemented(e) => e.kind(),
-            Self::Corrupt { .. } => ErrorKind::Internal,
+            Self::Corrupt { .. } | Self::Build(_) => ErrorKind::Internal,
         }
     }
 }

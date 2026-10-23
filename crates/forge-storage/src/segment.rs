@@ -35,6 +35,7 @@ use vortex::file::WriteStrategyBuilder;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutStrategy;
+use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 
 pub struct VortexSegmentStore {
@@ -44,6 +45,8 @@ pub struct VortexSegmentStore {
     /// spans_schema as a Vortex dtype, converted once.
     dtype: DType,
     strategy: Arc<dyn LayoutStrategy>,
+    /// D10b: Vortex footers by segment (segments are write-once, so no invalidation).
+    footers: moka::future::Cache<forge_model::catalog::SegmentId, vortex::file::Footer>,
 }
 
 impl std::fmt::Debug for VortexSegmentStore {
@@ -69,6 +72,7 @@ impl VortexSegmentStore {
             session,
             dtype,
             strategy,
+            footers: moka::future::Cache::new(4096),
         }
     }
     /// Some(absolute root) for file:// stores.
@@ -210,6 +214,24 @@ fn outcome(stashed: Option<StorageError>, written: StorageResult<()>, rows: u64)
     Ok(())
 }
 
+/// `PutMode::Create` of a segment object (`.vortex`, `.fts`). A retry of a put that landed but was reported as
+/// failed counts as written: same key (fresh per segment id), same size.
+pub async fn put_create(store: &dyn ObjectStore, location: &Path, buf: Vec<u8>) -> StorageResult<()> {
+    let size = buf.len() as u64;
+    let create = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    if let Err(e) = store.put_opts(location, PutPayload::from(buf), create).await {
+        let landed = matches!(e, object_store::Error::AlreadyExists { .. })
+            && store.head(location).await.is_ok_and(|m| m.size == size);
+        if !landed {
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SegmentStore for VortexSegmentStore {
     async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
@@ -248,19 +270,7 @@ impl SegmentStore for VortexSegmentStore {
         outcome(err, written, stats.rows)?;
         let path = paths::segment_path(&spec.project_id, spec.level, spec.partition_hour, spec.id)?;
         let byte_size = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-        let location = Path::from(path.as_str());
-        let create = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-        if let Err(e) = self.store.put_opts(&location, PutPayload::from(buf), create).await {
-            // A retry of a put that landed but was reported as failed: same id, same size counts as written.
-            let landed = matches!(e, object_store::Error::AlreadyExists { .. })
-                && self.store.head(&location).await.is_ok_and(|m| m.size == byte_size);
-            if !landed {
-                return Err(e.into());
-            }
-        }
+        put_create(self.store.as_ref(), &Path::from(path.as_str()), buf).await?;
         let traces = stats.traces;
         let meta = SegmentMeta {
             id: spec.id,
@@ -287,20 +297,37 @@ impl SegmentStore for VortexSegmentStore {
     }
 
     async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream> {
-        if let RowSelection::Range(r) = &req.rows
-            && (r.start > r.end || r.end > seg.row_count)
-        {
-            return Err(StorageError::InvalidInput(format!(
-                "row range {}..{} is invalid for segment {} with {} rows",
-                r.start, r.end, seg.id, seg.row_count
-            )));
+        match &req.rows {
+            RowSelection::Range(r) if r.start > r.end || r.end > seg.row_count => {
+                return Err(StorageError::InvalidInput(format!(
+                    "row range {}..{} is invalid for segment {} with {} rows",
+                    r.start, r.end, seg.id, seg.row_count
+                )));
+            }
+            RowSelection::Rows(rows) if rows.max().is_some_and(|m| m >= seg.row_count) => {
+                return Err(StorageError::InvalidInput(format!(
+                    "row id {} is invalid for segment {} with {} rows",
+                    rows.max().unwrap_or_default(),
+                    seg.id,
+                    seg.row_count
+                )));
+            }
+            // Nothing selected: do not even open the file (its footer is ~2 GETs).
+            RowSelection::Rows(rows) if rows.is_empty() => return Ok(futures::stream::empty().boxed()),
+            _ => {}
         }
-        let file = self
-            .session
-            .open_options()
-            .with_file_size(seg.byte_size)
+        let opts = self.session.open_options().with_file_size(seg.byte_size);
+        let cached = self.footers.get(&seg.id).await;
+        let opts = match &cached {
+            Some(f) => opts.with_footer(f.clone()),
+            None => opts,
+        };
+        let file = opts
             .open_object_store(&self.store, Path::from(seg.path.as_str()))
             .await?;
+        if cached.is_none() {
+            self.footers.insert(seg.id, file.footer().clone()).await;
+        }
         let mut sb = file.scan()?;
         let schema = match req.projection {
             Some(cols) => {
@@ -313,6 +340,8 @@ impl SegmentStore for VortexSegmentStore {
         sb = match req.rows {
             RowSelection::All => sb,
             RowSelection::Range(r) => sb.with_row_range(r),
+            // File-absolute row ids; Vortex turns sparse ids into exact split ranges (attempt_split_ranges).
+            RowSelection::Rows(rows) => sb.with_selection(Selection::IncludeRoaring(Arc::unwrap_or_clone(rows))),
         };
         if let Some(f) = req.filter {
             sb = sb.with_filter(f.bind(file.dtype())?);

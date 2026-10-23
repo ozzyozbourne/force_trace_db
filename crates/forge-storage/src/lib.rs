@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub mod inspect;
 pub mod segment;
 pub mod store;
-pub use segment::VortexSegmentStore;
+pub use segment::{VortexSegmentStore, put_create};
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 pub use store::{BuiltStore, DurableLocalFs, build_object_store, delete_all, file_url_path};
@@ -105,6 +105,26 @@ pub enum RowSelection {
     All,
     /// trace_index row range (file row positions).
     Range(std::ops::Range<u64>),
+    /// Exactly these file rows (FTS hits, file-relative ids < `row_count`). Arc: parts and requests are cloned per
+    /// scan; the treemap is copied once, into the Vortex scan.
+    Rows(Arc<roaring::RoaringTreemap>),
+}
+
+impl RowSelection {
+    /// A `.fts` hit set (u32 file row ids, one bitmap per segment) as a selection. O(1): the bitmap becomes
+    /// partition 0 (row ids < 2^32) of the treemap Vortex takes.
+    pub fn from_bitmap(rows: roaring::RoaringBitmap) -> Self {
+        Self::Rows(Arc::new(roaring::RoaringTreemap::from_bitmaps([(0, rows)])))
+    }
+
+    /// The first selected row (0 for `All`; `u64::MAX` for an empty `Rows`): orders parts within a segment.
+    pub fn first_row(&self) -> u64 {
+        match self {
+            Self::All => 0,
+            Self::Range(r) => r.start,
+            Self::Rows(rows) => rows.min().unwrap_or(u64::MAX),
+        }
+    }
 }
 
 /// `rs` sorted by start, with ranges whose gap is at most `max_gap` rows merged (0: overlapping or adjacent only,

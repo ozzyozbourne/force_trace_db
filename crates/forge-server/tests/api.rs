@@ -492,3 +492,49 @@ async fn sql_api_limits() {
         b.len()
     );
 }
+
+/// `POST /v1/search`: memtable hits (freshness), paging, no payload, 400s, 405 for GET.
+#[tokio::test]
+async fn search_api() {
+    let f = forge().await;
+    let api = api_router(f.clone());
+    for t in 0..5 {
+        let mut s = span("default", t, 1, None);
+        s.inputs = Some(format!(
+            "{{\"messages\":[{{\"content\":\"please refund order {t}\"}}]}}"
+        ));
+        f.ingest.submit(vec![s, span("default", t, 2, Some(1))]).await.unwrap();
+    }
+    let (st, v) = call(&api, post("/v1/search", json!({"q": "refund"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let hits = v["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 5, "{v}");
+    assert!(hits.iter().all(|h| h.get("inputs").is_none()), "no payload: {v}");
+    assert_eq!(v["next_cursor"], Value::Null);
+    let (_, p1) = call(&api, post("/v1/search", json!({"q": "refund", "limit": 3}))).await;
+    let c = p1["next_cursor"].as_str().unwrap().to_string();
+    let (st, p2) = call(
+        &api,
+        post("/v1/search", json!({"q": "refund", "limit": 3, "cursor": c})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p2}");
+    assert_eq!(
+        p1["hits"].as_array().unwrap().len() + p2["hits"].as_array().unwrap().len(),
+        5
+    );
+    assert_eq!(p2["next_cursor"], Value::Null);
+    for bad in [
+        json!({"q": ""}),
+        json!({"q": "x", "limit": 0}),
+        json!({"q": "x", "limit": 1001}),
+        json!({"q": "x", "nope": 1}),
+        json!({"q": "x", "cursor": "zz"}),
+        json!({"q": "x", "columns": ["model"]}),
+    ] {
+        let (st, v) = call(&api, post("/v1/search", bad.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} -> {v}");
+    }
+    let resp = api.clone().oneshot(get("/v1/search")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}

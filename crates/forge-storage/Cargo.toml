@@ -23,9 +23,12 @@ vortex.workspace = true
 object_store.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+moka.workspace = true
+roaring.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+forge-storage = { workspace = true, features = ["test-util"] }
 forge-model = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

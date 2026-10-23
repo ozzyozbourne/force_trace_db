@@ -19,6 +19,9 @@ pub mod pick;
 pub use forge_meta::MAX_JOB_INPUTS as MAX_INPUTS;
 pub const L1_MAX_RUNS: usize = 4;
 pub const MAX_OPEN_WRITERS: usize = 4;
+/// D3: a compaction output closes at the next trace boundary once its `.fts` builder holds this many (term, row)
+/// pairs (~200-250 MiB of builder memory; x MAX_OPEN_WRITERS = 4).
+pub const MAX_SEGMENT_POSTINGS: u64 = 24 << 20;
 /// Jobs per `compact_project` run (a guard; the summary reports `capped`).
 const COMPACT_MAX_JOBS: usize = 64;
 pub const JOB_RETENTION: Duration = Duration::from_secs(7 * 86_400);

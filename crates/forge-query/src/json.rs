@@ -250,12 +250,15 @@ pub fn write_trace(
 /// every 1k runs.
 pub fn write_runs(
     out: &mut Vec<u8>,
+    key: &str,
     rows: &RecordBatch,
     cursor: Option<&str>,
     cancel: &Cancel,
 ) -> Result<(), QueryError> {
     let cols = SpanCols::new(rows, true);
-    out.extend_from_slice(b"{\"runs\":[");
+    out.extend_from_slice(b"{\"");
+    out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(b"\":[");
     for i in 0..rows.num_rows() {
         if i % 1024 == 0 {
             cancel.check()?;
@@ -318,7 +321,7 @@ mod tests {
         for (k, ok) in [(1, false), (2, true)] {
             let r = write_trace(&mut Vec::new(), "p", "t", &b, &tree, false, &Cancel::after(k));
             assert_eq!(r.is_ok(), ok, "write_trace {r:?}");
-            let r = write_runs(&mut Vec::new(), &b, None, &Cancel::after(k));
+            let r = write_runs(&mut Vec::new(), "runs", &b, None, &Cancel::after(k));
             assert_eq!(r.is_ok(), ok, "write_runs {r:?}");
         }
     }

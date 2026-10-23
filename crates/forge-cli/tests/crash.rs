@@ -389,10 +389,23 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) -> usi
     let (mut on_disk, mut staging) = (Vec::new(), Vec::new());
     for p in files_under(&dir.join("data/segments")) {
         let name = p.to_string_lossy();
-        if name.ends_with(".vortex") {
-            on_disk.push(p);
+        if name.ends_with(".vortex") || name.ends_with(".fts") {
+            let rel = p.strip_prefix(dir.join("data")).unwrap().to_str().unwrap().to_string();
+            on_disk.push(dir.join("data").join(paths::owning_segment(&rel).unwrap()));
         } else if name.contains(".vortex#") {
             staging.push(p);
+        }
+    }
+    on_disk.sort();
+    on_disk.dedup();
+    // Every live segment with a sidecar has its `.fts` at exactly `fts_byte_size` bytes.
+    for s in meta.list_segments(&Default::default()).await.expect("segments") {
+        if let Some(n) = s.fts_byte_size {
+            let f = dir.join("data").join(paths::fts_path(&s.path));
+            let len = std::fs::metadata(&f)
+                .map(|m| m.len())
+                .unwrap_or_else(|e| panic!("{ctx}: {f:?}: {e}"));
+            assert_eq!(len, n, "{ctx}: {f:?}");
         }
     }
     let n = on_disk.iter().filter(|p| !known.contains(*p)).count();

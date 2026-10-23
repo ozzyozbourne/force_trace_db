@@ -14,7 +14,15 @@ forge-model.workspace = true
 async-trait.workspace = true
 roaring.workspace = true
 thiserror.workspace = true
+arrow.workspace = true
+fst.workspace = true
+serde_json.workspace = true
+tantivy.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+foldhash.workspace = true
 
 [dev-dependencies]
 forge-model = { workspace = true, features = ["test-util"] }
 tokio.workspace = true
+proptest.workspace = true

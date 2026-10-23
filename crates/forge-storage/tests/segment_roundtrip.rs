@@ -488,3 +488,88 @@ async fn random_merge_passes_write_segment() {
         }
     }
 }
+
+/// M4: `RowSelection::Rows` (FTS hits) through `SegmentStore::scan`: exact rows across the 64K roaring container
+/// boundary, in file order, under a projection, a filter and a limit; empty = no rows; out of range = InvalidInput.
+#[tokio::test]
+async fn rows_selection() {
+    use arrow::array::UInt32Array;
+    use arrow::compute::take_record_batch;
+    use forge_model::schema::project_to;
+    let st = store("memory://");
+    let all = batch_from_rows(&rows(700, 100)); // 70,000 rows
+    let w = st.write_segment(spec("p"), input(vec![all.clone()])).await.unwrap();
+    let m = &w.meta;
+    let cols = vec![col::SPAN_ID, col::VERSION, col::INPUTS];
+    let schema = projected_schema(&cols);
+    let scan = async |rows: RowSelection, filter: Option<vortex::expr::Expression>, limit: Option<u64>| {
+        let req = ScanRequest {
+            projection: Some(cols.clone()),
+            rows,
+            filter,
+            limit,
+        };
+        collect(st.scan(m, req).await.unwrap(), schema.clone()).await
+    };
+    let want =
+        |ids: &[u32]| take_record_batch(&project_to(&all, &schema).unwrap(), &UInt32Array::from(ids.to_vec())).unwrap();
+
+    let pick = [0u32, 7, 65_535, 65_536, 69_999];
+    let sel = RowSelection::from_bitmap(pick.iter().copied().collect());
+    assert_eq!(sel.first_row(), 0);
+    assert_eq!(scan(sel.clone(), None, None).await, want(&pick));
+    // Dense: every third row.
+    let every3: Vec<u32> = (0..70_000).step_by(3).collect();
+    assert_eq!(
+        scan(RowSelection::from_bitmap(every3.iter().copied().collect()), None, None).await,
+        want(&every3)
+    );
+    // A filter applies on top of the selection; a limit counts selected rows.
+    let v = vortex::expr::eq(vortex::expr::col(col::VERSION), vortex::expr::lit(65_537i64));
+    assert_eq!(scan(sel.clone(), Some(v), None).await, want(&[65_536]));
+    assert_eq!(scan(sel, None, Some(2)).await, want(&[0, 7]));
+    // Empty: no rows and no file read.
+    let empty = RowSelection::from_bitmap(roaring::RoaringBitmap::new());
+    assert_eq!(empty.first_row(), u64::MAX);
+    assert_eq!(scan(empty, None, None).await.num_rows(), 0);
+    // A row id past the end is InvalidInput, like a bad range.
+    let bad = ScanRequest {
+        rows: RowSelection::from_bitmap([70_000u32].into_iter().collect()),
+        ..Default::default()
+    };
+    let err = st.scan(m, bad).await.err().expect("out of range");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
+/// D10b: the second scan of a segment reuses its cached Vortex footer (no footer read), same rows.
+#[tokio::test]
+async fn footer_cache_skips_reopen() {
+    use forge_storage::testing::LatencyStore;
+    use std::sync::atomic::Ordering;
+    let lat = Arc::new(LatencyStore::new(Arc::new(object_store::memory::InMemory::new())));
+    let st = VortexSegmentStore::new(BuiltStore {
+        store: lat.clone(),
+        local_root: None,
+    });
+    let w = st
+        .write_segment(spec("p"), input(vec![batch_from_rows(&rows(700, 100))]))
+        .await
+        .unwrap();
+    lat.set_delay(std::time::Duration::from_millis(50));
+    let cols = vec![col::SPAN_ID, col::VERSION];
+    let scan = async || {
+        let (before, t0) = (lat.gets.load(Ordering::Relaxed), std::time::Instant::now());
+        let req = ScanRequest {
+            projection: Some(cols.clone()),
+            rows: RowSelection::Range(1000..1100),
+            ..Default::default()
+        };
+        let b = collect(st.scan(&w.meta, req).await.unwrap(), projected_schema(&cols)).await;
+        (b, lat.gets.load(Ordering::Relaxed) - before, t0.elapsed())
+    };
+    let (first, cold, t_cold) = scan().await;
+    let (second, warm, t_warm) = scan().await;
+    assert_eq!(first, second);
+    assert_eq!(first.num_rows(), 100);
+    assert!(warm < cold, "warm {warm} GETs {t_warm:?}, cold {cold} GETs {t_cold:?}");
+}

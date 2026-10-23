@@ -31,6 +31,10 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 crc32fast.workspace = true
+bytes.workspace = true
+object_store.workspace = true
+roaring.workspace = true
+moka.workspace = true
 forge-ingest = { workspace = true, optional = true }
 
 [dev-dependencies]

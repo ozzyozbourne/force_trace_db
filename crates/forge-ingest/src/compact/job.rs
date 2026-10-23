@@ -1,6 +1,6 @@
 //! `run_job`: lazy trace slices -> scan + context -> merge (Keep) -> start fill -> dotted backfill -> sort -> route to
 //! per-(hour, orphan) writers -> commit (plans/phase-4 §2.8, CR §7).
-use super::{CompactCtx, JobReport, JobStats, MAX_OPEN_WRITERS};
+use super::{CompactCtx, JobReport, JobStats, MAX_OPEN_WRITERS, MAX_SEGMENT_POSTINGS};
 use crate::IngestError;
 use crate::sink::SegmentSink;
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampNanosecondArray, UInt32Array};
@@ -192,10 +192,12 @@ struct Writers {
     /// Every object of every output started (deleted when the job fails before its commit).
     objects: Vec<object_store::path::Path>,
     tick: u64,
+    /// D3: rotate an output once its `.fts` builder holds this many postings.
+    max_postings: u64,
 }
 
 impl Writers {
-    fn new(store: Arc<dyn SegmentStore>, project: ProjectId) -> Self {
+    fn new(store: Arc<dyn SegmentStore>, project: ProjectId, max_postings: u64) -> Self {
         Self {
             store,
             project,
@@ -203,6 +205,7 @@ impl Writers {
             closing: Vec::new(),
             objects: Vec::new(),
             tick: 0,
+            max_postings,
         }
     }
 
@@ -226,7 +229,7 @@ impl Writers {
         if self
             .open
             .get(&run)
-            .is_some_and(|w| w.bytes > 0 && w.bytes + size > limit)
+            .is_some_and(|w| w.bytes > 0 && (w.bytes + size > limit || w.sink.postings() >= self.max_postings))
         {
             self.close(run);
             stats.rotated += 1;
@@ -288,7 +291,7 @@ impl Writers {
 pub async fn run_job(cx: &CompactCtx, job: CompactionJob) -> Result<JobReport, IngestError> {
     failpoint::hit("compact_after_lease");
     let t0 = std::time::Instant::now();
-    let mut w = Writers::new(cx.segments.clone(), job.project_id.clone());
+    let mut w = Writers::new(cx.segments.clone(), job.project_id.clone(), MAX_SEGMENT_POSTINGS);
     let (mut report, commit) = match build(cx, &job, &mut w).await {
         Ok(x) => x,
         Err(e) => {
@@ -714,4 +717,55 @@ fn fill<'a>(m: &'a RecordBatch, old: &Context<'a>, all: &Context<'a>) -> Result<
         backfills: resolved.len() as u64,
         dotted_filled,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_model::ids::TraceId;
+    use forge_model::testing::{batch_from_rows, pid, sid, sort_by_key};
+
+    /// One trace of 20 spans, ~200 distinct tokens in `inputs` (10 per span).
+    fn trace_batch(t: u64) -> RecordBatch {
+        let rows: Vec<_> = (0..20u64)
+            .map(|s| {
+                let words: Vec<String> = (0..10).map(|w| format!("w{t}x{s}x{w}")).collect();
+                forge_model::row::SpanRow {
+                    project_id: Some(pid("p")),
+                    trace_id: TraceId(u128::from(t).to_be_bytes()),
+                    span_id: sid(s),
+                    start_time_ns: Some(1_700_000_000_000_000_000 + s as i64),
+                    inputs: Some(format!("{{\"text\":\"{}\"}}", words.join(" "))),
+                    version: 1,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        sort_by_key(&batch_from_rows(&rows))
+    }
+
+    async fn outputs(max_postings: u64) -> Vec<NewSegment> {
+        let mut w = Writers::new(forge_storage::testing::memory_store(), pid("p"), max_postings);
+        let run = Run {
+            hour: HourBucket(0),
+            orphan: false,
+        };
+        let mut stats = JobStats::default();
+        for t in 0..10 {
+            w.send(run, trace_batch(t), u64::MAX, &mut stats).await.unwrap();
+        }
+        w.finish().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn posting_cap_rotates_outputs() {
+        let out = outputs(1_000).await;
+        assert!(out.len() > 1, "{} outputs", out.len());
+        assert_eq!(out.iter().map(|o| o.meta.row_count).sum::<u64>(), 200);
+        for pair in out.windows(2) {
+            assert!(pair[0].meta.max_trace_id < pair[1].meta.min_trace_id);
+        }
+        assert!(out.iter().all(|o| o.meta.fts_byte_size.is_some()));
+        assert_eq!(outputs(u64::MAX).await.len(), 1);
+    }
 }

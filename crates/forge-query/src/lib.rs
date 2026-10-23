@@ -6,12 +6,16 @@
 //! (invariant 4). `total_tokens` is the effective total (decision 15) on every path.
 mod derived;
 mod filters;
+mod fts;
+mod fts_scan;
+pub use fts_scan::FtsIndexReader;
 mod json;
 mod merge_exec;
 mod provider;
 mod read;
 pub mod runs;
 mod scan;
+pub mod search;
 mod session;
 pub mod sql;
 #[cfg(any(test, feature = "test-util"))]
@@ -149,6 +153,8 @@ pub struct QueryEngine {
     pub(crate) store: Arc<dyn SegmentStore>,
     pub(crate) mem: Arc<dyn MemtableView>,
     pub(crate) cfg: QueryConfig,
+    /// `.fts` lookups (default: `FtsIndexReader` over the segment store).
+    pub(crate) index: Arc<dyn forge_index::IndexReader>,
     pub(crate) sql_slots: Arc<tokio::sync::Semaphore>,
     /// DataFusion `target_partitions` (default: the CPU count).
     pub target_partitions: usize,
@@ -224,6 +230,7 @@ impl QueryEngine {
             n => n,
         };
         Self {
+            index: Arc::new(FtsIndexReader::new(store.object_store())),
             meta,
             store,
             mem,
@@ -233,6 +240,12 @@ impl QueryEngine {
             #[cfg(any(test, feature = "test-util"))]
             blocking_hook: None,
         }
+    }
+
+    /// Replaces the index reader (tests; a caching reader in M5).
+    pub fn with_index(mut self, index: Arc<dyn forge_index::IndexReader>) -> Self {
+        self.index = index;
+        self
     }
 
     /// The memtable snapshot, taken now (before any metastore call made through the view).
