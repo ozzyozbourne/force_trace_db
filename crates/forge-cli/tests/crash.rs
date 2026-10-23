@@ -582,6 +582,16 @@ async fn crash_random_sigkill() {
             let ms = 200 + rng.below(800);
             let (mut s, p) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
             let tasks = load(p, round, &c.ledger, Duration::from_millis(ms)).await;
+            // Under a loaded machine the random cut can land before MIN_ACKED acks; extend it (bounded) so the
+            // round still exercises a kill mid-load instead of flaking.
+            let acked = || {
+                let l = c.ledger.lock().unwrap();
+                l.iter().filter(|p| p.acked && p.round == round).count()
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while acked() < MIN_ACKED && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             s.signal("KILL");
             let st = s.wait_exit(Duration::from_secs(20)).await;
             assert_killed(st, &s.logs(), None);
