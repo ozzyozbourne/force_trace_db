@@ -121,15 +121,12 @@ fn inspect_missing_file_fails() {
 
 /// A data dir with 3 L0 segments of project `p` (flushes 1..=3).
 async fn data_dir_with_l0s() -> tempfile::TempDir {
-    use forge_meta::{FlushCommit, Metastore, NewSegment, SqliteMetastore};
-    use forge_model::catalog::{HourBucket, Level, SegmentId};
-    use forge_model::merge::{Tombstones, merge_versions};
-    use forge_model::testing::{Rng, batch_from_rows, pid, random_row};
-    use forge_storage::{SegmentSpec, SegmentStore};
+    use forge_model::catalog::HourBucket;
+    use forge_model::testing::{Rng, batch_from_rows, random_row};
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("data")).unwrap();
-    let m = SqliteMetastore::open_path(&d.path().join("meta.db")).unwrap();
-    let store = common::segment_store(d.path());
+    let m = forge_meta::SqliteMetastore::open_path(&d.path().join("meta.db")).unwrap();
+    let store: std::sync::Arc<dyn forge_storage::SegmentStore> = std::sync::Arc::new(common::segment_store(d.path()));
     let mut r = Rng(7);
     for f in 1..=3u64 {
         let rows: Vec<_> = (0..5)
@@ -139,47 +136,11 @@ async fn data_dir_with_l0s() -> tempfile::TempDir {
                 ..random_row(&mut r, "p", s % 2, s, f * 10 + s)
             })
             .collect();
-        let b = merge_versions(&[batch_from_rows(&rows)], Tombstones::Keep).unwrap();
-        let spec = SegmentSpec {
-            id: SegmentId::new(),
-            project_id: pid("p"),
-            level: Level::L0,
-            partition_hour: HourBucket(472_222),
-        };
-        let w = store
-            .write_segment(spec, Box::pin(futures::stream::iter([Ok(b)])))
-            .await
-            .unwrap();
-        m.commit_flush(FlushCommit {
-            node_id: "node-1".into(),
-            segments: vec![NewSegment {
-                meta: w.meta,
-                traces: w.traces,
-                blobs: vec![],
-            }],
-            flushed_wal_seq: f,
-            max_version: 100,
-        })
-        .await
-        .unwrap();
+        let b = batch_from_rows(&rows);
+        let hour = HourBucket(472_222);
+        forge_ingest::testing::write_flush(&m, store.clone(), &b, hour, "node-1", 1 << 30, f, 100).await;
     }
     d
-}
-
-fn count(dir: &std::path::Path, sql: &str) -> i64 {
-    let c = rusqlite::Connection::open(dir.join("meta.db")).unwrap();
-    c.query_row(sql, [], |r| r.get(0)).unwrap()
-}
-
-fn sql_n(dir: &str) -> u64 {
-    common::sql_count(&forge(&[
-        "sql",
-        "SELECT count(*) AS n FROM spans",
-        "--data-dir",
-        dir,
-        "--format",
-        "json",
-    ]))
 }
 
 /// Every file under `dir`, relative, sorted.
@@ -196,7 +157,7 @@ fn ls(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 async fn compact_table_json_unknown_and_nothing_to_do() {
     let d = data_dir_with_l0s().await;
     let dir = d.path().to_str().unwrap();
-    let n = sql_n(dir);
+    let n = common::spans_count(d.path());
     let o = forge(&["compact", "--project", "nope", "--data-dir", dir]);
     assert_eq!(o.status.code(), Some(1), "{o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("no project"), "{o:?}");
@@ -209,20 +170,20 @@ async fn compact_table_json_unknown_and_nothing_to_do() {
     );
     assert!(out.contains("done: 1 jobs, 0 skipped, 0 failed"), "{out}");
     assert_eq!(
-        count(
+        common::meta_count(
             d.path(),
             "SELECT count(*) FROM segments WHERE state <> 'deleted' AND level = 0"
         ),
         0
     );
     assert_eq!(
-        count(
+        common::meta_count(
             d.path(),
             "SELECT count(*) FROM segments WHERE state <> 'deleted' AND level = 1"
         ),
         1
     );
-    assert_eq!(sql_n(dir), n);
+    assert_eq!(common::spans_count(d.path()), n);
     let o = forge(&["compact", "--project", "p", "--data-dir", dir]);
     assert!(o.status.success(), "{o:?}");
     assert!(String::from_utf8_lossy(&o.stdout).contains("done: 0 jobs"), "{o:?}");
@@ -266,7 +227,7 @@ async fn compact_failed_job_exits_1() {
         "{o:?}"
     );
     assert_eq!(
-        count(d.path(), "SELECT count(*) FROM segments WHERE state <> 'live'"),
+        common::meta_count(d.path(), "SELECT count(*) FROM segments WHERE state <> 'live'"),
         0
     );
 }
@@ -395,7 +356,7 @@ async fn gc_dry_run_then_real() {
         a
     };
     let files = ls(&data);
-    let rows = count(d.path(), "SELECT count(*) FROM segments");
+    let rows = common::meta_count(d.path(), "SELECT count(*) FROM segments");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let o = forge(&args(true));
     assert!(o.status.success(), "{o:?}");
@@ -409,9 +370,9 @@ async fn gc_dry_run_then_real() {
     };
     assert_eq!(got(&v), (Some(1), Some(1), Some(1)), "{v}");
     assert_eq!(ls(&data), files, "dry run changed objects");
-    assert_eq!(count(d.path(), "SELECT count(*) FROM segments"), rows);
+    assert_eq!(common::meta_count(d.path(), "SELECT count(*) FROM segments"), rows);
     assert_eq!(
-        count(d.path(), "SELECT count(*) FROM segments WHERE state = 'deleted'"),
+        common::meta_count(d.path(), "SELECT count(*) FROM segments WHERE state = 'deleted'"),
         1
     );
     let o = forge(&args(false));
@@ -420,7 +381,7 @@ async fn gc_dry_run_then_real() {
     assert_eq!(got(&v), (Some(1), Some(1), Some(1)), "{v}");
     assert!(!data.join(&x.meta.path).exists() && !orphan.exists());
     assert!(data.join(&y.meta.path).exists() && data.join(&z.meta.path).exists());
-    assert_eq!(count(d.path(), "SELECT count(*) FROM segments"), 2);
+    assert_eq!(common::meta_count(d.path(), "SELECT count(*) FROM segments"), 2);
 }
 
 /// `--orphan-grace` (flag only: --data-dir ignores FORGE_* env).

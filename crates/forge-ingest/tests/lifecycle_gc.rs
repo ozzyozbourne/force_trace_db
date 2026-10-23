@@ -1,8 +1,10 @@
+use forge_ingest::blob::BlobGuard;
 use forge_ingest::lifecycle::{GcOptions, run_gc};
 use forge_meta::*;
 use forge_model::catalog::*;
 use forge_model::ids::TraceId;
 use forge_model::testing::{pid, segment_meta};
+use forge_model::time::Clocks;
 use forge_storage::DurableLocalFs;
 use object_store::{ObjectMeta, ObjectStoreExt, path::Path};
 use std::time::{Duration, SystemTime};
@@ -82,7 +84,9 @@ async fn gc_end_to_end_on_local_fs() {
         dry_run: true,
     };
     let now = forge_model::time::now_ms();
-    let dry = run_gc(&m, &store, now, now, &o, None).await.unwrap();
+    let dry = run_gc(&m, &store, &Clocks::at(now, now), &o, &BlobGuard::default())
+        .await
+        .unwrap();
     assert_eq!(
         (dry.expired_segments, dry.orphan_segment_objects, dry.orphan_blobs),
         (1, 1, 1),
@@ -95,7 +99,9 @@ async fn gc_end_to_end_on_local_fs() {
     );
 
     o.dry_run = false;
-    let r1 = run_gc(&m, &store, now, now, &o, None).await.unwrap();
+    let r1 = run_gc(&m, &store, &Clocks::at(now, now), &o, &BlobGuard::default())
+        .await
+        .unwrap();
     assert_eq!(
         (r1.expired_segments, r1.purged_segments),
         (1, 0),
@@ -112,7 +118,9 @@ async fn gc_end_to_end_on_local_fs() {
     );
     // Two hours later: purge; then the next sweep takes b_old.
     let later = now + 2 * 3_600_000;
-    let r2 = run_gc(&m, &store, later, later, &o, None).await.unwrap();
+    let r2 = run_gc(&m, &store, &Clocks::at(later, later), &o, &BlobGuard::default())
+        .await
+        .unwrap();
     assert_eq!((r2.purged_segments, r2.deleted_objects), (1, 2), "{r2:?}");
     assert!(store.head(&Path::from(old.meta.path.as_str())).await.is_err());
     assert_eq!(r2.orphan_blobs, 1, "b_old unreferenced after forget");
@@ -130,7 +138,9 @@ async fn gc_end_to_end_on_local_fs() {
         assert!(store.head(&Path::from(k)).await.is_err(), "{k} must be gone");
     }
     // Idempotent; purge re-run after a crash between object delete and forget: NotFound = success.
-    let r3 = run_gc(&m, &store, later, later, &o, None).await.unwrap();
+    let r3 = run_gc(&m, &store, &Clocks::at(later, later), &o, &BlobGuard::default())
+        .await
+        .unwrap();
     assert_eq!(
         (
             r3.expired_segments,
@@ -141,7 +151,7 @@ async fn gc_end_to_end_on_local_fs() {
         (0, 0, 0, 0)
     );
     assert_eq!(
-        forge_ingest::lifecycle::delete_all(&store, vec![Path::from(orphan_seg)])
+        forge_storage::delete_all(&store, vec![Path::from(orphan_seg)])
             .await
             .unwrap(),
         0
@@ -187,15 +197,21 @@ async fn data_clock_expires_wall_clock_purges() {
         sweep_blobs: true,
         dry_run: false,
     };
-    let guard = forge_ingest::blob::BlobGuard::default();
-    let r = run_gc(&m, &store, now + 2 * 86_400_000, now, &o, Some(&guard))
+    let guard = BlobGuard::default();
+    let r = run_gc(&m, &store, &Clocks::at(now + 2 * 86_400_000, now), &o, &guard)
         .await
         .unwrap();
     assert_eq!((r.expired_segments, r.purged_segments), (1, 0), "{r:?}");
     assert!(store.head(&Path::from(s.meta.path.as_str())).await.is_ok());
-    let r = run_gc(&m, &store, now + 2 * 86_400_000, now + 2 * 3_600_000, &o, Some(&guard))
-        .await
-        .unwrap();
+    let r = run_gc(
+        &m,
+        &store,
+        &Clocks::at(now + 2 * 86_400_000, now + 2 * 3_600_000),
+        &o,
+        &guard,
+    )
+    .await
+    .unwrap();
     assert_eq!(r.purged_segments, 1, "{r:?}");
 }
 

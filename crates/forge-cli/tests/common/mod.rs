@@ -35,6 +35,24 @@ pub fn sql_count(o: &std::process::Output) -> u64 {
     v["rows"][0]["n"].as_u64().expect("n")
 }
 
+/// A `SELECT count(*) …` (any one-integer query) on `dir`'s meta.db.
+pub fn meta_count(dir: &Path, sql: &str) -> i64 {
+    let c = rusqlite::Connection::open(dir.join(META_DB)).expect("meta.db");
+    c.query_row(sql, [], |r| r.get(0)).expect(sql)
+}
+
+/// `forge sql --data-dir dir "SELECT count(*) AS n FROM spans"`.
+pub fn spans_count(dir: &Path) -> u64 {
+    sql_count(&forge_output(&[
+        "sql",
+        "--data-dir",
+        dir.to_str().expect("utf-8 dir"),
+        "--format",
+        "json",
+        "SELECT count(*) AS n FROM spans",
+    ]))
+}
+
 /// Env for `spawn_ready`: no timer flush during the test.
 pub const NO_TIMER_FLUSH: [(&str, &str); 1] = [("FORGE_MEMTABLE__FLUSH_INTERVAL", "1h")];
 

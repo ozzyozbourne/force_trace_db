@@ -15,10 +15,9 @@ use forge_model::catalog::HourBucket;
 use forge_model::config::{ForgeConfig, META_DB};
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::ProjectId;
-use forge_model::merge::Cancel;
 use forge_model::row::SpanRow;
-use forge_model::testing::{Rng, pid, sid, tid};
-use forge_model::time::{Clock, now_ms};
+use forge_model::testing::{Rng, agent_parent, files_under, pid, sid, tid};
+use forge_model::time::{Clock, Clocks, now_ms, wall_clock};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -124,10 +123,6 @@ struct Load {
     sampled: Mutex<Vec<Sampled>>,
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 /// One trace: start posts (agent-shaped, perf.rs style: parent among the previous 8 spans, depth <= 10, one llm
 /// span in three with a ~200 B input), and the end patches of every fifth span (end, status OK, a new name, the
 /// output; they carry start_time as OTLP posts do).
@@ -136,14 +131,7 @@ fn trace_rows(n: u64, project: &ProjectId, start0: i64, text: &str) -> (Vec<Span
     let mut depth = [0u32; SPANS as usize];
     let (mut starts, mut patches) = (Vec::new(), Vec::new());
     for i in 0..SPANS {
-        let parent = (i > 0).then(|| {
-            let mut p = i - 1 - r.below(i.min(8));
-            if depth[p as usize] >= 9 {
-                p = 0;
-            }
-            depth[i as usize] = depth[p as usize] + 1;
-            p
-        });
+        let parent = agent_parent(&mut r, &mut depth, i);
         let llm = i % 3 == 1;
         let start = start0 + i as i64 * 1_000_017;
         let base = SpanRow {
@@ -207,7 +195,7 @@ async fn loader(f: Arc<forge_server::Forge>, load: Arc<Load>, clock: Arc<DataClo
             let (_, rows, sample) = due.pop_front().expect("front");
             let applied: Vec<_> = rows
                 .iter()
-                .map(|r| (hex(r.span_id.as_bytes()), r.name.clone(), r.end_time_ns))
+                .map(|r| (r.span_id.to_string(), r.name.clone(), r.end_time_ns))
                 .collect();
             if submit(&f, &load, rows).await
                 && let Some(s) = sample
@@ -227,7 +215,7 @@ async fn loader(f: Arc<forge_server::Forge>, load: Arc<Load>, clock: Arc<DataClo
         let expected: Expected = starts
             .iter()
             .map(|r| {
-                let k = hex(r.span_id.as_bytes());
+                let k = r.span_id.to_string();
                 (
                     k,
                     (r.name.clone().expect("name"), r.start_time_ns.expect("start"), None),
@@ -249,7 +237,7 @@ async fn loader(f: Arc<forge_server::Forge>, load: Arc<Load>, clock: Arc<DataClo
             let mut v = load.sampled.lock().unwrap();
             v.push(Sampled {
                 project: if is_ctl { "ctl" } else { "soak" },
-                trace: hex(&tid(n).0),
+                trace: tid(n).to_string(),
                 spans: expected,
             });
             v.len() - 1
@@ -277,26 +265,13 @@ fn rss_bytes() -> u64 {
     kb * 1024
 }
 
-fn walk(dir: &Path, out: &mut (u64, u64)) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walk(&p, out);
-        } else if !p.to_string_lossy().contains('#')
-            && let Ok(m) = e.metadata()
-        {
-            out.0 += 1;
-            out.1 += m.len();
-        }
-    }
-}
-
 /// (files, bytes) under `dir`, staging files (`#`) excluded.
 fn files(dir: &Path) -> (u64, u64) {
-    let mut out = (0, 0);
-    walk(dir, &mut out);
-    out
+    files_under(dir)
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains('#'))
+        .filter_map(|p| p.metadata().ok())
+        .fold((0, 0), |(n, b), m| (n + 1, b + m.len()))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -667,14 +642,11 @@ async fn soak_scaled_48_data_hours() {
         .expect("final flush");
     rss_stop.store(true, Ordering::Relaxed);
     let _ = rss_task.await;
-    let cx = CompactCtx {
-        meta: f.meta.clone(),
-        segments: f.segments.clone(),
-        cfg: cfg.compaction.clone(),
-        data_clock: data_clock.clone(),
-        next_project: Default::default(),
-        cancel: Cancel::new(),
+    let clocks = Clocks {
+        data: data_clock.clone(),
+        wall: wall_clock(),
     };
+    let cx = CompactCtx::new(f.meta.clone(), f.segments.clone(), cfg.compaction.clone(), clocks);
     for p in ["soak", "ctl"] {
         loop {
             let s = compact_project(&cx, &pid(p)).await.expect("compact_project");
@@ -688,18 +660,15 @@ async fn soak_scaled_48_data_hours() {
     }
     let o = GcOptions {
         gc_grace,
-        orphan_grace: cfg.compaction.orphan_grace,
-        sweep_blobs: true,
-        dry_run: false,
+        ..GcOptions::from_config(&cfg.compaction)
     };
     let store = f.segments.object_store();
     let gc = run_gc(
         f.meta.as_ref(),
         store.as_ref(),
-        frozen,
-        now_ms(),
+        &Clocks::at(frozen, now_ms()),
         &o,
-        Some(&f.ingest.blob_guard()),
+        &f.ingest.blob_guard(),
     )
     .await
     .expect("final gc");

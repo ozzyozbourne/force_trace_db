@@ -1,11 +1,11 @@
 //! M3 compaction (plans/phase-4-compaction.md): picker -> lease -> run_job -> swap.
 use crate::IngestError;
 use forge_meta::{JobRequest, Metastore, SegmentFilter};
-use forge_model::catalog::{JobKind, Level};
+use forge_model::catalog::{JobKind, SegmentId};
 use forge_model::config::CompactionConfig;
 use forge_model::ids::ProjectId;
 use forge_model::merge::Cancel;
-use forge_model::time::{Clock, now_ms};
+use forge_model::time::Clocks;
 use forge_storage::SegmentStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,24 +14,46 @@ use std::time::Duration;
 pub mod job;
 pub mod pick;
 
+/// The picker's input cap (begin_compaction's own cap, `forge_meta::MAX_JOB_INPUTS`, is higher).
 pub const MAX_INPUTS: usize = 16;
+const _: () = assert!(MAX_INPUTS <= forge_meta::MAX_JOB_INPUTS);
 pub const L1_MAX_RUNS: usize = 4;
 pub const MAX_OPEN_WRITERS: usize = 4;
 /// Jobs per `compact_project` run (a guard; the summary reports `capped`).
 pub const COMPACT_MAX_JOBS: usize = 64;
 pub const JOB_RETENTION: Duration = Duration::from_secs(7 * 86_400);
-const DAY_NS: i64 = 86_400 * 1_000_000_000;
 
 pub struct CompactCtx {
     pub meta: Arc<dyn Metastore>,
     pub segments: Arc<dyn SegmentStore>,
     pub cfg: CompactionConfig,
-    /// D11: hour closed / expired. L0 age and the job-age guard use `now_ms()`.
-    pub data_clock: Clock,
+    /// D11: `data` decides hour closed / expired, `wall` the L0 age (the job-age guard is the metastore's clock).
+    pub clocks: Clocks,
+    /// `merge_versions_projected`'s output bound per merged batch (`flush::MERGE_CHUNK_BYTES`).
+    pub merge_chunk_bytes: usize,
     /// Rotating start for `run_next`.
     pub next_project: AtomicUsize,
     /// Shutdown: checked between slices, never during the commit (D7).
     pub cancel: Cancel,
+}
+
+impl CompactCtx {
+    pub fn new(
+        meta: Arc<dyn Metastore>,
+        segments: Arc<dyn SegmentStore>,
+        cfg: CompactionConfig,
+        clocks: Clocks,
+    ) -> Self {
+        Self {
+            meta,
+            segments,
+            cfg,
+            clocks,
+            merge_chunk_bytes: crate::flush::MERGE_CHUNK_BYTES,
+            next_project: AtomicUsize::new(0),
+            cancel: Cancel::new(),
+        }
+    }
 }
 
 /// Coverage counters of one job (tests, logs).
@@ -73,7 +95,7 @@ async fn pick_for(
     cx: &CompactCtx,
     p: &ProjectId,
     force: bool,
-) -> Result<Option<(JobKind, Vec<forge_model::catalog::SegmentId>)>, IngestError> {
+) -> Result<Option<(JobKind, Vec<SegmentId>)>, IngestError> {
     let segs = cx
         .meta
         .list_segments(&SegmentFilter {
@@ -81,22 +103,30 @@ async fn pick_for(
             ..Default::default()
         })
         .await?;
-    let data_now_ns = (cx.data_clock)().saturating_mul(1_000_000);
-    let days = cx.meta.get_project(p).await?.and_then(|p| p.retention_days);
+    let data_now_ns = (cx.clocks.data)().saturating_mul(1_000_000);
+    let project = cx.meta.get_project(p).await?;
     let input = pick::PickInput {
         segs: &segs,
-        wall_now_ms: now_ms(),
+        wall_now_ms: (cx.clocks.wall)(),
         data_now_ns,
-        expired_before_ns: days.map(|d| data_now_ns.saturating_sub(i64::from(d) * DAY_NS)),
+        expired_before_ns: project.and_then(|p| p.retention_cutoff_ns(data_now_ns)),
         force,
     };
     Ok(pick::pick(&input, &cx.cfg))
 }
 
-/// Pick -> lease -> run. Ok(None): nothing due, or the lease raced.
-async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Option<Option<JobReport>>, IngestError> {
+/// What one pick -> begin -> run did.
+enum Outcome {
+    /// Nothing due.
+    Idle,
+    /// The begin rules failed (raced).
+    Refused,
+    Ran(JobReport),
+}
+
+async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Outcome, IngestError> {
     let Some((kind, inputs)) = pick_for(cx, p, force).await? else {
-        return Ok(None);
+        return Ok(Outcome::Idle);
     };
     let req = JobRequest {
         project_id: p.clone(),
@@ -104,9 +134,9 @@ async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Option<Optio
         inputs,
     };
     let Some(job) = cx.meta.begin_compaction(req).await? else {
-        return Ok(Some(None)); // raced / rules failed
+        return Ok(Outcome::Refused);
     };
-    Ok(Some(Some(job::run_job(cx, job).await?)))
+    Ok(Outcome::Ran(job::run_job(cx, job).await?))
 }
 
 /// Server slot: projects in rotating order; the first that yields a job. None = nothing due or all raced.
@@ -118,7 +148,7 @@ pub async fn run_next(cx: &CompactCtx) -> Result<Option<JobReport>, IngestError>
     let start = cx.next_project.fetch_add(1, Ordering::Relaxed);
     for i in 0..projects.len() {
         let p = &projects[(start + i) % projects.len()].id;
-        if let Some(Some(r)) = one(cx, p, false).await? {
+        if let Outcome::Ran(r) = one(cx, p, false).await? {
             return Ok(Some(r));
         }
     }
@@ -131,12 +161,12 @@ pub async fn compact_project(cx: &CompactCtx, p: &ProjectId) -> Result<CompactSu
     let mut s = CompactSummary::default();
     for _ in 0..COMPACT_MAX_JOBS {
         match one(cx, p, true).await {
-            Ok(None) => return Ok(s),
-            Ok(Some(None)) => {
+            Ok(Outcome::Idle) => return Ok(s),
+            Ok(Outcome::Refused) => {
                 s.skipped += 1;
                 return Ok(s);
             }
-            Ok(Some(Some(r))) => s.jobs.push(r),
+            Ok(Outcome::Ran(r)) => s.jobs.push(r),
             Err(e) => {
                 tracing::warn!(project = %p, error = %e, "compaction failed");
                 s.failed.push(e.to_string());
@@ -148,9 +178,4 @@ pub async fn compact_project(cx: &CompactCtx, p: &ProjectId) -> Result<CompactSu
     }
     s.capped = true;
     Ok(s)
-}
-
-pub(crate) fn level_counts(inputs: &[forge_model::catalog::SegmentMeta]) -> (usize, usize) {
-    let l0 = inputs.iter().filter(|s| s.level == Level::L0).count();
-    (l0, inputs.len() - l0)
 }

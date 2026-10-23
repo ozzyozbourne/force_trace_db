@@ -9,6 +9,9 @@ pub mod lifecycle;
 pub mod memtable;
 pub mod normalize;
 pub mod pipeline;
+pub mod sink;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 pub mod version;
 pub mod wal;
 pub use pipeline::{IngestTasks, OpenReport, Pipeline};

@@ -2,8 +2,7 @@
 use crate::app::Forge;
 use forge_ingest::compact::{CompactCtx, run_next};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
-use forge_model::merge::Cancel;
-use forge_model::time::{Clock, now_ms, wall_clock};
+use forge_model::time::{Clock, Clocks, wall_clock};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -37,16 +36,18 @@ pub async fn start(f: Arc<Forge>) -> anyhow::Result<LifecycleTasks> {
 
 /// `data_clock`: retention cutoff and "hour closed/expired" (D10); everything else is the wall clock.
 pub async fn start_with(f: Arc<Forge>, data_clock: Clock) -> anyhow::Result<LifecycleTasks> {
-    let cx = Arc::new(CompactCtx {
-        meta: f.meta.clone(),
-        segments: f.segments.clone(),
-        cfg: f.config.compaction.clone(),
-        data_clock: data_clock.clone(),
-        next_project: Default::default(),
-        cancel: Cancel::new(),
-    });
+    let clocks = Clocks {
+        data: data_clock,
+        wall: wall_clock(),
+    };
+    let cx = Arc::new(CompactCtx::new(
+        f.meta.clone(),
+        f.segments.clone(),
+        f.config.compaction.clone(),
+        clocks,
+    ));
     let stop = CancellationToken::new();
-    let handle = tokio::spawn(run(f, cx.clone(), data_clock, stop.clone()));
+    let handle = tokio::spawn(run(f, cx.clone(), stop.clone()));
     Ok(LifecycleTasks { stop, cx, handle })
 }
 
@@ -70,7 +71,7 @@ async fn tick(t: &mut Option<tokio::time::Interval>) {
     }
 }
 
-async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, data_clock: Clock, stop: CancellationToken) {
+async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, stop: CancellationToken) {
     let c = f.config.compaction.clone();
     let mut jobs: JoinSet<()> = JoinSet::new();
     let mut compact_tick = ticker(c.interval, false);
@@ -92,9 +93,8 @@ async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, data_clock: Clock, stop: Cancel
                 }
             }
             _ = tick(&mut gc_tick) => {
-                let o = GcOptions { gc_grace: c.gc_grace, orphan_grace: c.orphan_grace, sweep_blobs: true, dry_run: false };
                 let store = f.segments.object_store();
-                match run_gc(f.meta.as_ref(), store.as_ref(), data_clock(), now_ms(), &o, Some(&blobs)).await {
+                match run_gc(f.meta.as_ref(), store.as_ref(), &cx.clocks, &GcOptions::from_config(&c), &blobs).await {
                     Ok(r) => tracing::info!(?r, "gc pass done"),
                     Err(e) => tracing::warn!(error = %e, "gc pass failed; retried next interval"),
                 }

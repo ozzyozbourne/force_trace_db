@@ -62,7 +62,7 @@ impl BlobGuard {
             let recent = self.recent.lock().unwrap();
             paths.into_iter().filter(|p| !recent.contains(p.as_ref())).collect()
         };
-        crate::lifecycle::delete_all(store, doomed.clone()).await?;
+        forge_storage::delete_all(store, doomed.clone()).await?;
         Ok(doomed)
     }
 }

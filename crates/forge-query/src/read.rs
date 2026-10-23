@@ -9,9 +9,8 @@ use arrow::array::{AsArray, RecordBatch};
 use arrow::compute::{concat_batches, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
 use forge_meta::{MetaResult, Metastore, SegmentFilter};
-use forge_model::catalog::{HourBucket, Level, SegmentMeta, TraceLocation};
+use forge_model::catalog::{Level, SegmentMeta, TraceLocation, trace_ranges_overlap};
 use forge_model::derived::with_effective_total_tokens;
-use forge_model::ids::ProjectId;
 use forge_model::ids::TraceId;
 use forge_model::merge::{Cancel, MERGE_COLUMNS, Tombstones, merge_projected};
 use forge_model::schema::{ALL_COLUMNS, col, col_idx, project_to};
@@ -82,22 +81,9 @@ pub(crate) fn needs_merge(parts: &[SegmentPart], mem_rows: bool) -> bool {
     if segs.iter().any(|s| s.level == Level::L0) {
         return true;
     }
-    segs.sort_by(|a, b| {
-        (&a.project_id, a.partition_hour, a.min_trace_id).cmp(&(&b.project_id, b.partition_hour, b.min_trace_id))
-    });
-    let mut run_max: Option<(&ProjectId, HourBucket, TraceId)> = None;
-    for s in segs {
-        match run_max {
-            Some((p, h, max)) if p == &s.project_id && h == s.partition_hour => {
-                if s.min_trace_id <= max {
-                    return true;
-                }
-                run_max = Some((p, h, max.max(s.max_trace_id)));
-            }
-            _ => run_max = Some((&s.project_id, s.partition_hour, s.max_trace_id)),
-        }
-    }
-    false
+    segs.sort_by(|a, b| (&a.project_id, a.partition_hour).cmp(&(&b.project_id, b.partition_hour)));
+    segs.chunk_by_mut(|a, b| (&a.project_id, a.partition_hour) == (&b.project_id, b.partition_hour))
+        .any(trace_ranges_overlap)
 }
 
 /// Fast paths: the merged rows of `batches` (tombstones dropped; only the tombstone filter when `!merge`), with
@@ -243,6 +229,7 @@ fn row_start(r: &RowSelection) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_model::catalog::HourBucket;
     use forge_model::schema::spans_schema;
     use forge_model::testing::{FixedMemtable, Rng, batch_from_rows, random_row};
 

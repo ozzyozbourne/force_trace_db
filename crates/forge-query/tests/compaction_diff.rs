@@ -5,6 +5,7 @@ mod common;
 
 use common::*;
 use datafusion::physical_plan::ExecutionPlan;
+use forge_ingest::blob::BlobGuard;
 use forge_ingest::compact::{CompactCtx, compact_project};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
 use forge_meta::SegmentFilter;
@@ -12,10 +13,10 @@ use forge_model::catalog::{HourBucket, Level};
 use forge_model::config::QueryConfig;
 use forge_model::dotted::depth;
 use forge_model::ids::{ProjectId, TraceId};
-use forge_model::merge::Cancel;
 use forge_model::row::SpanRow;
 use forge_model::schema::{ALL_COLUMNS, col};
 use forge_model::testing::{RowKey, ref_dotted, ref_tree, reference_merge, row_key};
+use forge_model::time::Clocks;
 use forge_query::QueryEngine;
 use forge_query::runs::{RunsParams, RunsRequest};
 use forge_query::trace::TraceFormat;
@@ -164,14 +165,7 @@ async fn compact_and_gc_change_no_result() {
         let inputs = fx.meta.list_segments(&SegmentFilter::default()).await.unwrap();
         assert!(inputs.iter().all(|s| s.level == Level::L0));
         assert!(inputs.iter().map(|s| s.byte_size).sum::<u64>() < 512 << 20, "{ctx}");
-        let cx = CompactCtx {
-            meta: fx.meta.clone(),
-            segments: fx.store.clone(),
-            cfg: Default::default(),
-            data_clock: forge_model::time::wall_clock(),
-            next_project: Default::default(),
-            cancel: Cancel::new(),
-        };
+        let cx = CompactCtx::new(fx.meta.clone(), fx.store.clone(), Default::default(), Clocks::wall());
         for p in fx.meta.list_projects().await.unwrap() {
             let s = compact_project(&cx, &p.id).await.unwrap();
             assert!(s.failed.is_empty() && !s.capped && s.skipped == 0, "{ctx}: {s:?}");
@@ -183,9 +177,15 @@ async fn compact_and_gc_change_no_result() {
             dry_run: false,
         };
         let now = forge_model::time::now_ms() + 1;
-        run_gc(fx.meta.as_ref(), fx.store.object_store().as_ref(), now, now, &o, None)
-            .await
-            .unwrap();
+        run_gc(
+            fx.meta.as_ref(),
+            fx.store.object_store().as_ref(),
+            &Clocks::at(now, now),
+            &o,
+            &BlobGuard::default(),
+        )
+        .await
+        .unwrap();
         let segs = fx
             .meta
             .list_segments(&SegmentFilter {

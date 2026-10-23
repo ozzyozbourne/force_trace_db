@@ -5,6 +5,7 @@
 //! retry: idempotent) -> release the frozen memtable from the view -> truncate the WAL.
 use crate::IngestError;
 use crate::memtable::{Frozen, MemtableSet};
+use crate::sink::SegmentSink;
 use crate::version::VersionAllocator;
 use crate::wal::WalLog;
 use forge_meta::{FlushCommit, Metastore, NewSegment};
@@ -13,7 +14,6 @@ use forge_model::failpoint;
 use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
 use forge_model::retry::{Backoff, retry};
 use forge_storage::{SegmentSpec, SegmentStore};
-use futures::StreamExt;
 use std::sync::Arc;
 
 /// Rows per batch handed to the segment writer (zero-copy slices; Vortex re-chunks anyway).
@@ -93,22 +93,24 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
                     .map(|o| b.slice(o, WRITE_BATCH_ROWS.min(b.num_rows() - o)))
             })
             .collect();
-        let w = retry("write_segment", cx.backoff, || {
+        let segment = retry("write_segment", cx.backoff, || {
             let spec = SegmentSpec {
                 id: SegmentId::new(),
                 project_id: project.clone(),
                 level: Level::L0,
                 partition_hour: hour,
             };
-            let stream = futures::stream::iter(chunks.clone().into_iter().map(Ok)).boxed();
-            cx.segments.write_segment(spec, stream)
+            let (store, chunks) = (cx.segments.clone(), &chunks);
+            async move {
+                let mut sink = SegmentSink::open(store, spec)?;
+                for c in chunks {
+                    sink.push(c.clone()).await?;
+                }
+                sink.finish().await
+            }
         })
         .await;
-        written.push(NewSegment {
-            meta: w.meta,
-            traces: w.traces,
-            blobs: forge_model::blob::blob_refs_in(&rows),
-        });
+        written.push(segment);
     }
     failpoint::hit("flush_after_upload");
 

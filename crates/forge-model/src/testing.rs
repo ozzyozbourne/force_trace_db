@@ -94,6 +94,19 @@ impl Rng {
     }
 }
 
+/// An agent-shaped span tree (perf.rs, soak.rs): span `i`'s parent is among the previous 8 spans, and depth
+/// stays <= 10 (a too-deep pick becomes span 0). Call once per span, in order; `depth` holds every span's depth.
+pub fn agent_parent(r: &mut Rng, depth: &mut [u32], i: u64) -> Option<u64> {
+    (i > 0).then(|| {
+        let mut p = i - 1 - r.below(i.min(8));
+        if depth[p as usize] >= 9 {
+            p = 0;
+        }
+        depth[i as usize] = depth[p as usize] + 1;
+        p
+    })
+}
+
 pub fn tid(n: u64) -> TraceId {
     let mut b = [0u8; 16];
     b[8..].copy_from_slice(&n.to_be_bytes());

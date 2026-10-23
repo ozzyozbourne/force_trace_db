@@ -54,6 +54,27 @@ pub fn file_url_path(url: &str) -> StorageResult<PathBuf> {
     }
 }
 
+/// `delete_stream` over `paths` (S3 batches 1000 per request, Azure 256, local/GCS 10 concurrent single deletes).
+/// NotFound is success and does not stop the stream: local/GCS/Azure report a missing object, S3 does not.
+/// Returns the number reported deleted.
+pub async fn delete_all(store: &dyn ObjectStore, paths: Vec<object_store::path::Path>) -> object_store::Result<usize> {
+    use futures::StreamExt;
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let input = futures::stream::iter(paths.into_iter().map(Ok)).boxed();
+    let mut out = store.delete_stream(input);
+    let mut n = 0;
+    while let Some(r) = out.next().await {
+        match r {
+            Ok(_) => n += 1,
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 // ---- DurableLocalFs: fsyncs `put_opts` objects (LocalFileSystem does not) ----
 use async_trait::async_trait;
 use futures::stream::BoxStream;

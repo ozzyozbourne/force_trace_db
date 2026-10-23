@@ -49,6 +49,14 @@ impl Level {
     }
 }
 
+/// Nanoseconds per day (retention).
+pub const DAY_NS: i64 = 86_400 * 1_000_000_000;
+
+/// Retention cutoff on the data clock (plans/phase-4 D10): data older than `retention_days` before `data_now_ns`.
+pub fn retention_cutoff_ns(retention_days: u32, data_now_ns: i64) -> i64 {
+    data_now_ns.saturating_sub(i64::from(retention_days).saturating_mul(DAY_NS))
+}
+
 /// Hours since the Unix epoch (UTC). L1: the (project, hour) partition. L0: hour of the flush
 /// (path placement only; pruning uses min/max_start_ns).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,6 +72,11 @@ impl HourBucket {
         self.0
             .checked_mul(Self::NANOS)
             .ok_or(ModelError::HourOutOfRange(self.0))
+    }
+    /// Retention: the whole hour ends at or before `cutoff_ns` (the L1 rule of `SegmentMeta::expires`, the
+    /// picker's "expired hour" and forge-meta's expire SQL).
+    pub fn expired_by(self, cutoff_ns: i64) -> bool {
+        self.0 < cutoff_ns.div_euclid(Self::NANOS)
     }
     /// `yyyy-mm-dd/hh` (object layout).
     pub fn path_component(self) -> Result<String, ModelError> {
@@ -141,9 +154,15 @@ impl SegmentMeta {
     /// same rule (pinned by a test); it also skips an L1 hour that has a compacting segment.
     pub fn expires(&self, cutoff_ns: i64) -> bool {
         match self.level {
-            Level::L1 => self.partition_hour.0 < cutoff_ns.div_euclid(HourBucket::NANOS),
+            Level::L1 => self.partition_hour.expired_by(cutoff_ns),
             Level::L0 => self.start_time_nulls == 0 && self.max_start_ns.is_some_and(|m| m < cutoff_ns),
         }
+    }
+
+    /// An L1 orphan run: its rows have a null start_time (compaction writes every L1 output either all null-start
+    /// or all non-null-start, D3).
+    pub fn is_orphan_run(&self) -> bool {
+        self.start_time_nulls > 0
     }
 
     /// Conservative: true unless the segment provably has no row with start_time in [start, end).
@@ -156,6 +175,13 @@ impl SegmentMeta {
         };
         start_ns.is_none_or(|s| hi >= s) && end_ns.is_none_or(|e| lo < e)
     }
+}
+
+/// Some two of `segs` have intersecting `[min_trace_id, max_trace_id]` ranges (touching counts). The picker's
+/// kind-B trigger and the read path's merge-skip both use it, per (project, hour) (invariant 10). Sorts `segs`.
+pub fn trace_ranges_overlap(segs: &mut [&SegmentMeta]) -> bool {
+    segs.sort_by_key(|s| s.min_trace_id);
+    segs.windows(2).any(|w| w[1].min_trace_id <= w[0].max_trace_id)
 }
 
 /// A trace's contiguous rows inside one segment (rows are sorted by trace).
@@ -194,6 +220,19 @@ pub mod paths {
     }
     pub fn fts_path(segment_path: &str) -> String {
         format!("{}.fts", segment_path.strip_suffix(".vortex").unwrap_or(segment_path))
+    }
+    /// Every object of the segment at `segment_path` (`.vortex`, then the `.fts` sidecar, which may not exist).
+    pub fn segment_objects(segment_path: &str) -> [String; 2] {
+        [segment_path.to_string(), fts_path(segment_path)]
+    }
+    /// The `.vortex` path of the segment an object key belongs to (the inverse of `segment_objects`); None for
+    /// keys that are not segment objects.
+    pub fn owning_segment(key: &str) -> Option<String> {
+        if key.ends_with(".vortex") {
+            Some(key.to_string())
+        } else {
+            key.strip_suffix(".fts").map(|s| format!("{s}.vortex"))
+        }
     }
     pub fn blob_path(p: &ProjectId, sha256_hex: &str) -> String {
         format!("blobs/{p}/{sha256_hex}")
@@ -275,6 +314,10 @@ mod tests {
             paths::fts_path(&path),
             "segments/p/L1/1970-01-01/00/01JAAAAAAAAAAAAAAAAAAAAAAA.fts"
         );
+        for o in paths::segment_objects(&path) {
+            assert_eq!(paths::owning_segment(&o).as_deref(), Some(path.as_str()));
+        }
+        assert_eq!(paths::owning_segment("segments/p/x.tmp"), None);
         for l in [Level::L0, Level::L1] {
             assert_eq!(Level::from_u8(l.as_u8()), Some(l));
         }

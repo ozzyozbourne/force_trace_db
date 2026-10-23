@@ -13,7 +13,9 @@ pub mod inspect;
 pub mod segment;
 pub mod store;
 pub use segment::VortexSegmentStore;
-pub use store::{BuiltStore, DurableLocalFs, build_object_store, file_url_path};
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
+pub use store::{BuiltStore, DurableLocalFs, build_object_store, delete_all, file_url_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {

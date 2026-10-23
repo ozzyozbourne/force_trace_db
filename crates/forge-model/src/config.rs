@@ -142,6 +142,14 @@ pub struct CompactionConfig {
     pub orphan_grace: Duration,
 }
 
+impl CompactionConfig {
+    /// D15: a compaction job older than this cannot commit, so the orphan sweep (`orphan_grace` = 2 x this) never
+    /// deletes an upload that is about to be committed.
+    pub fn commit_max_age(&self) -> Duration {
+        self.orphan_grace / 2
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueryConfig {

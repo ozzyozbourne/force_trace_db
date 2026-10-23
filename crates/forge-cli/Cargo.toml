@@ -26,6 +26,7 @@ forge-ingest.workspace = true
 humantime-serde.workspace = true
 
 [dev-dependencies]
+forge-ingest = { workspace = true, features = ["test-util"] }
 forge-storage.workspace = true
 prost.workspace = true
 futures.workspace = true

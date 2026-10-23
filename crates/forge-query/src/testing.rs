@@ -1,59 +1,19 @@
-//! Test wrappers around the metastore and the segment store, and a hand-made L0 flush (used by forge-query and
-//! forge-server tests; feature `test-util`).
-use arrow::record_batch::RecordBatch;
+//! Test wrappers around the metastore, plus re-exports of the segment-store wrappers and the hand-made L0 flush
+//! (used by forge-query and forge-server tests; feature `test-util`).
 use async_trait::async_trait;
+pub use forge_ingest::testing::write_flush;
 use forge_meta::{
-    CompactionCommit, CompactionJob, FlushCommit, JobRequest, MetaResult, Metastore, NewSegment, Project,
-    SegmentFilter, WalCheckpoint,
+    CompactionCommit, CompactionJob, FlushCommit, JobRequest, MetaError, MetaResult, Metastore, Project, SegmentFilter,
+    WalCheckpoint,
 };
-use forge_model::catalog::{HourBucket, JobStatus, Level, SegmentId, SegmentMeta, TraceLocation, TraceRange};
+use forge_model::catalog::{JobStatus, SegmentId, SegmentMeta, TraceLocation, TraceRange};
 use forge_model::ids::{ProjectId, TraceId};
-use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
-use forge_storage::{BatchStream, ScanRequest, SegmentSpec, SegmentStore, StorageResult, WrittenSegment};
+pub use forge_storage::testing::{HookedSegmentStore, RecordingSegmentStore, memory_store};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// One L0 flush of `batch` (spans_schema rows, versions already assigned): merge (Keep) -> one segment per project
-/// (chunks of at most `max_chunk` bytes) -> one metastore commit.
-pub async fn write_flush(
-    meta: &dyn Metastore,
-    store: &dyn SegmentStore,
-    batch: &RecordBatch,
-    hour: HourBucket,
-    max_chunk: usize,
-    seq: u64,
-    max_version: u64,
-) {
-    let mut segments = Vec::new();
-    if batch.num_rows() > 0 {
-        let merged = merge_versions_chunked(std::slice::from_ref(batch), Tombstones::Keep, max_chunk).unwrap();
-        for (p, batches) in split_chunks_by_project(&merged).unwrap() {
-            let spec = SegmentSpec {
-                id: SegmentId::new(),
-                project_id: p,
-                level: Level::L0,
-                partition_hour: hour,
-            };
-            let blobs = forge_model::blob::blob_refs_in(&batches);
-            let s = futures::stream::iter(batches.into_iter().map(Ok));
-            let w = store.write_segment(spec, Box::pin(s)).await.unwrap();
-            segments.push(NewSegment {
-                meta: w.meta,
-                traces: w.traces,
-                blobs,
-            });
-        }
-    }
-    let c = FlushCommit {
-        node_id: "test".into(),
-        segments,
-        flushed_wal_seq: seq,
-        max_version,
-    };
-    meta.commit_flush(c).await.unwrap();
-}
 
 type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -62,11 +22,10 @@ type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 pub struct HookedMetastore {
     inner: Arc<dyn Metastore>,
     hook: Hook,
-    /// `commit_compaction`: (run the real commit?, map its result to what the caller sees).
-    commit: Option<(bool, CommitHook)>,
+    /// `commit_compaction`: (run the real commit first?, the error every call returns).
+    commit: Option<(bool, fn() -> MetaError)>,
+    commit_calls: AtomicUsize,
 }
-
-pub type CommitHook = Box<dyn Fn(MetaResult<()>) -> MetaResult<()> + Send + Sync>;
 
 impl std::fmt::Debug for HookedMetastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +40,7 @@ impl HookedMetastore {
             inner,
             hook: Box::new(move || Box::pin(tokio::time::sleep(d))),
             commit: None,
+            commit_calls: AtomicUsize::new(0),
         }
     }
     /// The FIRST read runs `f` (e.g. a flush that commits and releases a memtable) before returning its
@@ -95,16 +55,22 @@ impl HookedMetastore {
             inner,
             hook,
             commit: None,
+            commit_calls: AtomicUsize::new(0),
         }
     }
-    /// Every `commit_compaction` runs the real commit if `land`, then returns `f(result)` (e.g. an error after a
-    /// commit that landed; plans/phase-4 D7).
-    pub fn on_commit(inner: Arc<dyn Metastore>, land: bool, f: CommitHook) -> Self {
+    /// Every `commit_compaction` runs the real commit if `land` (its result is ignored), then returns `err()`
+    /// (e.g. an error after a commit that landed; plans/phase-4 D7).
+    pub fn on_commit(inner: Arc<dyn Metastore>, land: bool, err: fn() -> MetaError) -> Self {
         Self {
             inner,
             hook: Box::new(|| Box::pin(async {})),
-            commit: Some((land, f)),
+            commit: Some((land, err)),
+            commit_calls: AtomicUsize::new(0),
         }
+    }
+    /// `commit_compaction` calls so far.
+    pub fn commit_calls(&self) -> usize {
+        self.commit_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -156,6 +122,9 @@ impl Metastore for HookedMetastore {
     async fn expire_segments(&self, p: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
         self.inner.expire_segments(p, cutoff_ns, max_hours).await
     }
+    async fn expire_candidates(&self, p: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
+        self.inner.expire_candidates(p, cutoff_ns, max_hours).await
+    }
     async fn purge_candidates(&self, before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>> {
         self.inner.purge_candidates(before_ms, limit).await
     }
@@ -169,14 +138,13 @@ impl Metastore for HookedMetastore {
         self.inner.begin_compaction(r).await
     }
     async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
-        match &self.commit {
-            Some((land, f)) => {
-                let r = if *land {
-                    self.inner.commit_compaction(c).await
-                } else {
-                    Ok(())
-                };
-                f(r)
+        self.commit_calls.fetch_add(1, Ordering::SeqCst);
+        match self.commit {
+            Some((land, err)) => {
+                if land {
+                    let _ = self.inner.commit_compaction(c).await;
+                }
+                Err(err())
             }
             None => self.inner.commit_compaction(c).await,
         }
@@ -198,54 +166,5 @@ impl Metastore for HookedMetastore {
     }
     async fn blob_refs(&self, p: &ProjectId) -> MetaResult<std::collections::HashSet<String>> {
         self.inner.blob_refs(p).await
-    }
-}
-
-/// Delegates to `inner`, records every scan's projection, and optionally sleeps before each scan.
-#[derive(Debug)]
-pub struct RecordingSegmentStore {
-    inner: Arc<dyn SegmentStore>,
-    delay: Duration,
-    projections: Mutex<Vec<Vec<&'static str>>>,
-}
-
-impl RecordingSegmentStore {
-    pub fn new(inner: Arc<dyn SegmentStore>) -> Self {
-        Self {
-            inner,
-            delay: Duration::ZERO,
-            projections: Mutex::default(),
-        }
-    }
-    pub fn slow(inner: Arc<dyn SegmentStore>, delay: Duration) -> Self {
-        Self {
-            delay,
-            ..Self::new(inner)
-        }
-    }
-    /// The projections scanned since the last call (None = all columns).
-    pub fn take_projections(&self) -> Vec<Vec<&'static str>> {
-        std::mem::take(&mut self.projections.lock().unwrap())
-    }
-}
-
-#[async_trait]
-impl SegmentStore for RecordingSegmentStore {
-    async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
-        self.inner.write_segment(spec, rows).await
-    }
-    async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream> {
-        let cols = req
-            .projection
-            .clone()
-            .unwrap_or_else(|| forge_model::schema::ALL_COLUMNS.to_vec());
-        self.projections.lock().unwrap().push(cols);
-        if !self.delay.is_zero() {
-            tokio::time::sleep(self.delay).await;
-        }
-        self.inner.scan(seg, req).await
-    }
-    fn object_store(&self) -> Arc<dyn object_store::ObjectStore> {
-        self.inner.object_store()
     }
 }

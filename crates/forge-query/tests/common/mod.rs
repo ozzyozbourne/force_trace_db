@@ -99,7 +99,17 @@ impl Fixture {
             max_version += f.len() as u64;
             let b = batch_from_rows(f);
             let hour = HourBucket::from_nanos(BASE);
-            write_flush(&*meta, &*store, &b, hour, 64 << 10, i as u64 + 1, max_version).await;
+            write_flush(
+                &*meta,
+                store.clone(),
+                &b,
+                hour,
+                "test",
+                64 << 10,
+                i as u64 + 1,
+                max_version,
+            )
+            .await;
         }
         let mut mem: Vec<RecordBatch> = layout
             .mem

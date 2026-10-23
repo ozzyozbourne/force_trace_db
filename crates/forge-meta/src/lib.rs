@@ -105,6 +105,12 @@ impl Project {
             created_at_ms,
         })
     }
+
+    /// The retention cutoff at `data_now_ns` (`forge_model::catalog::retention_cutoff_ns`); None = keep forever.
+    pub fn retention_cutoff_ns(&self, data_now_ns: i64) -> Option<i64> {
+        self.retention_days
+            .map(|d| forge_model::catalog::retention_cutoff_ns(d, data_now_ns))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +232,13 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
         cutoff_ns: i64,
         max_hours: usize,
     ) -> MetaResult<Vec<SegmentMeta>>;
+    /// What `expire_segments` would mark now, without marking (the same SELECT; `forge gc --dry-run`).
+    async fn expire_candidates(
+        &self,
+        project: &ProjectId,
+        cutoff_ns: i64,
+        max_hours: usize,
+    ) -> MetaResult<Vec<SegmentMeta>>;
     /// Deleted segments with `deleted_at_ms < deleted_before_ms`, oldest deletion first, at most `limit`.
     async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>>;
     /// Removes the rows of DELETED segments (others in `ids` are ignored): their trace_index rows in short txns of
@@ -243,6 +256,7 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     // ---- compaction (M3; one process per data dir, plans/phase-4 D2) ----
 
     /// One IMMEDIATE txn. None when the D1 rules fail or an input is not live; nothing is written then.
+    /// `InvalidInput` for no inputs or more than `MAX_JOB_INPUTS`.
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>>;
     /// The atomic swap (D6). Ok if the job is already done (idempotent retry). Conflict if it is failed, or older
     /// than `max_age_ms`.
@@ -256,6 +270,9 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     /// Deletes done/failed jobs finished before `finished_before_ms`.
     async fn prune_compaction_jobs(&self, finished_before_ms: i64) -> MetaResult<usize>;
 }
+
+/// Most inputs `begin_compaction` accepts. The picker's own caps (forge-ingest `MAX_INPUTS`) must stay within it.
+pub const MAX_JOB_INPUTS: usize = 64;
 
 /// `forget_segments` deletes trace_index rows in txns of this many rows, so a flush commit never waits behind
 /// one huge delete (an hour's L1 segment holds ~720k trace rows at 200 traces/s).

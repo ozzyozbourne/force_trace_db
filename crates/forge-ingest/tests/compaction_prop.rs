@@ -5,25 +5,25 @@
 //!
 //! Default: 8 seeds in 4 shards. `FORGE_PROP_SEEDS=N` (400 in quick-release), `FORGE_PROP_SEED=s` (one seed).
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
+use forge_ingest::blob::BlobGuard;
 use forge_ingest::compact::{CompactCtx, JobReport, job, pick};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
-use forge_meta::{CompactionJob, FlushCommit, JobRequest, Metastore, NewSegment, SegmentFilter, SqliteMetastore};
+use forge_ingest::testing::write_flush;
+use forge_meta::{CompactionJob, JobRequest, Metastore, SegmentFilter, SqliteMetastore};
 use forge_model::blob::{blob_ref, blob_refs_in};
 use forge_model::catalog::{HourBucket, JobKind, Level, SegmentId, SegmentMeta, SegmentState};
-use forge_model::config::{CompactionConfig, StorageConfig};
+use forge_model::config::CompactionConfig;
 use forge_model::dotted::{SEGMENT_LEN, depth};
 use forge_model::ids::{SpanId, TraceId};
-use forge_model::merge::{Cancel, Tombstones, merge_versions};
+use forge_model::merge::{Tombstones, merge_versions};
 use forge_model::row::SpanRow;
 use forge_model::testing::{
     Parent, Rng, RowKey, batch_from_rows, random_row, ref_dotted, reference_merge, row_key, rows_from_batch,
     tree_parents,
 };
-use forge_storage::{
-    BatchStream, ScanRequest, SegmentSpec, SegmentStore, StorageResult, VortexSegmentStore, WrittenSegment,
-    build_object_store,
-};
+use forge_model::time::Clocks;
+use forge_storage::testing::{HookedSegmentStore, memory_store};
+use forge_storage::{ScanRequest, SegmentSpec, SegmentStore};
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -42,30 +42,22 @@ const MAX_POSTS: u64 = 120;
 // ---------------------------------------------------------------------------------------------------------------
 // A segment store whose writes into some hours are slowed (varies the commit order of concurrent jobs, step e).
 
-#[derive(Debug)]
-struct DelayStore {
-    inner: Arc<dyn SegmentStore>,
-    /// (hour, slow inside the hour?): writes with (partition_hour == hour) == slow_inside sleep.
-    delay: Mutex<Option<(HourBucket, bool)>>,
-}
+/// (hour, slow inside the hour?): writes with (partition_hour == hour) == slow_inside sleep.
+type Delay = Arc<Mutex<Option<(HourBucket, bool)>>>;
 
-#[async_trait]
-impl SegmentStore for DelayStore {
-    async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
-        let d = *self.delay.lock().unwrap();
-        if let Some((h, inside)) = d
-            && (spec.partition_hour == h) == inside
-        {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        self.inner.write_segment(spec, rows).await
-    }
-    async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream> {
-        self.inner.scan(seg, req).await
-    }
-    fn object_store(&self) -> Arc<dyn ObjectStore> {
-        self.inner.object_store()
-    }
+fn delay_store(inner: Arc<dyn SegmentStore>, delay: Delay) -> Arc<dyn SegmentStore> {
+    Arc::new(HookedSegmentStore::new(
+        inner,
+        Box::new(move |spec| {
+            let slow = matches!(*delay.lock().unwrap(), Some((h, inside)) if (spec.partition_hour == h) == inside);
+            Box::pin(async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                Ok(())
+            })
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -175,7 +167,7 @@ struct World {
     _dir: tempfile::TempDir,
     meta: Arc<dyn Metastore>,
     raw: rusqlite::Connection,
-    delay: Arc<DelayStore>,
+    delay: Delay,
     store: Arc<dyn SegmentStore>,
     posts: Vec<SpanRow>,
     mem: Vec<SpanRow>,
@@ -200,21 +192,12 @@ fn key_of(k: &RowKey) -> String {
     format!("{}/{}/{}", k.0, k.1, k.2)
 }
 
-/// Groups of one hour's segments: by min_version, overlapping [min, max] version intervals merged. Oldest first.
+/// `pick::groups` as segment ids.
 fn groups(segs: &[&SegmentMeta]) -> Vec<Vec<SegmentId>> {
-    let mut v: Vec<&&SegmentMeta> = segs.iter().collect();
-    v.sort_by_key(|s| s.min_version);
-    let mut out: Vec<(u64, Vec<SegmentId>)> = Vec::new();
-    for s in v {
-        match out.last_mut() {
-            Some((hi, g)) if s.min_version <= *hi => {
-                *hi = (*hi).max(s.max_version);
-                g.push(s.id);
-            }
-            _ => out.push((s.max_version, vec![s.id])),
-        }
-    }
-    out.into_iter().map(|x| x.1).collect()
+    pick::groups(segs)
+        .into_iter()
+        .map(|g| g.iter().map(|s| s.id).collect())
+        .collect()
 }
 
 /// State read before a job begins (placement and dotted oracles).
@@ -230,22 +213,13 @@ impl World {
         let path = dir.path().join("meta.db");
         let meta: Arc<dyn Metastore> = Arc::new(SqliteMetastore::open_path(&path).unwrap());
         let raw = rusqlite::Connection::open(&path).unwrap();
-        let inner: Arc<dyn SegmentStore> = Arc::new(VortexSegmentStore::new(
-            build_object_store(&StorageConfig {
-                url: "memory://".into(),
-            })
-            .unwrap(),
-        ));
-        let delay = Arc::new(DelayStore {
-            inner,
-            delay: Mutex::new(None),
-        });
+        let delay = Delay::default();
         Self {
             seed,
             _dir: dir,
             meta,
             raw,
-            store: delay.clone(),
+            store: delay_store(memory_store(), delay.clone()),
             delay,
             posts: Vec::new(),
             mem: Vec::new(),
@@ -257,14 +231,7 @@ impl World {
     }
 
     fn ctx(&self, cfg: CompactionConfig) -> CompactCtx {
-        CompactCtx {
-            meta: self.meta.clone(),
-            segments: self.store.clone(),
-            cfg,
-            data_clock: forge_model::time::wall_clock(),
-            next_project: Default::default(),
-            cancel: Cancel::new(),
-        }
+        CompactCtx::new(self.meta.clone(), self.store.clone(), cfg, Clocks::wall())
     }
 
     /// One L0 per project of the unflushed rows, one commit (like the real flush). Blobs of the flushed rows are
@@ -276,53 +243,27 @@ impl World {
         self.seq += 1;
         let hour = HourBucket(BASE_H + self.flushes % 4);
         self.flushes += 1;
-        let mut segments = Vec::new();
-        for p in PROJECTS {
-            let rows: Vec<SpanRow> = self
-                .mem
-                .iter()
-                .filter(|r| r.project_id.as_ref().unwrap().as_str() == p)
-                .cloned()
-                .collect();
-            if rows.is_empty() {
-                continue;
-            }
-            let merged = merge_versions(&[batch_from_rows(&rows)], Tombstones::Keep).unwrap();
-            let blobs = blob_refs_in(std::slice::from_ref(&merged));
-            for b in &blobs {
-                let opts = PutOptions::from(PutMode::Create);
-                let _ = self
-                    .store
-                    .object_store()
-                    .put_opts(&Path::from(b.as_str()), b"blob".to_vec().into(), opts)
-                    .await;
-            }
-            let spec = SegmentSpec {
-                id: SegmentId::new(),
-                project_id: forge_model::testing::pid(p),
-                level: Level::L0,
-                partition_hour: hour,
-            };
-            let w = self
+        let merged = merge_versions(&[batch_from_rows(&self.mem)], Tombstones::Keep).unwrap();
+        for b in blob_refs_in(std::slice::from_ref(&merged)) {
+            let opts = PutOptions::from(PutMode::Create);
+            let _ = self
                 .store
-                .write_segment(spec, Box::pin(futures::stream::iter([Ok(merged)])))
-                .await
-                .unwrap();
-            segments.push(NewSegment {
-                meta: w.meta,
-                traces: w.traces,
-                blobs,
-            });
+                .object_store()
+                .put_opts(&Path::from(b.as_str()), b"blob".to_vec().into(), opts)
+                .await;
         }
-        self.meta
-            .commit_flush(FlushCommit {
-                node_id: "n".into(),
-                segments,
-                flushed_wal_seq: self.seq,
-                max_version: self.posts.iter().map(|r| r.version).max().unwrap_or(0),
-            })
-            .await
-            .unwrap();
+        let max_version = self.posts.iter().map(|r| r.version).max().unwrap_or(0);
+        write_flush(
+            self.meta.as_ref(),
+            self.store.clone(),
+            &merged,
+            hour,
+            "n",
+            1 << 30,
+            self.seq,
+            max_version,
+        )
+        .await;
         self.mem.clear();
     }
 
@@ -774,9 +715,15 @@ impl World {
         };
         let now = forge_model::time::now_ms() + 1;
         let os = self.store.object_store();
-        run_gc(self.meta.as_ref(), os.as_ref(), now, now, &o, None)
-            .await
-            .unwrap();
+        run_gc(
+            self.meta.as_ref(),
+            os.as_ref(),
+            &Clocks::at(now, now),
+            &o,
+            &BlobGuard::default(),
+        )
+        .await
+        .unwrap();
         self.cov.bump("gc_passes", 1);
         for s in self.visible(None).await {
             for path in blob_refs_in(&scan(self.store.as_ref(), &s).await) {
@@ -838,11 +785,11 @@ impl World {
             }
             self.flush().await;
         }
-        *self.delay.lock_delay() = Some((hour, r.chance(50)));
+        *self.delay.lock().unwrap() = Some((hour, r.chance(50)));
         let (cfg_a, cfg_b) = (random_cfg(r, 4), random_cfg(r, 4));
         let (cxa, cxb) = (self.ctx(cfg_a), self.ctx(cfg_b));
         let (ra, rb) = tokio::join!(job::run_job(&cxa, ja), job::run_job(&cxb, jb));
-        *self.delay.lock_delay() = None;
+        *self.delay.lock().unwrap() = None;
         let (ra, rb) = (
             ra.unwrap_or_else(|e| panic!("seed {seed}: kind A failed: {e}")),
             rb.unwrap_or_else(|e| panic!("seed {seed}: kind B failed: {e}")),
@@ -854,12 +801,6 @@ impl World {
             .bump("b_committed_first", u64::from(rb.elapsed_ms < ra.elapsed_ms));
         self.check_outputs(&before, None, fallback).await;
         self.check().await;
-    }
-}
-
-impl DelayStore {
-    fn lock_delay(&self) -> std::sync::MutexGuard<'_, Option<(HourBucket, bool)>> {
-        self.delay.lock().unwrap()
     }
 }
 
@@ -934,12 +875,7 @@ async fn history(seed: u64) -> Cov {
 
 /// One 1-row L1 is far below the 4 MiB fold arm's limit (target / 2): folds can happen (RT #4).
 async fn assert_precondition() {
-    let store = VortexSegmentStore::new(
-        build_object_store(&StorageConfig {
-            url: "memory://".into(),
-        })
-        .unwrap(),
-    );
+    let store = memory_store();
     let row = random_row(&mut Rng(1), "p", 1, 1, 1);
     let spec = SegmentSpec {
         id: SegmentId::new(),

@@ -8,9 +8,12 @@
 //!   older than `orphan_grace` (object last_modified).
 use crate::blob::BlobGuard;
 use forge_meta::{MetaError, Metastore};
-use forge_model::catalog::{Level, SegmentMeta, SegmentState, paths};
+use forge_model::catalog::{Level, SegmentMeta, paths, retention_cutoff_ns};
+use forge_model::config::CompactionConfig;
 use forge_model::ids::ProjectId;
-use futures::{StreamExt, TryStreamExt};
+use forge_model::time::Clocks;
+use forge_storage::delete_all;
+use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::collections::HashSet;
@@ -20,7 +23,6 @@ use std::time::Duration;
 pub const BATCH: usize = 1000;
 /// Blobs deleted per write-lock hold of the `BlobGuard` (no HEAD under the lock; RA m11).
 pub const BLOB_CHUNK: usize = 64;
-const DAY_NS: i64 = 86_400 * 1_000_000_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
@@ -43,6 +45,18 @@ pub struct GcOptions {
     pub dry_run: bool,
 }
 
+impl GcOptions {
+    /// The configured graces; blobs swept; not a dry run.
+    pub fn from_config(c: &CompactionConfig) -> Self {
+        Self {
+            gc_grace: c.gc_grace,
+            orphan_grace: c.orphan_grace,
+            sweep_blobs: true,
+            dry_run: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct GcReport {
     pub expired_segments: usize,
@@ -55,31 +69,15 @@ pub struct GcReport {
 }
 
 /// Retention (data clock): marks expired segments of every project with `retention_days` deleted
-/// (`Metastore::expire_segments`). Returns the count. Dry run: counts the candidates (`list_segments` +
-/// `SegmentMeta::expires`, skipping L1 hours with a compacting segment) without marking.
+/// (`Metastore::expire_segments`). Returns the count. Dry run: counts the same candidates
+/// (`Metastore::expire_candidates`) without marking.
 pub async fn expire(meta: &dyn Metastore, data_now_ms: i64, dry_run: bool) -> Result<usize, GcError> {
     let mut n = 0;
     for p in meta.list_projects().await? {
         let Some(days) = p.retention_days else { continue };
-        let cutoff = data_now_ms
-            .saturating_mul(1_000_000)
-            .saturating_sub(i64::from(days) * DAY_NS);
+        let cutoff = retention_cutoff_ns(days, data_now_ms.saturating_mul(1_000_000));
         if dry_run {
-            let f = forge_meta::SegmentFilter {
-                project_id: Some(p.id.clone()),
-                ..Default::default()
-            };
-            let segs = meta.list_segments(&f).await?;
-            let busy: HashSet<_> = segs
-                .iter()
-                .filter(|s| s.state == SegmentState::Compacting && s.level == Level::L1)
-                .map(|s| s.partition_hour)
-                .collect();
-            n += segs
-                .iter()
-                .filter(|s| s.state == SegmentState::Live && s.expires(cutoff))
-                .filter(|s| s.level == Level::L0 || !busy.contains(&s.partition_hour))
-                .count();
+            n += meta.expire_candidates(&p.id, cutoff, usize::MAX).await?.len();
             continue;
         }
         loop {
@@ -96,29 +94,9 @@ pub async fn expire(meta: &dyn Metastore, data_now_ms: i64, dry_run: bool) -> Re
     Ok(n)
 }
 
-/// Both objects of a segment (`.fts` may not exist: NotFound is success).
-fn segment_objects(s: &SegmentMeta) -> [Path; 2] {
-    [Path::from(s.path.as_str()), Path::from(paths::fts_path(&s.path))]
-}
-
-/// `delete_stream` over `paths` (S3 batches 1000 per request, Azure 256, local/GCS 10 concurrent single deletes).
-/// NotFound is success and does not stop the stream: local/GCS/Azure report a missing object, S3 does not.
-/// Returns the number reported deleted.
-pub async fn delete_all(store: &dyn ObjectStore, paths: Vec<Path>) -> Result<usize, object_store::Error> {
-    if paths.is_empty() {
-        return Ok(0);
-    }
-    let input = futures::stream::iter(paths.into_iter().map(Ok)).boxed();
-    let mut out = store.delete_stream(input);
-    let mut n = 0;
-    while let Some(r) = out.next().await {
-        match r {
-            Ok(_) => n += 1,
-            Err(object_store::Error::NotFound { .. }) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(n)
+/// Every object of a segment (`.fts` may not exist: NotFound is success).
+fn segment_objects(s: &SegmentMeta) -> impl Iterator<Item = Path> {
+    paths::segment_objects(&s.path).into_iter().map(Path::from)
 }
 
 /// Purge: objects of segments deleted before `now - gc_grace`, then their rows.
@@ -178,15 +156,6 @@ async fn old_objects(
         .await
 }
 
-/// The `.vortex` path a segment object belongs to; None for files that are not segment objects (kept).
-fn owning_segment(key: &str) -> Option<String> {
-    if key.ends_with(".vortex") {
-        Some(key.to_string())
-    } else {
-        key.strip_suffix(".fts").map(|s| format!("{s}.vortex"))
-    }
-}
-
 /// Orphan sweep. The listing comes first and the metastore read second: an object committed in between is in
 /// the known set; one committed later is younger than `orphan_grace` and was never a candidate.
 pub async fn sweep_orphans(
@@ -195,7 +164,7 @@ pub async fn sweep_orphans(
     now_ms: i64,
     o: &GcOptions,
     r: &mut GcReport,
-    blobs: Option<&BlobGuard>,
+    blobs: &BlobGuard,
 ) -> Result<(), GcError> {
     let cutoff = chrono::DateTime::from_timestamp_millis(now_ms.saturating_sub(o.orphan_grace.as_millis() as i64))
         .unwrap_or_default();
@@ -207,7 +176,7 @@ pub async fn sweep_orphans(
         let known: HashSet<String> = meta.segment_paths(&p).await?;
         let orphans: Vec<ObjectMeta> = old
             .into_iter()
-            .filter(|m| owning_segment(m.location.as_ref()).is_some_and(|s| !known.contains(&s)))
+            .filter(|m| paths::owning_segment(m.location.as_ref()).is_some_and(|s| !known.contains(&s)))
             .collect();
         r.orphan_segment_objects += orphans.len();
         r.freed_bytes += orphans.iter().map(|m| m.size).sum::<u64>();
@@ -221,9 +190,7 @@ pub async fn sweep_orphans(
     if !o.sweep_blobs {
         return Ok(());
     }
-    if let Some(g) = blobs {
-        g.clear_recent();
-    }
+    blobs.clear_recent();
     for p in projects_under(store, "blobs").await? {
         let old = old_objects(store, &format!("blobs/{p}"), cutoff).await?;
         if old.is_empty() {
@@ -247,13 +214,7 @@ pub async fn sweep_orphans(
         // Chunks under the guard's write lock, minus the paths a `put_blobs` touched since the sweep began.
         for chunk in doomed.chunks(BLOB_CHUNK) {
             let paths: Vec<Path> = chunk.iter().map(|m| m.location.clone()).collect();
-            let gone: HashSet<Path> = match blobs {
-                Some(g) => g.delete_unless_recent(store, paths).await?.into_iter().collect(),
-                None => {
-                    delete_all(store, paths.clone()).await?;
-                    paths.into_iter().collect()
-                }
-            };
+            let gone: HashSet<Path> = blobs.delete_unless_recent(store, paths).await?.into_iter().collect();
             let deleted: Vec<&ObjectMeta> = chunk.iter().filter(|m| gone.contains(&m.location)).collect();
             r.orphan_blobs += deleted.len();
             r.freed_bytes += deleted.iter().map(|m| m.size).sum::<u64>();
@@ -262,15 +223,18 @@ pub async fn sweep_orphans(
     Ok(())
 }
 
-/// One full pass: retention (data clock), purge and orphan sweep (wall clock), job pruning.
+/// One full pass: retention (data clock), purge and orphan sweep (wall clock), job pruning; each clock is read once.
+/// `blobs` guards the blob sweep against concurrent `put_blobs` (the server passes its pipeline's guard). Offline
+/// callers pass `&BlobGuard::default()`: they hold every WAL lock, so no other writer exists and the guard never
+/// filters anything.
 pub async fn run_gc(
     meta: &dyn Metastore,
     store: &dyn ObjectStore,
-    data_now_ms: i64,
-    wall_now_ms: i64,
+    clocks: &Clocks,
     o: &GcOptions,
-    blobs: Option<&BlobGuard>,
+    blobs: &BlobGuard,
 ) -> Result<GcReport, GcError> {
+    let (data_now_ms, wall_now_ms) = ((clocks.data)(), (clocks.wall)());
     let mut r = GcReport {
         expired_segments: expire(meta, data_now_ms, o.dry_run).await?,
         ..Default::default()

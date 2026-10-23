@@ -1,4 +1,4 @@
-//! Classify-driven retry with exponential backoff (today: the flush steps).
+//! Classify-driven retry with exponential backoff: unbounded (the flush steps) and bounded (the compaction commit).
 use crate::error::{Classify, ErrorKind};
 use std::time::Duration;
 
@@ -38,12 +38,35 @@ where
         match op().await {
             Ok(v) => return v,
             Err(e) if e.kind() == ErrorKind::Transient => {
-                tracing::warn!(what, attempt, error = %e, ?delay, "flush step failed (transient); retrying");
+                tracing::warn!(what, attempt, error = %e, ?delay, "{what} failed (transient); retrying");
             }
             Err(e) => {
                 delay = backoff.max;
-                tracing::error!(what, attempt, error = %e, ?delay, "flush step failed (non-transient); retrying; data is safe in the WAL");
+                tracing::error!(what, attempt, error = %e, ?delay, "{what} failed (non-transient); retrying; data is safe in the WAL");
             }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(backoff.max);
+        attempt += 1;
+    }
+}
+
+/// Runs `op` at most `attempts` times (at least once), retrying only Transient errors after the backoff delay
+/// (`initial`, doubling up to `max`). Returns the first Ok or the last error.
+pub async fn retry_bounded<T, E, F, Fut>(what: &str, backoff: Backoff, attempts: u32, mut op: F) -> Result<T, E>
+where
+    E: Classify,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut delay = backoff.initial;
+    let mut attempt = 1u32;
+    loop {
+        match op().await {
+            Err(e) if attempt < attempts && e.kind() == ErrorKind::Transient => {
+                tracing::warn!(what, attempt, error = %e, ?delay, "{what} failed (transient); retrying");
+            }
+            r => return r,
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(backoff.max);

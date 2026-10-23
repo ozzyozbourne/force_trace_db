@@ -1,21 +1,19 @@
 //! plans/phase-4 §6.5: focused compaction cases (B1 regression, slices, rotation and the writer cap, placement,
 //! fill, sticky, backfill, the upload-failure path). The commit-hook cases live in forge-query (HookedMetastore).
-use async_trait::async_trait;
 use forge_ingest::compact::{CompactCtx, compact_project, job};
-use forge_meta::{FlushCommit, JobRequest, Metastore, NewSegment, SegmentFilter, SqliteMetastore};
+use forge_ingest::testing::write_flush;
+use forge_meta::{JobRequest, Metastore, SegmentFilter, SqliteMetastore};
 use forge_model::blob::{blob_ref, blob_refs_in};
 use forge_model::catalog::{HourBucket, JobKind, Level, SegmentId, SegmentMeta, SegmentState};
-use forge_model::config::{CompactionConfig, StorageConfig};
+use forge_model::config::CompactionConfig;
 use forge_model::dotted::dotted_segment;
-use forge_model::merge::{Cancel, Tombstones, merge_versions};
+use forge_model::merge::{Tombstones, merge_versions};
 use forge_model::row::SpanRow;
 use forge_model::testing::{batch_from_rows, pid, rows_from_batch, sid, tid};
-use forge_storage::{
-    BatchStream, ScanRequest, SegmentSpec, SegmentStore, StorageError, StorageResult, VortexSegmentStore,
-    WrittenSegment, build_object_store,
-};
+use forge_model::time::Clocks;
+use forge_storage::testing::{HookedSegmentStore, memory_store};
+use forge_storage::{ScanRequest, SegmentStore, StorageError};
 use futures::TryStreamExt;
-use object_store::ObjectStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,94 +35,38 @@ fn row(trace: u64, span: u64, v: u64) -> SpanRow {
     }
 }
 
-/// Fails the `fail_at`-th write_segment (1-based); 0 = never.
-#[derive(Debug)]
-struct FailingStore {
-    inner: Arc<dyn SegmentStore>,
-    writes: AtomicUsize,
-    fail_at: usize,
-}
-
-#[async_trait]
-impl SegmentStore for FailingStore {
-    async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
-        if self.writes.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
-            return Err(StorageError::InvalidInput("injected upload failure".into()));
-        }
-        self.inner.write_segment(spec, rows).await
-    }
-    async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream> {
-        self.inner.scan(seg, req).await
-    }
-    fn object_store(&self) -> Arc<dyn ObjectStore> {
-        self.inner.object_store()
-    }
-}
-
 struct W {
     meta: Arc<dyn Metastore>,
-    store: Arc<FailingStore>,
+    store: Arc<dyn SegmentStore>,
     seq: u64,
 }
 
 impl W {
     fn new() -> Self {
-        let inner: Arc<dyn SegmentStore> = Arc::new(VortexSegmentStore::new(
-            build_object_store(&StorageConfig {
-                url: "memory://".into(),
-            })
-            .unwrap(),
-        ));
         Self {
             meta: Arc::new(SqliteMetastore::open_in_memory().unwrap()),
-            store: Arc::new(FailingStore {
-                inner,
-                writes: AtomicUsize::new(0),
-                fail_at: 0,
-            }),
+            store: memory_store(),
             seq: 0,
         }
     }
     fn cx(&self, cfg: CompactionConfig) -> CompactCtx {
-        CompactCtx {
-            meta: self.meta.clone(),
-            segments: self.store.clone(),
-            cfg,
-            data_clock: forge_model::time::wall_clock(),
-            next_project: Default::default(),
-            cancel: Cancel::new(),
-        }
+        CompactCtx::new(self.meta.clone(), self.store.clone(), cfg, Clocks::wall())
     }
     async fn flush(&mut self, rows: &[SpanRow]) -> SegmentId {
         self.seq += 1;
-        let merged = merge_versions(&[batch_from_rows(rows)], Tombstones::Keep).unwrap();
-        let blobs = blob_refs_in(std::slice::from_ref(&merged));
-        let spec = SegmentSpec {
-            id: SegmentId::new(),
-            project_id: pid("p"),
-            level: Level::L0,
-            partition_hour: HourBucket(H0 + 9),
-        };
-        let w = self
-            .store
-            .write_segment(spec, Box::pin(futures::stream::iter([Ok(merged)])))
-            .await
-            .unwrap();
-        let id = w.meta.id;
-        self.meta
-            .commit_flush(FlushCommit {
-                node_id: "n".into(),
-                segments: vec![NewSegment {
-                    meta: w.meta,
-                    traces: w.traces,
-                    blobs,
-                }],
-                flushed_wal_seq: self.seq,
-                max_version: 1_000_000,
-            })
-            .await
-            .unwrap();
-        id
+        let b = batch_from_rows(rows);
+        let segs = write_flush(
+            self.meta.as_ref(),
+            self.store.clone(),
+            &b,
+            HourBucket(H0 + 9),
+            "n",
+            1 << 30,
+            self.seq,
+            1_000_000,
+        )
+        .await;
+        segs[0].id
     }
     async fn segs(&self) -> Vec<SegmentMeta> {
         self.meta.list_segments(&SegmentFilter::default()).await.unwrap()
@@ -406,18 +348,27 @@ async fn upload_failure_deletes_uploads() {
         slice_bytes: bytesize::ByteSize::kib(1),
         ..Default::default()
     };
-    let store = Arc::new(FailingStore {
-        inner: w.store.inner.clone(),
-        writes: AtomicUsize::new(0),
-        fail_at: 3, // two outputs uploaded first
-    });
+    // The third write_segment fails: two outputs are uploaded first.
+    let writes = Arc::new(AtomicUsize::new(0));
+    let n = writes.clone();
+    let store = Arc::new(HookedSegmentStore::new(
+        w.store.clone(),
+        Box::new(move |_| {
+            let r = if n.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                Err(StorageError::InvalidInput("injected upload failure".into()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { r })
+        }),
+    ));
     let cx = CompactCtx {
-        segments: store.clone(),
+        segments: store,
         ..w.cx(cfg.clone())
     };
     let j = w.begin(JobKind::L0, vec![l0]).await;
     assert!(job::run_job(&cx, j).await.is_err());
-    assert!(store.writes.load(Ordering::SeqCst) >= 3);
+    assert!(writes.load(Ordering::SeqCst) >= 3);
     let segs = w.segs().await;
     assert!(
         segs.iter()
@@ -448,4 +399,51 @@ async fn upload_failure_deletes_uploads() {
             assert!(refs.contains(&path), "{path}");
         }
     }
+}
+
+/// The job's merge is byte-bounded and re-cut at trace boundaries: a 1-byte bound (every merged batch as small as
+/// possible) writes the same outputs, row for row, as the default bound.
+#[tokio::test]
+async fn tiny_merge_chunks_write_the_same_outputs() {
+    let starts: Vec<SpanRow> = (0..30)
+        .flat_map(|t| {
+            (0..4).map(move |s| SpanRow {
+                start_time_ns: Some(at(t as i64 % 3, s as i64)),
+                parent_span_id: (s > 0).then(|| sid(t * 10)),
+                ..row(t, t * 10 + s, t * 4 + s + 1)
+            })
+        })
+        .collect();
+    // Patches: newer versions of some spans, and spans whose start never arrives (orphan rows).
+    let patches: Vec<SpanRow> = (0..30)
+        .map(|t| SpanRow {
+            end_time_ns: Some(at(t as i64 % 3, 9)),
+            ..row(t, t * 10 + (t % 5), 1000 + t)
+        })
+        .collect();
+    let cfg = CompactionConfig {
+        slice_bytes: bytesize::ByteSize::kib(2),
+        ..Default::default()
+    };
+    let mut outputs = Vec::new();
+    for chunk_bytes in [None, Some(1)] {
+        let mut w = W::new();
+        let a = w.flush(&starts).await;
+        let b = w.flush(&patches).await;
+        let mut cx = w.cx(cfg.clone());
+        if let Some(n) = chunk_bytes {
+            cx.merge_chunk_bytes = n;
+        }
+        let j = w.begin(JobKind::L0, vec![a, b]).await;
+        let rep = job::run_job(&cx, j).await.unwrap();
+        assert!(rep.stats.slices > 1 && rep.stats.orphan_outputs > 0, "{rep:?}");
+        let mut l1 = w.l1().await;
+        l1.sort_by_key(|s| (s.partition_hour, s.is_orphan_run(), s.min_trace_id));
+        let mut out = Vec::new();
+        for s in &l1 {
+            out.push((s.partition_hour, s.is_orphan_run(), w.rows(s).await));
+        }
+        outputs.push(out);
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }

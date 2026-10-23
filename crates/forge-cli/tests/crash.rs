@@ -478,16 +478,7 @@ async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
 /// posts included.
 async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     let n = verify(dir, ledger, orphans, ctx).await;
-    let o = common::forge_output(&[
-        "sql",
-        "--data-dir",
-        dir.to_str().unwrap(),
-        "--format",
-        "json",
-        "SELECT count(*) AS n FROM spans",
-    ]);
-    assert!(o.status.success(), "{ctx}: {o:?}");
-    assert_eq!(common::sql_count(&o), n as u64, "{ctx}: forge sql count");
+    assert_eq!(common::spans_count(dir), n as u64, "{ctx}: forge sql count");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -496,10 +487,6 @@ async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &st
 
 fn db(dir: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(dir.join("meta.db")).expect("meta.db")
-}
-
-fn count(dir: &Path, sql: &str) -> i64 {
-    db(dir).query_row(sql, [], |r| r.get(0)).expect(sql)
 }
 
 /// `path` of every `segments` row matching `cond`.
@@ -516,8 +503,8 @@ fn segment_paths(dir: &Path, cond: &str) -> Vec<String> {
 
 /// P: no `compacting` segment and no `running` job.
 fn check_p(dir: &Path, ctx: &str) {
-    let compacting = count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'");
-    let running = count(dir, "SELECT count(*) FROM compaction_jobs WHERE status = 'running'");
+    let compacting = common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'");
+    let running = common::meta_count(dir, "SELECT count(*) FROM compaction_jobs WHERE status = 'running'");
     assert_eq!(
         (compacting, running),
         (0, 0),
@@ -592,7 +579,7 @@ async fn check_prs(dir: &Path, ctx: &str) {
     assert!(o.status.success(), "{ctx} S2: gc: {o:?}");
     assert!(answers(dir) == before, "{ctx} S3: an answer changed");
     // S4
-    let deleted = count(dir, "SELECT count(*) FROM segments WHERE state = 'deleted'");
+    let deleted = common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'deleted'");
     assert_eq!(deleted, 0, "{ctx} S4: deleted rows left");
     let live: HashSet<_> = segment_paths(dir, "state = 'live'")
         .into_iter()
@@ -773,7 +760,7 @@ async fn crash_random_sigkill() {
 async fn crash_meta_lease_in_txn() {
     timed(compaction_case("meta_lease_in_txn@1", Orphans::Any, |d| {
         assert_eq!(
-            count(d, "SELECT count(*) FROM compaction_jobs"),
+            common::meta_count(d, "SELECT count(*) FROM compaction_jobs"),
             0,
             "the begin txn rolled back"
         );
@@ -785,7 +772,7 @@ async fn crash_meta_lease_in_txn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_compact_after_lease() {
     timed(compaction_case("compact_after_lease@1", Orphans::Any, |d| {
-        let failed = count(d, "SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
+        let failed = common::meta_count(d, "SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
         assert!(failed >= 1, "the killed job was reset to failed");
     }))
     .await;
@@ -824,7 +811,7 @@ async fn crash_compact_merge_panic() {
         let tasks = load(p, 0, &c.ledger, Duration::ZERO).await;
         s.wait_for_log("compaction failed", Duration::from_secs(30)).await;
         let jobs = |st: &str| {
-            count(
+            common::meta_count(
                 dir,
                 &format!("SELECT count(*) FROM compaction_jobs WHERE status = '{st}'"),
             )
@@ -843,8 +830,10 @@ async fn crash_compact_merge_panic() {
         for t in tasks {
             let _ = t.await;
         }
-        let quiet =
-            || count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'") == 0 && jobs("running") == 0;
+        let quiet = || {
+            common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'") == 0
+                && jobs("running") == 0
+        };
         until(
             &quiet,
             "P: no compacting segment and no running job once the load stops",

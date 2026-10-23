@@ -208,27 +208,26 @@ static LOCATE_TRACE: LazyLock<String> = LazyLock::new(|| {
          WHERE state <> 'deleted' ORDER BY id"
     )
 });
-/// Retention (plans/phase-4 §2.5; `SegmentMeta::expires`, pinned by a test). ?1 project, ?2 cutoff hour,
-/// ?3 cutoff ns, ?4 now_ms (wall), ?5 max hours. L1: whole hours only; an hour with a compacting segment is skipped.
-static EXPIRE_L1: LazyLock<String> = LazyLock::new(|| {
+/// Retention (plans/phase-4 §2.5; `SegmentMeta::expires`, pinned by a test): the ids `expire_segments` marks.
+/// ?1 project, ?2 cutoff hour, ?3 cutoff ns, ?4 max hours. L1: whole hours only, the oldest ?4 hours below the
+/// cutoff hour; an hour with a compacting segment is skipped. L0: no null start_time and max_start_ns < cutoff.
+const EXPIRE_CANDIDATES: &str = "SELECT id FROM segments \
+     WHERE project_id = ?1 AND level = 1 AND state = 'live' AND partition_hour IN ( \
+       SELECT partition_hour FROM segments s WHERE s.project_id = ?1 AND s.level = 1 AND s.state <> 'deleted' \
+         AND s.partition_hour < ?2 \
+       GROUP BY partition_hour HAVING sum(s.state = 'compacting') = 0 \
+       ORDER BY partition_hour LIMIT ?4) \
+     UNION ALL SELECT id FROM segments \
+     WHERE project_id = ?1 AND level = 0 AND state = 'live' AND start_time_nulls = 0 AND max_start_ns < ?3";
+/// ?5 now_ms (wall).
+static EXPIRE: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?4 \
-         WHERE project_id = ?1 AND level = 1 AND state = 'live' AND partition_hour IN ( \
-           SELECT partition_hour FROM segments s WHERE s.project_id = ?1 AND s.level = 1 AND s.state <> 'deleted' \
-             AND s.partition_hour < ?2 \
-           GROUP BY partition_hour HAVING sum(s.state = 'compacting') = 0 \
-           ORDER BY partition_hour LIMIT ?5) \
+        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?5 WHERE id IN ({EXPIRE_CANDIDATES}) \
          RETURNING {SEGMENT_COLS}"
     )
 });
-/// ?1 project, ?2 cutoff ns, ?3 now_ms.
-static EXPIRE_L0: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?3 \
-         WHERE project_id = ?1 AND level = 0 AND state = 'live' AND start_time_nulls = 0 AND max_start_ns < ?2 \
-         RETURNING {SEGMENT_COLS}"
-    )
-});
+static EXPIRE_DRY_RUN: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {SEGMENT_COLS} FROM segments WHERE id IN ({EXPIRE_CANDIDATES})"));
 static PURGE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT {SEGMENT_COLS} FROM segments WHERE state = 'deleted' AND deleted_at_ms < ?1 \
@@ -517,6 +516,15 @@ fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<
         st.execute(params![m.project_id.as_str(), b, id])?;
     }
     Ok(())
+}
+
+/// (project, cutoff hour, max hours) for the expire statements.
+fn expire_params(project: &ProjectId, cutoff_ns: i64, max_hours: usize) -> (String, i64, i64) {
+    (
+        project.as_str().to_string(),
+        cutoff_ns.div_euclid(HourBucket::NANOS),
+        i64::try_from(max_hours).unwrap_or(i64::MAX),
+    )
 }
 
 /// Inputs of running jobs back to live, then the jobs to failed; `?1` = job id or NULL (every running job).
@@ -989,9 +997,31 @@ impl Metastore for SqliteMetastore {
         cutoff_ns: i64,
         max_hours: usize,
     ) -> MetaResult<Vec<SegmentMeta>> {
-        self.expire(project, cutoff_ns, max_hours).await
+        let (p, hour, hours) = expire_params(project, cutoff_ns, max_hours);
+        self.write(move |tx| {
+            let mut st = tx.prepare_cached(&EXPIRE)?;
+            let rows = st.query_map(params![p, hour, cutoff_ns, hours, now_ms()], |r| {
+                Ok(segment_from_row(r))
+            })?;
+            rows.map(|r| r?).collect()
+        })
+        .await
     }
 
+    async fn expire_candidates(
+        &self,
+        project: &ProjectId,
+        cutoff_ns: i64,
+        max_hours: usize,
+    ) -> MetaResult<Vec<SegmentMeta>> {
+        let (p, hour, hours) = expire_params(project, cutoff_ns, max_hours);
+        self.read(move |c| {
+            let mut st = c.prepare_cached(&EXPIRE_DRY_RUN)?;
+            let rows = st.query_map(params![p, hour, cutoff_ns, hours], |r| Ok(segment_from_row(r)))?;
+            rows.map(|r| r?).collect()
+        })
+        .await
+    }
     async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.read(move |c| {
@@ -1017,7 +1047,7 @@ impl Metastore for SqliteMetastore {
     }
 
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
-        if r.inputs.is_empty() || r.inputs.len() > 64 {
+        if r.inputs.is_empty() || r.inputs.len() > crate::MAX_JOB_INPUTS {
             return Err(MetaError::InvalidInput(format!("{} compaction inputs", r.inputs.len())));
         }
         self.write(move |tx| begin_in_txn(tx, &r, now_ms())).await
@@ -1118,29 +1148,6 @@ impl Metastore for SqliteMetastore {
 }
 
 impl SqliteMetastore {
-    /// Lifecycle methods (trait impl below delegates here to keep the trait impl block readable).
-    async fn expire(&self, project: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
-        let project = project.clone();
-        let max_hours = i64::try_from(max_hours).unwrap_or(i64::MAX);
-        let cutoff_hour = cutoff_ns.div_euclid(HourBucket::NANOS);
-        self.write(move |tx| {
-            let now = now_ms();
-            let mut out = Vec::new();
-            let mut st = tx.prepare_cached(&EXPIRE_L1)?;
-            for r in st.query_map(params![project.as_str(), cutoff_hour, cutoff_ns, now, max_hours], |r| {
-                Ok(segment_from_row(r))
-            })? {
-                out.push(r??);
-            }
-            let mut st = tx.prepare_cached(&EXPIRE_L0)?;
-            for r in st.query_map(params![project.as_str(), cutoff_ns, now], |r| Ok(segment_from_row(r)))? {
-                out.push(r??);
-            }
-            Ok(out)
-        })
-        .await
-    }
-
     async fn forget(&self, ids: &[SegmentId]) -> MetaResult<usize> {
         let mut removed = 0;
         let chunk = crate::TRACE_INDEX_PURGE_CHUNK as i64;

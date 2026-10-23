@@ -163,8 +163,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let opts = forge_ingest::lifecycle::GcOptions {
                 gc_grace: gc_grace.unwrap_or(c.gc_grace),
                 orphan_grace: orphan_grace.unwrap_or(c.orphan_grace),
-                sweep_blobs: true,
                 dry_run,
+                ..forge_ingest::lifecycle::GcOptions::from_config(c)
             };
             gc(&o, opts, format).await
         }
@@ -365,14 +365,12 @@ async fn compact(
     if o.meta.get_project(&p).await?.is_none() {
         anyhow::bail!("no project {project:?}");
     }
-    let cx = forge_ingest::compact::CompactCtx {
-        meta: o.meta.clone(),
-        segments: o.segments.clone(),
-        cfg: o.cfg.compaction.clone(),
-        data_clock: forge_model::time::wall_clock(),
-        next_project: Default::default(),
-        cancel: forge_model::merge::Cancel::new(),
-    };
+    let cx = forge_ingest::compact::CompactCtx::new(
+        o.meta.clone(),
+        o.segments.clone(),
+        o.cfg.compaction.clone(),
+        forge_model::time::Clocks::wall(),
+    );
     let s = forge_ingest::compact::compact_project(&cx, &p).await?;
     let mut out = std::io::stdout().lock();
     match format {
@@ -429,7 +427,10 @@ async fn gc(o: &Offline, mut opts: forge_ingest::lifecycle::GcOptions, format: F
     opts.sweep_blobs = unflushed.is_empty();
     let now = forge_model::time::now_ms();
     let store = o.segments.object_store();
-    let mut r = forge_ingest::lifecycle::run_gc(o.meta.as_ref(), store.as_ref(), now, now, &opts, None).await?;
+    // `Offline::open` holds every node's WAL lock: no other writer can put blobs, so an empty guard is exact.
+    let clocks = forge_model::time::Clocks::at(now, now);
+    let blobs = forge_ingest::blob::BlobGuard::default();
+    let mut r = forge_ingest::lifecycle::run_gc(o.meta.as_ref(), store.as_ref(), &clocks, &opts, &blobs).await?;
     if !unflushed.is_empty() {
         r.blobs_skipped = Some(format!("{}: run forge serve once", unflushed.join(", ")));
     }

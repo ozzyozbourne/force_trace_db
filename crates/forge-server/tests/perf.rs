@@ -11,12 +11,13 @@ use forge_model::catalog::HourBucket;
 use forge_model::config::{DATA_DIR, ForgeConfig, META_DB};
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::row::SpanRow;
-use forge_model::testing::{Rng, batch_from_rows, pid, sid, tid};
+use forge_model::testing::{Rng, agent_parent, batch_from_rows, pid, sid, tid};
 use forge_query::testing::write_flush;
 use forge_server::{Forge, api_router};
 use forge_storage::{SegmentStore, VortexSegmentStore, build_object_store};
 use futures::StreamExt;
 use http::Request;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
@@ -32,14 +33,7 @@ fn posts(trace: u64, kind: u8, payload: usize) -> Vec<SpanRow> {
     let text = "lorem ipsum ".repeat(payload / 12);
     let mut out = Vec::new();
     for i in 0..SPANS {
-        let parent = (i > 0).then(|| {
-            let mut p = i - 1 - r.below(i.min(8));
-            if depth[p as usize] >= 9 {
-                p = 0;
-            }
-            depth[i as usize] = depth[p as usize] + 1;
-            p
-        });
+        let parent = agent_parent(&mut r, &mut depth, i);
         let llm = i % 3 == 1;
         let start = BASE + (trace as i64 % 1000) * 1_000_000_000 + i as i64 * 1_000_017;
         let base = SpanRow {
@@ -91,7 +85,7 @@ fn posts(trace: u64, kind: u8, payload: usize) -> Vec<SpanRow> {
 }
 
 /// One flush of `rows`, versions restamped to end below `max_version`.
-async fn flush(meta: &dyn Metastore, store: &dyn SegmentStore, rows: Vec<SpanRow>, seq: u64, max_version: u64) {
+async fn flush(meta: &dyn Metastore, store: Arc<dyn SegmentStore>, rows: Vec<SpanRow>, seq: u64, max_version: u64) {
     let rows: Vec<SpanRow> = rows
         .into_iter()
         .enumerate()
@@ -101,7 +95,17 @@ async fn flush(meta: &dyn Metastore, store: &dyn SegmentStore, rows: Vec<SpanRow
         })
         .collect();
     let hour = HourBucket::from_nanos(BASE);
-    write_flush(meta, store, &batch_from_rows(&rows), hour, 64 << 20, seq, max_version).await;
+    write_flush(
+        meta,
+        store,
+        &batch_from_rows(&rows),
+        hour,
+        "test",
+        64 << 20,
+        seq,
+        max_version,
+    )
+    .await;
 }
 
 async fn timed(api: &Router, uri: &str, gzip: bool) -> (Duration, usize) {
@@ -163,13 +167,13 @@ async fn trace_2000_spans_p50_under_100ms() {
     {
         std::fs::create_dir_all(dir.path().join(DATA_DIR)).unwrap();
         let meta = forge_meta::SqliteMetastore::open_path(&dir.path().join(META_DB)).unwrap();
-        let store = VortexSegmentStore::new(build_object_store(&cfg.storage).unwrap());
+        let store: Arc<dyn SegmentStore> = Arc::new(VortexSegmentStore::new(build_object_store(&cfg.storage).unwrap()));
         for f in 0..3u64 {
             let mut rows = posts(TARGET, f as u8, 1600);
             for filler in 0..16 {
                 rows.extend(posts(filler, f as u8, 1600));
             }
-            flush(&meta, &store, rows, f + 1, (f + 1) * 1_000_000).await;
+            flush(&meta, store.clone(), rows, f + 1, (f + 1) * 1_000_000).await;
         }
     }
     println!("setup: 3 flushes written in {:.1} s", t0.elapsed().as_secs_f64());

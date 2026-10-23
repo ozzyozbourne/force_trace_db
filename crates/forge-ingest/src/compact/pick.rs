@@ -1,6 +1,6 @@
 //! Pure picker: one project's visible segments -> a job request (plans/phase-4 §2.7).
 use super::{L1_MAX_RUNS, MAX_INPUTS};
-use forge_model::catalog::{HourBucket, JobKind, Level, SegmentId, SegmentMeta, SegmentState};
+use forge_model::catalog::{HourBucket, JobKind, Level, SegmentId, SegmentMeta, SegmentState, trace_ranges_overlap};
 use forge_model::config::CompactionConfig;
 use std::collections::BTreeMap;
 
@@ -15,6 +15,7 @@ pub struct PickInput<'a> {
     pub force: bool,
 }
 
+/// First nanosecond after the hour.
 fn hour_end_ns(h: HourBucket) -> i64 {
     h.0.saturating_add(1).saturating_mul(HourBucket::NANOS)
 }
@@ -62,22 +63,16 @@ fn rewrite(segs: &[&SegmentMeta], closed: bool, force: bool, max_bytes: u64) -> 
             .all(|s| s.start_time_nulls == 0 || s.start_time_nulls == s.row_count),
         "mixed L1 segment"
     );
-    let trigger = [true, false].into_iter().any(|main| {
-        let mut v: Vec<&SegmentMeta> = suffix
-            .iter()
-            .copied()
-            .filter(|s| (s.start_time_nulls == 0) == main)
-            .collect();
-        v.sort_by_key(|s| s.min_trace_id);
-        let overlap = v.windows(2).any(|w| w[1].min_trace_id <= w[0].max_trace_id);
-        overlap && (closed || force || v.len() > L1_MAX_RUNS)
+    let trigger = [false, true].into_iter().any(|orphan| {
+        let mut v: Vec<&SegmentMeta> = suffix.iter().copied().filter(|s| s.is_orphan_run() == orphan).collect();
+        trace_ranges_overlap(&mut v) && (closed || force || v.len() > L1_MAX_RUNS)
     });
     trigger.then(|| suffix.iter().map(|s| s.id).collect())
 }
 
 pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<SegmentId>)> {
     let segs: Vec<&SegmentMeta> = i.segs.iter().filter(|s| s.state.is_visible()).collect();
-    let expired = |h: HourBucket| i.expired_before_ns.is_some_and(|c| hour_end_ns(h) <= c);
+    let expired = |h: HourBucket| i.expired_before_ns.is_some_and(|c| h.expired_by(c));
     let mut hours: BTreeMap<HourBucket, Vec<&SegmentMeta>> = BTreeMap::new();
     for s in segs.iter().filter(|s| s.level == Level::L1) {
         hours.entry(s.partition_hour).or_default().push(s);
