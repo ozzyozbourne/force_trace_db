@@ -194,7 +194,6 @@ struct FtsSource<'a> {
     units: Arc<Vec<Unit>>,
     tree: Arc<Tree>,
     read_group: usize,
-    prefetch: usize,
     /// Index answers of this call, per segment.
     memo: Mutex<HashMap<SegmentId, Arc<Hits>>>,
     /// One index lookup per segment, shared by concurrent callers (`start`, `prefetch`, `segments`).
@@ -212,7 +211,6 @@ impl<'a> FtsSource<'a> {
         index: &'a dyn IndexReader,
         counters: Arc<FtsCounters>,
         read_group: usize,
-        prefetch: usize,
     ) -> Result<Self, QueryError> {
         let mut units = Vec::new();
         let tree = split(&mut Analyzer::default(), &r.expr(), &mut units)?;
@@ -224,7 +222,6 @@ impl<'a> FtsSource<'a> {
             units: Arc::new(units),
             tree: Arc::new(tree),
             read_group,
-            prefetch,
             memo: Mutex::default(),
             lookups: moka::future::Cache::new(u64::MAX),
             mem_traces: Mutex::default(),
@@ -285,7 +282,7 @@ impl<'a> FtsSource<'a> {
                         out.push(Candidate::At(p));
                     }
                 } else {
-                    FtsCounters::add(&self.counters.unpositioned, 1);
+                    self.counters.add(1, |c| &mut c.unpositioned);
                     out.push(Candidate::Unpositioned(t, sp));
                 }
             }
@@ -326,10 +323,6 @@ impl CandidateSource for FtsSource<'_> {
     async fn start(&self, _q: &QueryCtx, _view: &ReadView, segs: &[SegmentMeta]) -> Result<(), QueryError> {
         let todo: Vec<&SegmentMeta> = segs.iter().filter(|s| s.start_time_nulls > 0).collect();
         self.lookup_all(&todo).await
-    }
-
-    fn prefetch_window(&self) -> usize {
-        self.prefetch
     }
 
     async fn prefetch(&self, _q: &QueryCtx, _view: &ReadView, next: &[SegmentMeta]) -> Result<(), QueryError> {
@@ -386,7 +379,7 @@ impl CandidateSource for FtsSource<'_> {
                 Ok((out, traces, unpositioned))
             })
             .await?;
-        FtsCounters::add(&self.counters.unpositioned, unpositioned);
+        self.counters.add(unpositioned, |c| &mut c.unpositioned);
         *self.mem_traces.lock().expect("poisoned") = traces;
         Ok(cands)
     }
@@ -466,17 +459,11 @@ impl CandidateSource for FtsSource<'_> {
             let out_schema = projected_schema(&out_cols);
             let wide_schema = projected_schema(&wide);
             let mut an = Analyzer::default();
-            let mask_keys = |b: RecordBatch| -> Result<RecordBatch, QueryError> {
-                Ok(match kf.key_mask(&b)? {
-                    Some(m) => filter_record_batch(&b, &m)?,
-                    None => b,
-                })
-            };
             // Single-source rows: the index answer is the answer (tombstones still dropped).
-            let ex: Vec<RecordBatch> = exact.into_iter().map(mask_keys).collect::<Result<_, _>>()?;
+            let ex: Vec<RecordBatch> = exact.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
             let ex = merge_or_filter(&out_schema, &ex, false, cancel)?;
             // The rest: every version, merged, re-checked on the merged cells.
-            let mut batches: Vec<RecordBatch> = merged.into_iter().map(mask_keys).collect::<Result<_, _>>()?;
+            let mut batches: Vec<RecordBatch> = merged.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
             let mem = mem_versions(&snap, &mk, &wide_schema, cancel)?;
             let merge = needs_merge(&merge_parts, !mem.is_empty());
             batches.extend(mem);
@@ -497,8 +484,8 @@ impl CandidateSource for FtsSource<'_> {
                 })
                 .collect();
             let m = project_to(&filter_record_batch(&m, &fts)?, &out_schema)?;
-            FtsCounters::add(&counters.exact_rows, ex.num_rows() as u64);
-            FtsCounters::add(&counters.merge_rows, m.num_rows() as u64);
+            counters.add(ex.num_rows() as u64, |c| &mut c.exact_rows);
+            counters.add(m.num_rows() as u64, |c| &mut c.merge_rows);
             let all = concat_batches(&out_schema, [&ex, &m])?;
             let out = filter_record_batch(&all, &row_mask(&r, hi, &all)?)?;
             res.try_grow(out.get_array_memory_size())?;
@@ -553,16 +540,8 @@ impl QueryEngine {
         let view = self.read_view(); // FIRST (invariant 1)
         let hi = upper_bound(r.end_ns, r.cursor);
         let segs = newest_first_segments(&view, &r.project, r.start_ns, hi).await?;
-        let src = FtsSource::new(r, hi, &*self.index, self.fts.clone(), self.read_group, self.prefetch)?;
-        let out = page(
-            q,
-            &view,
-            &src,
-            segs,
-            r.limit,
-            &projected_schema(&read_columns(&RUN_COLUMNS)),
-        )
-        .await?;
+        let src = FtsSource::new(r, hi, &*self.index, self.fts.clone(), self.read_group)?;
+        let out = page(q, &view, &src, segs, r.limit, self.prefetch).await?;
         let n = src.bruted.load(Ordering::Relaxed);
         if n > 0 {
             tracing::warn!(project = %r.project, segments = n, "search: segments without a usable .fts were scanned by brute force");
@@ -590,7 +569,7 @@ mod tests {
             p,
         )
         .unwrap();
-        let src = FtsSource::new(&r, None, &forge_index::NoopIndexReader, Arc::default(), 8, 64).unwrap();
+        let src = FtsSource::new(&r, None, &forge_index::NoopIndexReader, Arc::default(), 8).unwrap();
         let n = src.units.len();
         let mut s = segment_meta("p", Level::L0, HourBucket(0));
         s.max_start_ns = Some(5);

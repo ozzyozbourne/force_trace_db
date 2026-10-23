@@ -117,6 +117,28 @@ impl RowSelection {
         Self::Rows(Arc::new(roaring::RoaringTreemap::from_bitmaps([(0, rows)])))
     }
 
+    /// Rows selected in a segment of `row_count` rows.
+    pub fn len(&self, row_count: u64) -> u64 {
+        match self {
+            Self::All => row_count,
+            Self::Range(r) => r.end - r.start,
+            Self::Rows(s) => s.len(),
+        }
+    }
+
+    /// The rows of `rows` this selection selects.
+    pub fn intersect(&self, mut rows: roaring::RoaringTreemap) -> roaring::RoaringTreemap {
+        match self {
+            Self::All => rows,
+            Self::Range(r) => {
+                rows.remove_range(..r.start);
+                rows.remove_range(r.end..);
+                rows
+            }
+            Self::Rows(s) => rows & s.as_ref(),
+        }
+    }
+
     /// The first selected row (0 for `All`; `u64::MAX` for an empty `Rows`): orders parts within a segment.
     pub fn first_row(&self) -> u64 {
         match self {

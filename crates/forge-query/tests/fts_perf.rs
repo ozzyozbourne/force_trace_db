@@ -15,7 +15,7 @@ use forge_model::catalog::HourBucket;
 use forge_model::config::QueryConfig;
 use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::SpanRow;
-use forge_model::testing::{FixedMemtable, batch_from_rows, pid};
+use forge_model::testing::{FixedMemtable, Rng, batch_from_rows, pid};
 use forge_query::QueryEngine;
 use forge_query::search::{SearchBody, SearchRequest};
 use forge_query::testing::{RecordingSegmentStore, write_flush};
@@ -39,20 +39,8 @@ const TIMED: usize = 10;
 
 type Pos = (i64, TraceId, SpanId);
 
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
+fn rng(seed: u64) -> Rng {
+    Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1)
 }
 
 fn ids(seg: u64, t: u64, s: u64) -> (TraceId, SpanId) {
@@ -62,7 +50,7 @@ fn ids(seg: u64, t: u64, s: u64) -> (TraceId, SpanId) {
 
 /// Odd traces get an end post (no start, in the next segment) on ~20% of their spans; even traces never do.
 fn end_post(seg: u64, t: u64, s: u64) -> bool {
-    t % 2 == 1 && Rng::new(seg << 32 | t << 8 | s).below(5) == 0
+    t % 2 == 1 && rng(seg << 32 | t << 8 | s).below(5) == 0
 }
 
 fn inputs(r: &mut Rng, extra: &[String]) -> String {
@@ -74,7 +62,7 @@ fn inputs(r: &mut Rng, extra: &[String]) -> String {
 /// Segment `seg`: its own start posts (hour `seg`) plus the end posts of segment `seg - 1`'s spans. Marker spans are
 /// recorded in `marks`.
 fn segment_rows(seg: u64, v: &mut u64, marks: &mut HashMap<String, Vec<Pos>>) -> Vec<SpanRow> {
-    let mut r = Rng::new(seg + 1);
+    let mut r = rng(seg + 1);
     let mut out = Vec::with_capacity((TRACES * SPANS * 11 / 10) as usize);
     for t in 0..TRACES {
         for s in 0..SPANS {
@@ -138,7 +126,7 @@ fn segment_rows(seg: u64, v: &mut u64, marks: &mut HashMap<String, Vec<Pos>>) ->
 /// The memtable: fresh traces (hour SEGS), the same payload generator. Markers are 100x rarer than in segments
 /// (about 10-20 hits per term), so page 1 needs segment hits too.
 fn memtable(v: &mut u64, marks: &mut HashMap<String, Vec<Pos>>) -> Vec<arrow::record_batch::RecordBatch> {
-    let mut r = Rng::new(0xFEED);
+    let mut r = rng(0xFEED);
     (0..MEM_BATCHES)
         .map(|b| {
             let rows: Vec<SpanRow> = (0..100u64)

@@ -1,19 +1,139 @@
-//! Test wrappers around the metastore, plus re-exports of the segment-store wrappers and the hand-made L0 flush
-//! (used by forge-query and forge-server tests; feature `test-util`).
+//! Test wrappers around the metastore and the index reader, plus re-exports of the segment-store wrappers and the
+//! hand-made L0 flush, and the search paging loop (used by forge-query and forge-server tests; feature `test-util`).
+use crate::runs::{Pos, RunsPage};
+use crate::search::SearchRequest;
+use crate::{FtsIndexReader, QueryEngine};
+use arrow::array::{Array, AsArray, RecordBatch};
 use async_trait::async_trait;
+use forge_index::{FtsExpr, FtsHits, IndexReader, IndexResult};
 pub use forge_ingest::testing::write_flush;
 use forge_meta::{
     CompactionCommit, CompactionJob, FlushCommit, JobRequest, MetaError, MetaResult, Metastore, Project, SegmentFilter,
     WalCheckpoint,
 };
-use forge_model::catalog::{JobStatus, SegmentId, SegmentMeta, TraceLocation, TraceRange};
-use forge_model::ids::{ProjectId, TraceId};
+use forge_model::catalog::{HourBucket, JobStatus, SegmentId, SegmentMeta, TraceLocation, TraceRange};
+use forge_model::ids::{ProjectId, SpanId, TraceId};
+use forge_model::row::SpanRow;
+use forge_model::schema::col;
+use forge_model::testing::batch_from_rows;
+use forge_storage::SegmentStore;
 pub use forge_storage::testing::{HookedSegmentStore, RecordingSegmentStore, memory_store};
 use futures::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// The real `.fts` reader; segments in `hidden` are reported as sidecar-less (brute force), and `edit` changes the
+/// segment metadata the reader sees (a wrong size or row count).
+#[derive(Debug)]
+pub struct HidingIndexReader {
+    inner: FtsIndexReader,
+    pub hidden: Mutex<HashSet<SegmentId>>,
+    pub edit: Mutex<Option<(SegmentId, fn(&mut SegmentMeta))>>,
+}
+
+impl HidingIndexReader {
+    pub fn new(store: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            inner: FtsIndexReader::new(store),
+            hidden: Mutex::default(),
+            edit: Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl IndexReader for HidingIndexReader {
+    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr) -> IndexResult<FtsHits> {
+        if self.hidden.lock().unwrap().contains(&seg.id) {
+            return Ok(FtsHits::NoIndex);
+        }
+        let mut seg = seg.clone();
+        if let Some((id, f)) = *self.edit.lock().unwrap()
+            && id == seg.id
+        {
+            f(&mut seg);
+        }
+        self.inner.search(&seg, e).await
+    }
+}
+
+/// Versions 1, 2, ... in order.
+pub fn stamp_versions<'a>(rows: impl IntoIterator<Item = &'a mut SpanRow>) {
+    for (v, r) in (1..).zip(rows) {
+        r.version = v;
+    }
+}
+
+/// One `write_flush` per flush (sequence i + 1, max version = the rows so far), flush `i` in `hour(i)`.
+pub async fn write_flushes(
+    meta: &dyn Metastore,
+    store: Arc<dyn SegmentStore>,
+    flushes: &[Vec<SpanRow>],
+    hour: impl Fn(usize) -> HourBucket,
+    node_id: &str,
+    max_chunk: usize,
+) -> Vec<SegmentMeta> {
+    let (mut segs, mut max_version) = (Vec::new(), 0);
+    for (i, f) in flushes.iter().enumerate() {
+        max_version += f.len() as u64;
+        let b = batch_from_rows(f);
+        segs.extend(
+            write_flush(
+                meta,
+                store.clone(),
+                &b,
+                hour(i),
+                node_id,
+                max_chunk,
+                i as u64 + 1,
+                max_version,
+            )
+            .await,
+        );
+    }
+    segs
+}
+
+/// The (start, trace, span) of every row (rows of a runs or search page: start is never null).
+pub fn positions(b: &RecordBatch) -> Vec<Pos> {
+    let s = b.schema();
+    let st = b
+        .column(s.index_of(col::START_TIME).unwrap())
+        .as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+    let t = b.column(s.index_of(col::TRACE_ID).unwrap()).as_binary::<i32>();
+    let sp = b.column(s.index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
+    (0..b.num_rows())
+        .map(|i| {
+            assert!(st.is_valid(i), "a page row without a start");
+            (
+                st.value(i),
+                TraceId::from_slice(t.value(i)).unwrap(),
+                SpanId::from_slice(sp.value(i)).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// `/v1/search` pages of `req(cursor)`, following `next_cursor` until it is null or `max_pages` were read.
+pub async fn search_pages(
+    e: &QueryEngine,
+    req: impl Fn(Option<String>) -> SearchRequest,
+    max_pages: usize,
+) -> Vec<RunsPage> {
+    let (mut out, mut cursor) = (Vec::new(), None);
+    while out.len() < max_pages {
+        let r = req(cursor.take());
+        let page = e.search(&r).await.unwrap();
+        cursor = page.next_cursor.map(|c| r.encode_cursor(&c));
+        out.push(page);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    out
+}
 
 type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 

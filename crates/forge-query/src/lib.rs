@@ -36,8 +36,7 @@ use forge_model::error::{Classify, ErrorKind, Unimplemented};
 use forge_model::merge::{Cancel, CancelOnDrop};
 use forge_storage::SegmentStore;
 use read::ReadView;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -151,13 +150,16 @@ pub type BlockingHook = Arc<dyn Fn(&str, &Cancel) + Send + Sync>;
 
 /// What the FTS paths did, summed over every query of an engine (tests diff two snapshots; D4's brute-force count).
 #[derive(Debug, Default)]
-pub(crate) struct FtsCounters {
-    pub index_parts: AtomicU64,
-    pub brute_parts: AtomicU64,
-    pub exact_rows: AtomicU64,
-    pub merge_rows: AtomicU64,
-    pub segments_read: AtomicU64,
-    pub unpositioned: AtomicU64,
+pub(crate) struct FtsCounters(Mutex<FtsCountersSnapshot>);
+
+impl FtsCounters {
+    /// Adds `n` to the counter `f` picks.
+    pub(crate) fn add(&self, n: u64, f: impl FnOnce(&mut FtsCountersSnapshot) -> &mut u64) {
+        *f(&mut self.0.lock().expect("poisoned")) += n;
+    }
+    pub(crate) fn get(&self) -> FtsCountersSnapshot {
+        *self.0.lock().expect("poisoned")
+    }
 }
 
 /// A copy of the engine's FTS counters.
@@ -177,9 +179,31 @@ pub struct FtsCountersSnapshot {
     pub unpositioned: u64,
 }
 
-impl FtsCounters {
-    pub(crate) fn add(c: &AtomicU64, n: u64) {
-        c.fetch_add(n, Ordering::Relaxed);
+impl FtsCountersSnapshot {
+    fn zip(self, o: Self, f: fn(u64, u64) -> u64) -> Self {
+        Self {
+            index_parts: f(self.index_parts, o.index_parts),
+            brute_parts: f(self.brute_parts, o.brute_parts),
+            exact_rows: f(self.exact_rows, o.exact_rows),
+            merge_rows: f(self.merge_rows, o.merge_rows),
+            segments_read: f(self.segments_read, o.segments_read),
+            unpositioned: f(self.unpositioned, o.unpositioned),
+        }
+    }
+}
+
+impl std::ops::Add for FtsCountersSnapshot {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        self.zip(o, |a, b| a + b)
+    }
+}
+
+/// `later - earlier`: what happened in between.
+impl std::ops::Sub for FtsCountersSnapshot {
+    type Output = Self;
+    fn sub(self, o: Self) -> Self {
+        self.zip(o, |a, b| a - b)
     }
 }
 
@@ -298,16 +322,7 @@ impl QueryEngine {
     }
 
     pub fn fts_counters(&self) -> FtsCountersSnapshot {
-        let c = &*self.fts;
-        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        FtsCountersSnapshot {
-            index_parts: g(&c.index_parts),
-            brute_parts: g(&c.brute_parts),
-            exact_rows: g(&c.exact_rows),
-            merge_rows: g(&c.merge_rows),
-            segments_read: g(&c.segments_read),
-            unpositioned: g(&c.unpositioned),
-        }
+        self.fts.get()
     }
 
     /// The memtable snapshot, taken now (before any metastore call made through the view).

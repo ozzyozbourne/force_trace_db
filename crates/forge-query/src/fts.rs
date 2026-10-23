@@ -80,116 +80,84 @@ fn eval_predicate(
     Ok(ColumnarValue::Array(Arc::new(out.finish())))
 }
 
-/// `search(col, 'query')` -> bool. Brute force here; on an indexed column the provider answers it from the
-/// index (`fts_filter`, Exact pushdown) and this runs only for the post-merge re-check.
+/// The M4 scalar UDFs:
+/// - `search(col, 'query')` -> bool. Brute force here; on an indexed column the provider answers it from the index
+///   (`fts_filter`, Exact pushdown) and this runs only for the post-merge re-check.
+/// - `json_key_search(col, '$.path', 'text')` -> bool; empty text = the path exists.
+/// - `json_key(col, '$.path')` -> utf8: a string leaf as itself, any other value as JSON text, else NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Udf {
+    Search,
+    JsonKeySearch,
+    JsonKey,
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SearchUdf {
+pub(crate) struct FtsUdf {
+    udf: Udf,
     signature: Signature,
 }
 
-impl Default for SearchUdf {
-    fn default() -> Self {
+impl FtsUdf {
+    pub(crate) fn new(udf: Udf) -> Self {
+        let args = if udf == Udf::JsonKeySearch { 3 } else { 2 };
         // Immutable: DataFusion never pushes a volatile predicate into TableScan.
         Self {
-            signature: Signature::string(2, Volatility::Immutable),
+            udf,
+            signature: Signature::string(args, Volatility::Immutable),
         }
     }
 }
 
-impl ScalarUDFImpl for SearchUdf {
+impl ScalarUDFImpl for FtsUdf {
     fn name(&self) -> &str {
-        SEARCH
+        match self.udf {
+            Udf::Search => SEARCH,
+            Udf::JsonKeySearch => JSON_KEY_SEARCH,
+            Udf::JsonKey => JSON_KEY,
+        }
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
     fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Boolean)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        eval_predicate(&args, &|column, a| {
-            Ok(FtsPredicate::Search {
-                column,
-                query: a[0].to_string(),
-            })
+        Ok(match self.udf {
+            Udf::JsonKey => DataType::Utf8,
+            Udf::Search | Udf::JsonKeySearch => DataType::Boolean,
         })
     }
-}
-
-/// `json_key_search(col, '$.path', 'text')` -> bool; empty text = the path exists.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub(crate) struct JsonKeySearchUdf {
-    signature: Signature,
-}
-
-impl Default for JsonKeySearchUdf {
-    fn default() -> Self {
-        Self {
-            signature: Signature::string(3, Volatility::Immutable),
-        }
-    }
-}
-
-impl ScalarUDFImpl for JsonKeySearchUdf {
-    fn name(&self) -> &str {
-        JSON_KEY_SEARCH
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Boolean)
-    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        eval_predicate(&args, &|column, a| {
-            Ok(FtsPredicate::JsonKeySearch {
-                column,
-                path: a[0].to_string(),
-                text: a[1].to_string(),
-            })
-        })
-    }
-}
-
-/// `json_key(col, '$.path')` -> utf8: a string leaf as itself, any other value as JSON text, else NULL.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub(crate) struct JsonKeyUdf {
-    signature: Signature,
-}
-
-impl Default for JsonKeyUdf {
-    fn default() -> Self {
-        Self {
-            signature: Signature::string(2, Volatility::Immutable),
-        }
-    }
-}
-
-impl ScalarUDFImpl for JsonKeyUdf {
-    fn name(&self) -> &str {
-        JSON_KEY
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let arrs = ColumnarValue::values_to_arrays(&args.args)?;
-        let (docs, paths) = (utf8(&arrs[0])?, utf8(&arrs[1])?);
-        let mut out = StringBuilder::new();
-        for i in 0..args.number_rows {
-            if docs.is_null(i) || paths.is_null(i) {
-                out.append_null();
-                continue;
-            }
-            match forge_index::matcher::json_key(docs.value(i), paths.value(i)).map_err(ext)? {
-                Some(v) => out.append_value(v),
-                None => out.append_null(),
+        match self.udf {
+            Udf::Search => eval_predicate(&args, &|column, a| {
+                Ok(FtsPredicate::Search {
+                    column,
+                    query: a[0].to_string(),
+                })
+            }),
+            Udf::JsonKeySearch => eval_predicate(&args, &|column, a| {
+                Ok(FtsPredicate::JsonKeySearch {
+                    column,
+                    path: a[0].to_string(),
+                    text: a[1].to_string(),
+                })
+            }),
+            Udf::JsonKey => {
+                let arrs = ColumnarValue::values_to_arrays(&args.args)?;
+                let (docs, paths) = (utf8(&arrs[0])?, utf8(&arrs[1])?);
+                let mut out = StringBuilder::new();
+                for i in 0..args.number_rows {
+                    if docs.is_null(i) || paths.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    match forge_index::matcher::json_key(docs.value(i), paths.value(i)).map_err(ext)? {
+                        Some(v) => out.append_value(v),
+                        None => out.append_null(),
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
             }
         }
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -388,8 +356,8 @@ mod tests {
 
     #[test]
     fn filter_shapes() {
-        let s = udf(SearchUdf::default());
-        let j = udf(JsonKeySearchUdf::default());
+        let s = udf(FtsUdf::new(Udf::Search));
+        let j = udf(FtsUdf::new(Udf::JsonKeySearch));
         let search = |c: &str, q: &str| s.call(vec![dcol(c), lit(q)]);
         assert!(fts_filter(&search("inputs", "refund")).is_some());
         assert!(fts_filter(&search("name", "a").or(search("outputs", "b"))).is_some());

@@ -4,6 +4,13 @@ use async_trait::async_trait;
 use forge_model::catalog::SegmentMeta;
 use forge_model::config::StorageConfig;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult,
+};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,88 +124,90 @@ pub struct LatencyStore {
     pub waves: std::sync::atomic::AtomicU64,
 }
 
-mod latency {
-    use super::LatencyStore;
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::path::Path;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result,
-    };
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    impl LatencyStore {
-        pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
-            Self {
-                inner,
-                delay_us: 0.into(),
-                gets: 0.into(),
-                in_flight: 0.into(),
-                waves: 0.into(),
-            }
-        }
-        pub fn set_delay(&self, d: Duration) {
-            self.delay_us
-                .store(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
-        }
-        /// `call` after the delay, counted as in flight from start to end.
-        async fn read<T>(&self, call: impl Future<Output = T>) -> T {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            if self.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.waves.fetch_add(1, Ordering::SeqCst);
-            }
-            let us = self.delay_us.load(Ordering::Relaxed);
-            if us > 0 {
-                tokio::time::sleep(Duration::from_micros(us)).await;
-            }
-            let r = call.await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            r
+impl LatencyStore {
+    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            delay_us: 0.into(),
+            gets: 0.into(),
+            in_flight: 0.into(),
+            waves: 0.into(),
         }
     }
-
-    impl std::fmt::Display for LatencyStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "LatencyStore({})", self.inner)
-        }
+    pub fn set_delay(&self, d: Duration) {
+        self.delay_us
+            .store(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
+    /// `call` after the delay, counted as in flight from start to end.
+    async fn read<T>(&self, call: impl Future<Output = T>) -> T {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.waves.fetch_add(1, Ordering::SeqCst);
+        }
+        let us = self.delay_us.load(Ordering::Relaxed);
+        if us > 0 {
+            tokio::time::sleep(Duration::from_micros(us)).await;
+        }
+        let r = call.await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+}
 
-    #[async_trait]
-    impl ObjectStore for LatencyStore {
-        async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.read(self.inner.get_opts(location, options)).await
-        }
-        /// One wave: the default would re-enter `get_range` (and the delay) per coalesced range.
-        async fn get_ranges(&self, location: &Path, ranges: &[std::ops::Range<u64>]) -> Result<Vec<bytes::Bytes>> {
-            self.read(self.inner.get_ranges(location, ranges)).await
-        }
-        fn delete_stream(&self, locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-        fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
+impl std::fmt::Display for LatencyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LatencyStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LatencyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.read(self.inner.get_opts(location, options)).await
+    }
+    /// One wave: the default would re-enter `get_range` (and the delay) per coalesced range.
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.read(self.inner.get_ranges(location, ranges)).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }

@@ -8,14 +8,13 @@
 //! start posts with `name` / `inputs`, end posts with `outputs` and no start (in a later flush, or the memtable), and
 //! forced traces (a)-(h) for the single-source rule, re-checks, cross-source AND and the early-stop frontier.
 use arrow::array::{AsArray, RecordBatch};
-use async_trait::async_trait;
-use forge_index::{Analyzer, FtsColumn, FtsExpr, FtsHits, FtsPredicate, IndexReader, IndexResult, Matcher};
+use forge_index::{Analyzer, FtsColumn, FtsPredicate, Matcher};
 use forge_ingest::blob::BlobGuard;
 use forge_ingest::compact::{CompactCtx, compact_project};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
 use forge_meta::{Metastore, SegmentFilter};
 use forge_model::MemtableView;
-use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta};
+use forge_model::catalog::{HourBucket, Level};
 use forge_model::config::QueryConfig;
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::{SpanId, TraceId};
@@ -24,12 +23,12 @@ use forge_model::row::SpanRow;
 use forge_model::testing::{FixedMemtable, Rng, batch_from_rows, pid, reference, sid, tid};
 use forge_model::time::Clocks;
 use forge_query::search::{JsonFilter, SearchBody, SearchFilters, SearchRequest};
-use forge_query::testing::{memory_store, write_flush};
-use forge_query::{FtsCountersSnapshot, FtsIndexReader, QueryEngine};
+use forge_query::testing::{HidingIndexReader, memory_store, positions, search_pages, stamp_versions, write_flushes};
+use forge_query::{FtsCountersSnapshot, QueryEngine};
 use forge_storage::SegmentStore;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 const BASE: i64 = 1_700_000_000_000_000_000 / HOUR * HOUR;
@@ -407,60 +406,33 @@ fn preds() -> Vec<P> {
 
 // ---------------------------------------------------------------- fixture
 
-/// Reports NoIndex for `hidden` segments (brute-force fallback).
-#[derive(Debug)]
-struct HideIndex {
-    inner: FtsIndexReader,
-    hidden: Mutex<HashSet<SegmentId>>,
-}
-
-#[async_trait]
-impl IndexReader for HideIndex {
-    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr) -> IndexResult<FtsHits> {
-        if self.hidden.lock().unwrap().contains(&seg.id) {
-            return Ok(FtsHits::NoIndex);
-        }
-        self.inner.search(seg, e).await
-    }
-}
-
 struct Fx {
     meta: Arc<dyn Metastore>,
     store: Arc<dyn SegmentStore>,
     mem: Arc<dyn MemtableView>,
-    hide: Arc<HideIndex>,
+    hide: Arc<HidingIndexReader>,
     all: Vec<SpanRow>,
 }
 
 impl Fx {
     async fn build(mut l: Layout) -> Self {
-        let mut v = 0;
-        for r in l.flushes.iter_mut().chain(std::iter::once(&mut l.mem)).flatten() {
-            v += 1;
-            r.version = v;
-        }
+        stamp_versions(l.flushes.iter_mut().chain(std::iter::once(&mut l.mem)).flatten());
         let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
         let store = memory_store();
-        let (mut maxv, mut multi_batch) = (0, false);
-        for (i, f) in l.flushes.iter().enumerate() {
-            maxv += f.len() as u64;
-            let b = batch_from_rows(f);
-            multi_batch |= merge_versions_chunked(std::slice::from_ref(&b), Tombstones::Keep, MAX_CHUNK)
+        let multi_batch = l.flushes.iter().any(|f| {
+            merge_versions_chunked(&[batch_from_rows(f)], Tombstones::Keep, MAX_CHUNK)
                 .unwrap()
                 .len()
-                > 1;
-            let hour = HourBucket::from_nanos(at(i, 0));
-            write_flush(&*meta, store.clone(), &b, hour, "t", MAX_CHUNK, i as u64 + 1, maxv).await;
-        }
+                > 1
+        });
         assert!(multi_batch, "precondition: some segment holds more than one batch");
+        let hour = |i| HourBucket::from_nanos(at(i, 0));
+        write_flushes(&*meta, store.clone(), &l.flushes, hour, "t", MAX_CHUNK).await;
         let segs = meta.list_segments(&SegmentFilter::default()).await.unwrap();
         assert_eq!(segs.len(), FLUSHES);
         assert!(segs.iter().all(|s| s.fts_byte_size.is_some()));
         let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(vec![batch_from_rows(&l.mem)]));
-        let hide = Arc::new(HideIndex {
-            inner: FtsIndexReader::new(store.object_store()),
-            hidden: Mutex::default(),
-        });
+        let hide = Arc::new(HidingIndexReader::new(store.object_store()));
         let all = l.flushes.into_iter().chain(std::iter::once(l.mem)).flatten().collect();
         Self {
             meta,
@@ -687,58 +659,18 @@ fn oracle_hits(merged: &[SpanRow], req: &Req, v: Variant) -> Vec<Pos> {
 
 /// Pages until the cursor is null (at most `max_pages`); checks the page bound.
 async fn pages(e: &QueryEngine, req: &Req, v: Variant, limit: usize, max_pages: usize) -> Vec<Pos> {
+    let ps = search_pages(e, |c| request(req, v, limit, c), max_pages).await;
     let mut out = Vec::new();
-    let mut cursor = None;
-    let mut n = 0;
-    loop {
-        let r = request(req, v, limit, cursor.take());
-        let page = e.search(&r).await.unwrap();
-        n += 1;
-        let b = &page.rows;
-        let s = b.schema();
-        let st = b
-            .column(s.index_of("start_time").unwrap())
-            .as_primitive::<arrow::datatypes::TimestampNanosecondType>();
-        let t = b.column(s.index_of("trace_id").unwrap()).as_binary::<i32>();
-        let sp = b.column(s.index_of("span_id").unwrap()).as_binary::<i32>();
-        assert!(b.num_rows() <= limit);
-        for i in 0..b.num_rows() {
-            out.push((
-                st.value(i),
-                TraceId::from_slice(t.value(i)).unwrap(),
-                SpanId::from_slice(sp.value(i)).unwrap(),
-            ));
-        }
-        match page.next_cursor {
-            Some(c) if n < max_pages => cursor = Some(r.encode_cursor(&c)),
-            Some(_) => return out,
-            None => break,
-        }
+    for p in &ps {
+        assert!(p.rows.num_rows() <= limit);
+        out.extend(positions(&p.rows));
     }
+    if ps.last().is_some_and(|p| p.next_cursor.is_some()) {
+        return out;
+    }
+    let n = ps.len();
     assert!(n <= out.len().div_ceil(limit) + 1, "{n} pages for {} hits", out.len());
     out
-}
-
-fn delta(a: FtsCountersSnapshot, b: FtsCountersSnapshot) -> FtsCountersSnapshot {
-    FtsCountersSnapshot {
-        index_parts: b.index_parts - a.index_parts,
-        brute_parts: b.brute_parts - a.brute_parts,
-        exact_rows: b.exact_rows - a.exact_rows,
-        merge_rows: b.merge_rows - a.merge_rows,
-        segments_read: b.segments_read - a.segments_read,
-        unpositioned: b.unpositioned - a.unpositioned,
-    }
-}
-
-fn sum(a: FtsCountersSnapshot, b: FtsCountersSnapshot) -> FtsCountersSnapshot {
-    FtsCountersSnapshot {
-        index_parts: a.index_parts + b.index_parts,
-        brute_parts: a.brute_parts + b.brute_parts,
-        exact_rows: a.exact_rows + b.exact_rows,
-        merge_rows: a.merge_rows + b.merge_rows,
-        segments_read: a.segments_read + b.segments_read,
-        unpositioned: a.unpositioned + b.unpositioned,
-    }
 }
 
 struct Outcome {
@@ -791,7 +723,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
                 acc.0 |= c.0;
                 acc.1 |= c.1;
             }
-            counters = sum(counters, delta(c0, e.fts_counters()));
+            counters = counters + (e.fts_counters() - c0);
         }
         let engines: &[((usize, usize), bool)] = if light {
             &[((2, 2), true)]
@@ -817,7 +749,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
                     }
                 }
             }
-            counters = sum(counters, delta(c0, e.fts_counters()));
+            counters = counters + (e.fts_counters() - c0);
         }
         // (h): page 1 of `zanzibar` holds the start-less hit and reads the first group plus the start-less-hit segment.
         let e = fx.engine(false, (8, 64));
@@ -828,7 +760,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
         };
         let c0 = e.fts_counters();
         let page1 = pages(&e, &req, Variant::None, 3, 1).await;
-        let d = delta(c0, e.fts_counters());
+        let d = e.fts_counters() - c0;
         let h = merged
             .iter()
             .find(|m| m.trace_id == tid(T_H))
@@ -849,7 +781,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
         };
         let c0 = e.fts_counters();
         let page1 = pages(&e, &req, Variant::None, 3, 1).await;
-        let d = delta(c0, e.fts_counters());
+        let d = e.fts_counters() - c0;
         assert_eq!(
             page1,
             oracle_hits(&merged, &req, Variant::None)[..3],
@@ -866,9 +798,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
 }
 
 fn assert_coverage(outs: &[Outcome]) {
-    let total = outs
-        .iter()
-        .fold(FtsCountersSnapshot::default(), |a, o| sum(a, o.counters));
+    let total = outs.iter().fold(FtsCountersSnapshot::default(), |a, o| a + o.counters);
     assert!(
         total.merge_rows > 0 && total.index_parts > 0 && total.brute_parts > 0 && total.unpositioned > 0,
         "{total:?}"

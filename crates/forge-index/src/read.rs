@@ -237,6 +237,16 @@ impl FtsFile {
     }
 }
 
+/// A `fetch` serving ranges from `file` in memory (tests, tools).
+pub fn bytes_fetch(file: Bytes) -> impl Fn(Vec<Range<u64>>) -> std::future::Ready<IndexResult<Vec<Bytes>>> {
+    move |rs| {
+        std::future::ready(Ok(rs
+            .into_iter()
+            .map(|r| file.slice(r.start as usize..r.end as usize))
+            .collect()))
+    }
+}
+
 /// The smallest key greater than every key starting with `p` (None: no bound).
 fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
     let mut s = p.to_vec();

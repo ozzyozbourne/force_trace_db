@@ -408,12 +408,7 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) -> usi
             assert_eq!(len, n, "{ctx}: {f:?}");
             // ... and is a readable sidecar of exactly the segment's rows.
             let file = bytes::Bytes::from(std::fs::read(&f).unwrap());
-            let fetch = |rs: Vec<std::ops::Range<u64>>| {
-                std::future::ready(Ok(rs
-                    .into_iter()
-                    .map(|r| file.slice(r.start as usize..r.end as usize))
-                    .collect()))
-            };
+            let fetch = forge_index::read::bytes_fetch(file);
             let (fts, _) = forge_index::FtsFile::open(&f.display().to_string(), n, &fetch)
                 .await
                 .unwrap_or_else(|e| panic!("{ctx}: {f:?}: {e}"));

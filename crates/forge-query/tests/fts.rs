@@ -3,57 +3,20 @@
 #![allow(clippy::print_stdout)]
 use arrow::array::{Array, AsArray};
 use arrow::util::pretty::pretty_format_batches;
-use async_trait::async_trait;
-use forge_index::{FtsExpr, FtsHits, IndexReader, IndexResult};
 use forge_meta::{Metastore, SegmentFilter};
 use forge_model::MemtableView;
-use forge_model::catalog::{HourBucket, SegmentId, SegmentMeta, paths};
+use forge_model::catalog::{HourBucket, SegmentMeta, paths};
 use forge_model::config::QueryConfig;
 use forge_model::row::SpanRow;
 use forge_model::testing::{FixedMemtable, batch_from_rows, pid, sid, tid};
-use forge_query::testing::{RecordingSegmentStore, memory_store, write_flush};
-use forge_query::{FtsIndexReader, QueryEngine};
+use forge_query::QueryEngine;
+use forge_query::testing::{HidingIndexReader, RecordingSegmentStore, memory_store, stamp_versions, write_flushes};
 use forge_storage::SegmentStore;
 use object_store::ObjectStoreExt;
-use std::collections::{BTreeSet, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 const BASE: i64 = 1_700_000_000_000_000_000;
-
-/// The real reader over the sink-built sidecars; segments in `hidden` are reported as sidecar-less, and `edit`
-/// changes the segment metadata the reader sees (a wrong size or row count).
-#[derive(Debug)]
-struct Sidecars {
-    inner: FtsIndexReader,
-    hidden: Mutex<HashSet<SegmentId>>,
-    edit: Mutex<Option<(SegmentId, fn(&mut SegmentMeta))>>,
-}
-
-impl Sidecars {
-    fn new(store: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self {
-            inner: FtsIndexReader::new(store),
-            hidden: Mutex::default(),
-            edit: Mutex::default(),
-        }
-    }
-}
-
-#[async_trait]
-impl IndexReader for Sidecars {
-    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr) -> IndexResult<FtsHits> {
-        if self.hidden.lock().unwrap().contains(&seg.id) {
-            return Ok(FtsHits::NoIndex);
-        }
-        let mut seg = seg.clone();
-        if let Some((id, f)) = *self.edit.lock().unwrap()
-            && id == seg.id
-        {
-            f(&mut seg);
-        }
-        self.inner.search(&seg, e).await
-    }
-}
 
 fn row(trace: u64, span: u64, inputs: Option<&str>) -> SpanRow {
     SpanRow {
@@ -74,21 +37,12 @@ struct Fx {
     mem: Arc<dyn MemtableView>,
     store: Arc<RecordingSegmentStore>,
     segs: Vec<SegmentMeta>,
-    sidecars: Arc<Sidecars>,
+    sidecars: Arc<HidingIndexReader>,
 }
 
 async fn fixture() -> Fx {
     let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
     let store = Arc::new(RecordingSegmentStore::new(memory_store()));
-    let mut v = 0;
-    let mut stamp = |rows: Vec<SpanRow>| -> Vec<SpanRow> {
-        rows.into_iter()
-            .map(|r| {
-                v += 1;
-                SpanRow { version: v, ..r }
-            })
-            .collect()
-    };
     // Flush 1: A (a1 says refund, later loses it), B (refund, single-source), E (gains refund in the memtable),
     // F (refund, tombstoned in flush 2), G (100 filler spans so the index matters).
     let mut f1 = vec![
@@ -107,53 +61,29 @@ async fn fixture() -> Fx {
         row(6, 61, Some(r#"{"q":"refund"}"#)),
     ];
     f1.extend((0..100).map(|i| row(7, 700 + i, Some(r#"{"q":"filler text"}"#))));
-    let f1 = stamp(f1);
     // Flush 2: a1's inputs replaced (term gone after the merge), F deleted, H (refund) only here.
-    let f2 = stamp(vec![
+    let mut f2 = vec![
         row(1, 11, Some(r#"{"messages":[{"role":"user","content":"never mind"}]}"#)),
         SpanRow {
             deleted: true,
             ..row(6, 61, None)
         },
         row(8, 81, Some(r#"{"q":"refund later"}"#)),
-    ]);
+    ];
     // Memtable: D (refund, memtable only), E gains refund.
-    let m = stamp(vec![
+    let mut m = vec![
         row(4, 41, Some(r#"{"q":"refund in mem"}"#)),
         row(5, 51, Some(r#"{"q":"refund now"}"#)),
-    ]);
+    ];
+    stamp_versions(f1.iter_mut().chain(&mut f2).chain(&mut m));
     let hour = HourBucket::from_nanos(BASE);
-    let inner: Arc<dyn SegmentStore> = store.clone();
-    let mut segs = write_flush(
-        &*meta,
-        inner.clone(),
-        &batch_from_rows(&f1),
-        hour,
-        "t",
-        64 << 10,
-        1,
-        105,
-    )
-    .await;
-    segs.extend(
-        write_flush(
-            &*meta,
-            inner.clone(),
-            &batch_from_rows(&f2),
-            hour,
-            "t",
-            64 << 10,
-            2,
-            108,
-        )
-        .await,
-    );
+    let segs = write_flushes(&*meta, store.clone(), &[f1, f2], |_| hour, "t", 64 << 10).await;
     assert!(
         segs.iter().all(|s| s.fts_byte_size.is_some()),
         "the sink builds every sidecar"
     );
     let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(vec![batch_from_rows(&m)]));
-    let sidecars = Arc::new(Sidecars::new(store.object_store()));
+    let sidecars = Arc::new(HidingIndexReader::new(store.object_store()));
     let engine =
         QueryEngine::new(meta.clone(), store.clone(), mem.clone(), QueryConfig::default()).with_index(sidecars.clone());
     let all = meta.list_segments(&SegmentFilter::default()).await.unwrap();
@@ -337,13 +267,7 @@ async fn corrupt_sidecar_falls_back_to_brute_force() {
     let os = fx.store.object_store();
     let loc: object_store::path::Path = paths::fts_path(&seg.path).as_str().into();
     let good = os.get(&loc).await.unwrap().bytes().await.unwrap();
-    let fetch = |rs: Vec<std::ops::Range<u64>>| {
-        let b = good.clone();
-        std::future::ready(Ok(rs
-            .into_iter()
-            .map(|r| b.slice(r.start as usize..r.end as usize))
-            .collect()))
-    };
+    let fetch = forge_index::read::bytes_fetch(good.clone());
     let footer = forge_index::FtsFile::open("t", good.len() as u64, &fetch)
         .await
         .unwrap()
@@ -386,7 +310,7 @@ async fn corrupt_sidecar_falls_back_to_brute_force() {
             }
             None => {}
         }
-        let idx = Arc::new(Sidecars::new(os.clone()));
+        let idx = Arc::new(HidingIndexReader::new(os.clone()));
         *idx.edit.lock().unwrap() = edit.map(|f| (seg.id, f));
         let e = QueryEngine::new(
             fx.meta.clone(),
@@ -406,30 +330,18 @@ async fn corrupt_sidecar_falls_back_to_brute_force() {
 async fn small_engine(seg_rows: Vec<SpanRow>, mem_rows: Vec<SpanRow>, hide: bool, cfg: QueryConfig) -> QueryEngine {
     let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
     let store = memory_store();
-    let mut v = 0;
-    let mut stamp = |rows: Vec<SpanRow>| -> Vec<SpanRow> {
-        rows.into_iter()
-            .map(|r| {
-                v += 1;
-                SpanRow { version: v, ..r }
-            })
-            .collect()
-    };
-    let (seg_rows, mem_rows) = (stamp(seg_rows), stamp(mem_rows));
-    let n = seg_rows.len() as u64;
+    let (mut seg_rows, mut mem_rows) = (seg_rows, mem_rows);
+    stamp_versions(seg_rows.iter_mut().chain(&mut mem_rows));
     let segs = if seg_rows.is_empty() {
         vec![]
     } else {
-        let hour = HourBucket::from_nanos(BASE);
-        write_flush(
+        write_flushes(
             &*meta,
             store.clone(),
-            &batch_from_rows(&seg_rows),
-            hour,
+            &[seg_rows],
+            |_| HourBucket::from_nanos(BASE),
             "t",
             1 << 20,
-            1,
-            n,
         )
         .await
     };
@@ -438,7 +350,7 @@ async fn small_engine(seg_rows: Vec<SpanRow>, mem_rows: Vec<SpanRow>, hide: bool
     } else {
         vec![batch_from_rows(&mem_rows)]
     }));
-    let idx = Arc::new(Sidecars::new(store.object_store()));
+    let idx = Arc::new(HidingIndexReader::new(store.object_store()));
     if hide {
         idx.hidden.lock().unwrap().extend(segs.iter().map(|s| s.id));
     }

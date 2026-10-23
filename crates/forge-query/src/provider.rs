@@ -136,20 +136,15 @@ impl TableProvider for SpansTableProvider {
         };
         let names = read_columns(&out_cols);
         let read_schema = projected_schema(&names);
-        let fts: Vec<&Expr> = filters
+        let (fts, mut fts_exprs): (Vec<&Expr>, Vec<FtsExpr>) = filters
             .iter()
-            .filter(|f| classify(f).is_none() && fts_filter(f).is_some())
-            .collect();
+            .filter(|f| classify(f).is_none())
+            .filter_map(|f| Some((f, fts_filter(f)?)))
+            .unzip();
         // The FTS filters' columns, read only where a re-check runs (merged candidates, fallback).
         let mut recheck_cols: BTreeSet<&'static str> = names.iter().copied().collect();
-        for f in &fts {
-            recheck_cols.extend(
-                fts_filter(f)
-                    .expect("fts filter")
-                    .columns()
-                    .into_iter()
-                    .map(|c| c.name()),
-            );
+        for e in &fts_exprs {
+            recheck_cols.extend(e.columns().into_iter().map(|c| c.name()));
         }
         let wide: Vec<&'static str> = ALL_COLUMNS
             .iter()
@@ -194,13 +189,42 @@ impl TableProvider for SpansTableProvider {
         };
 
         let df_read = DFSchema::try_from(read_schema.as_ref().clone())?;
-        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        let fts_expr = (!fts.is_empty()).then(|| {
-            let mut v: Vec<FtsExpr> = fts.iter().map(|f| fts_filter(f).expect("fts filter")).collect();
-            if v.len() == 1 {
-                v.pop().expect("one")
+        // One group's rows: its parts and memtable rows merged, or (`!merge`: one input, already one row per key,
+        // e.g. one segment) only the tombstones dropped.
+        let group = |parts: Vec<SegmentPart>,
+                     mem: Vec<RecordBatch>,
+                     cols: &[&'static str],
+                     schema: &SchemaRef,
+                     filter: Option<vortex::expr::Expression>,
+                     merge: bool|
+         -> Result<Arc<dyn ExecutionPlan>> {
+            let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+            if !parts.is_empty() {
+                inputs.push(Arc::new(SegmentScanExec::new(
+                    self.segments.clone(),
+                    parts,
+                    cols.to_vec(),
+                    schema.clone(),
+                    filter,
+                )));
+            }
+            if !mem.is_empty() {
+                inputs.push(MemorySourceConfig::try_new_exec(&[mem], schema.clone(), None)?);
+            }
+            Ok(if merge {
+                Arc::new(MergeVersionsExec::try_new(UnionExec::try_new(inputs)?)?)
             } else {
-                FtsExpr::And(v)
+                let df = DFSchema::try_from(schema.as_ref().clone())?;
+                let pred = state.create_physical_expr(not(col(c::DELETED)), &df)?;
+                Arc::new(FilterExec::try_new(pred, inputs.pop().expect("one input"))?)
+            })
+        };
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let fts_expr = (!fts_exprs.is_empty()).then(|| {
+            if fts_exprs.len() == 1 {
+                fts_exprs.pop().expect("one")
+            } else {
+                FtsExpr::And(fts_exprs)
             }
         });
         if let Some(expr) = &fts_expr {
@@ -240,15 +264,7 @@ impl TableProvider for SpansTableProvider {
                 };
                 if !exact.is_empty() {
                     // Single-source rows that match: no merge, no payload column, no re-check (tombstones dropped).
-                    let scan = Arc::new(SegmentScanExec::new(
-                        self.segments.clone(),
-                        exact,
-                        names.clone(),
-                        read_schema.clone(),
-                        None,
-                    ));
-                    let pred = state.create_physical_expr(not(col(c::DELETED)), &df_read)?;
-                    plans.push(Arc::new(FilterExec::try_new(pred, scan)?));
+                    plans.push(group(exact, vec![], &names, &read_schema, None, false)?);
                 }
                 let mem = if mk.traces.as_ref().is_some_and(|t| t.is_empty()) {
                     vec![]
@@ -258,46 +274,13 @@ impl TableProvider for SpansTableProvider {
                 if merge_parts.is_empty() && mem.is_empty() {
                     continue;
                 }
-                let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-                if !merge_parts.is_empty() {
-                    inputs.push(Arc::new(SegmentScanExec::new(
-                        self.segments.clone(),
-                        merge_parts,
-                        wide.clone(),
-                        wide_schema.clone(),
-                        None,
-                    )));
-                }
-                if !mem.is_empty() {
-                    inputs.push(MemorySourceConfig::try_new_exec(&[mem], wide_schema.clone(), None)?);
-                }
-                let merged: Arc<dyn ExecutionPlan> = Arc::new(MergeVersionsExec::try_new(UnionExec::try_new(inputs)?)?);
-                plans.push(recheck(merged)?);
+                plans.push(recheck(group(merge_parts, mem, &wide, &wide_schema, None, true)?)?);
             }
             groups = BTreeMap::new();
         }
         for (_, (parts, mem)) in groups {
             let merge = needs_merge(&parts, !mem.is_empty());
-            let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            if !parts.is_empty() {
-                inputs.push(Arc::new(SegmentScanExec::new(
-                    self.segments.clone(),
-                    parts,
-                    names.clone(),
-                    read_schema.clone(),
-                    filter.clone(),
-                )));
-            }
-            if !mem.is_empty() {
-                inputs.push(MemorySourceConfig::try_new_exec(&[mem], read_schema.clone(), None)?);
-            }
-            plans.push(if merge {
-                Arc::new(MergeVersionsExec::try_new(UnionExec::try_new(inputs)?)?)
-            } else {
-                // One segment: its rows are already one per key; only tombstones must go.
-                let pred = state.create_physical_expr(not(col(c::DELETED)), &df_read)?;
-                Arc::new(FilterExec::try_new(pred, inputs.pop().unwrap())?)
-            });
+            plans.push(group(parts, mem, &names, &read_schema, filter.clone(), merge)?);
         }
         let merged: Arc<dyn ExecutionPlan> = match plans.len() {
             0 => Arc::new(EmptyExec::new(read_schema.clone())),

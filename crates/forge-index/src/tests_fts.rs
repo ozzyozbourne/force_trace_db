@@ -2,26 +2,16 @@
 use crate::analyzer::{Analyzer, key_path_token, key_token};
 use crate::format::{BlockMeta, Footer, decode_postings, encode_postings};
 use crate::query::{Leaf, Query, json_key_search_query, search_query};
-use crate::read::{FtsFile, Io};
-use crate::{FtsBuilder, FtsColumn, IndexResult};
+use crate::read::{FtsFile, Io, bytes_fetch};
+use crate::{FtsBuilder, FtsColumn};
 use bytes::Bytes;
 use proptest::prelude::*;
 use roaring::RoaringBitmap;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
-
-fn fetcher(file: Bytes) -> impl Fn(Vec<Range<u64>>) -> std::future::Ready<IndexResult<Vec<Bytes>>> {
-    move |rs| {
-        std::future::ready(Ok(rs
-            .into_iter()
-            .map(|r| file.slice(r.start as usize..r.end as usize))
-            .collect()))
-    }
-}
 
 async fn run(file: &Bytes, q: &Query) -> (RoaringBitmap, Io) {
-    let fetch = fetcher(file.clone());
+    let fetch = bytes_fetch(file.clone());
     let (f, _) = FtsFile::open("t.fts", file.len() as u64, &fetch).await.unwrap();
     f.execute(q, &fetch).await.unwrap()
 }
@@ -169,7 +159,7 @@ async fn corrupt_files_are_errors() {
         let mut bad = file.clone();
         bad[i] ^= 0x55;
         let bad = Bytes::from(bad);
-        let fetch = fetcher(bad.clone());
+        let fetch = bytes_fetch(bad.clone());
         let q = Query {
             groups: vec![vec![Leaf::Exact(key_token(FtsColumn::Name, "hello"))]],
             needs_recheck: false,
@@ -180,7 +170,7 @@ async fn corrupt_files_are_errors() {
         }
     }
     assert!(
-        FtsFile::open("t.fts", 3, &fetcher(Bytes::from_static(b"FTS")))
+        FtsFile::open("t.fts", 3, &bytes_fetch(Bytes::from_static(b"FTS")))
             .await
             .is_err()
     );
@@ -245,7 +235,7 @@ proptest! {
             prop_assert_eq!(st.rows, row + 1);
             prop_assert_eq!(st.terms, oracle.len() as u64);
             let file = Bytes::from(file);
-            let fetch = fetcher(file.clone());
+            let fetch = bytes_fetch(file.clone());
             let exact = |k: &[u8]| Query { groups: vec![vec![Leaf::Exact(k.to_vec())]], needs_recheck: false };
             for (k, rows) in &oracle {
                 // Cold for every key: the footer read, then <= 2 waves.
@@ -332,7 +322,7 @@ async fn postings_crc_mismatch_is_corrupt() {
     }
     let (file, st) = b.finish().unwrap();
     assert!(st.varint_terms + st.roaring_terms > 0);
-    let fetch = fetcher(Bytes::from(file.clone()));
+    let fetch = bytes_fetch(Bytes::from(file.clone()));
     let (f, _) = FtsFile::open("t.fts", file.len() as u64, &fetch).await.unwrap();
     let postings = f.footer().postings.clone();
     let q = Query {
@@ -344,7 +334,7 @@ async fn postings_crc_mismatch_is_corrupt() {
     for i in postings.clone().step_by(3) {
         let mut bad = file.clone();
         bad[i as usize] ^= 0x01;
-        let fetch = fetcher(Bytes::from(bad.clone()));
+        let fetch = bytes_fetch(Bytes::from(bad.clone()));
         let (f, _) = FtsFile::open("t.fts", bad.len() as u64, &fetch).await.unwrap();
         match f.execute(&q, &fetch).await {
             Err(crate::IndexError::Corrupt { .. }) => corrupt += 1,

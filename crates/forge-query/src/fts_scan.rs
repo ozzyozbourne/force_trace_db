@@ -24,7 +24,6 @@ use futures::{StreamExt, TryStreamExt};
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 pub(crate) type Key = (TraceId, SpanId);
 
@@ -152,27 +151,6 @@ pub(crate) struct Selected {
     pub merge_traces: BTreeSet<TraceId>,
 }
 
-fn clip(mut rows: RoaringTreemap, sel: &RowSelection) -> RoaringTreemap {
-    match sel {
-        RowSelection::All => rows,
-        RowSelection::Range(r) => {
-            rows.remove_range(..r.start);
-            rows.remove_range(r.end..);
-            rows
-        }
-        RowSelection::Rows(s) => rows & s.as_ref(),
-    }
-}
-
-/// Rows a part selects.
-pub(crate) fn part_rows(p: &SegmentPart) -> u64 {
-    match &p.rows {
-        RowSelection::All => p.seg.row_count,
-        RowSelection::Range(r) => r.end - r.start,
-        RowSelection::Rows(s) => s.len(),
-    }
-}
-
 /// Rows of `part` (file row ids) where `unit` holds, by scanning its column (no sidecar, or `NoIndex`). Streams:
 /// one batch at a time, charged to `pool` (D5).
 pub(crate) async fn brute(
@@ -181,11 +159,11 @@ pub(crate) async fn brute(
     part: &SegmentPart,
     unit: &Unit,
 ) -> Result<RoaringTreemap, QueryError> {
-    let start = match &part.rows {
-        RowSelection::All => 0,
-        RowSelection::Range(r) => r.start,
-        RowSelection::Rows(_) => unreachable!("candidate parts are All or Range"),
-    };
+    debug_assert!(
+        !matches!(part.rows, RowSelection::Rows(_)),
+        "candidate parts are All or Range"
+    );
+    let start = part.rows.first_row();
     let req = scan_request(part, &[unit.col.name()], None);
     let mut stream = view.store().scan(&part.seg, req).await?;
     let res = MemoryConsumer::new("fts.brute").register(pool);
@@ -262,18 +240,11 @@ pub(crate) async fn part_hits(
     cols: &[&'static str],
 ) -> Result<PartHits, QueryError> {
     let bruted = looked.iter().any(Option::is_none);
-    FtsCounters::add(
-        if bruted {
-            &counters.brute_parts
-        } else {
-            &counters.index_parts
-        },
-        1,
-    );
+    counters.add(1, |c| if bruted { &mut c.brute_parts } else { &mut c.index_parts });
     let mut per_unit = Vec::with_capacity(units.len());
     for (u, h) in units.iter().zip(looked) {
         per_unit.push(match h {
-            Some(rows) => clip(rows, &part.rows),
+            Some(rows) => part.rows.intersect(rows),
             None => brute(view, pool, part, u).await?,
         });
     }
@@ -285,7 +256,7 @@ pub(crate) async fn part_hits(
     };
     let all = h.rows();
     if bruted || !all.is_empty() {
-        FtsCounters::add(&counters.segments_read, 1);
+        counters.add(1, |c| &mut c.segments_read);
     }
     if !all.is_empty() {
         let hit = SegmentPart {
@@ -388,7 +359,7 @@ pub(crate) async fn select(
 
     // Segments: index (or brute force) per unit, then the keys of the hit rows.
     // A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
-    let bruted0 = counters.brute_parts.load(Ordering::Relaxed);
+    let bruted0 = counters.get().brute_parts;
     let mut futs = Vec::with_capacity(parts.len());
     for part in parts {
         let units = &units;
@@ -411,7 +382,7 @@ pub(crate) async fn select(
         .try_collect()
         .await?;
     // Other queries add to the counter too: the count is approximate when they overlap.
-    let n = counters.brute_parts.load(Ordering::Relaxed).saturating_sub(bruted0);
+    let n = counters.get().brute_parts.saturating_sub(bruted0);
     if n > 0 {
         tracing::warn!(project = %p, segments = n, "search: segments without a usable .fts were scanned by brute force");
     }
@@ -455,7 +426,7 @@ pub(crate) async fn select(
         if let Some((_, keep)) = single.rows.get(&h.seg.id) {
             let rows = tree.rows(&h.per_unit) & keep;
             if !rows.is_empty() {
-                FtsCounters::add(&counters.exact_rows, rows.len());
+                counters.add(rows.len(), |c| &mut c.exact_rows);
                 sel.exact.push(SegmentPart {
                     seg: h.seg.clone(),
                     rows: RowSelection::Rows(Arc::new(rows)),
@@ -466,7 +437,9 @@ pub(crate) async fn select(
     // Everything else: all versions, merged and re-checked (memtable-only traces too).
     sel.merge_traces = traces.into_iter().filter(|t| !single.traces.contains(t)).collect();
     sel.merge = coalesce(single.merge, 0);
-    FtsCounters::add(&counters.merge_rows, sel.merge.iter().map(part_rows).sum());
+    counters.add(sel.merge.iter().map(|p| p.rows.len(p.seg.row_count)).sum(), |c| {
+        &mut c.merge_rows
+    });
     Ok(Some(sel))
 }
 

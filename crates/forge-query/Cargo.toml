@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 # Test hooks and wrappers (`testing`, the blocking-phase hook) for this crate's and forge-server's tests.
-test-util = ["dep:forge-ingest", "forge-ingest/test-util", "forge-storage/test-util"]
+test-util = ["dep:forge-ingest", "forge-ingest/test-util", "forge-storage/test-util", "forge-model/test-util"]
 
 [lints]
 workspace = true

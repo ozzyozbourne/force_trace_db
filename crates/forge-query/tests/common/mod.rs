@@ -15,7 +15,7 @@ pub use forge_model::testing::sort_by_key;
 use forge_model::testing::{FixedMemtable, RefNode, Rng, batch_from_rows, pid, reference, sid, tid, tree_parents};
 use forge_query::QueryEngine;
 use forge_query::runs::{Cursor, RunsParams, RunsRequest};
-use forge_query::testing::{RecordingSegmentStore, write_flush};
+use forge_query::testing::{RecordingSegmentStore, stamp_versions, write_flushes};
 use forge_query::trace::{TraceFormat, TraceRequest};
 use forge_storage::{SegmentStore, VortexSegmentStore, build_object_store};
 use serde_json::{Value, json};
@@ -82,11 +82,7 @@ impl Fixture {
     }
 
     pub async fn build_with(mut layout: Layout, traps: Traps, cfg: QueryConfig, partitions: usize) -> Self {
-        let mut v = 0;
-        for r in layout.flushes.iter_mut().chain(layout.mem.iter_mut()).flatten() {
-            v += 1;
-            r.version = v;
-        }
+        stamp_versions(layout.flushes.iter_mut().chain(layout.mem.iter_mut()).flatten());
         let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
         let built = build_object_store(&StorageConfig {
             url: "memory://".into(),
@@ -94,23 +90,15 @@ impl Fixture {
         .unwrap();
         let inner: Arc<dyn SegmentStore> = Arc::new(VortexSegmentStore::new(built));
         let store = Arc::new(RecordingSegmentStore::new(inner));
-        let mut max_version = 0;
-        for (i, f) in layout.flushes.iter().enumerate() {
-            max_version += f.len() as u64;
-            let b = batch_from_rows(f);
-            let hour = HourBucket::from_nanos(BASE);
-            write_flush(
-                &*meta,
-                store.clone(),
-                &b,
-                hour,
-                "test",
-                64 << 10,
-                i as u64 + 1,
-                max_version,
-            )
-            .await;
-        }
+        write_flushes(
+            &*meta,
+            store.clone(),
+            &layout.flushes,
+            |_| HourBucket::from_nanos(BASE),
+            "test",
+            64 << 10,
+        )
+        .await;
         let mut mem: Vec<RecordBatch> = layout
             .mem
             .iter()

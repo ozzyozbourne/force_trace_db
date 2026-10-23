@@ -22,6 +22,10 @@ enum FtsError {
     Build(forge_index::IndexError),
     /// The upload failed: the segment fails like a `.vortex` upload (the flush retries it).
     Put(StorageError),
+    /// The task was aborted: the segment fails.
+    Aborted,
+    /// The task panicked: the segment commits without a sidecar.
+    Panic(tokio::task::JoinError),
 }
 
 pub struct SegmentSink {
@@ -135,21 +139,25 @@ impl SegmentSink {
     pub async fn finish(mut self) -> Result<NewSegment, IngestError> {
         self.close();
         let w = join(self.handle.take().expect("not finished")).await;
-        let fts = self.fts.take().expect("not finished").await;
+        let fts = match self.fts.take().expect("not finished").await {
+            Ok(Ok(r)) => r,
+            Ok(Err(Aborted)) => Err(FtsError::Aborted),
+            Err(e) => Err(FtsError::Panic(e)),
+        };
         let mut w = w?;
         w.meta.fts_byte_size = match fts {
-            Ok(Ok(Ok((rows, bytes)))) if u64::from(rows) == w.meta.row_count => Some(bytes),
-            Ok(Ok(Ok((rows, _)))) => {
+            Ok((rows, bytes)) if u64::from(rows) == w.meta.row_count => Some(bytes),
+            Ok((rows, _)) => {
                 tracing::error!(segment = %w.meta.id, rows, expected = w.meta.row_count, ".fts row count differs; segment committed without it");
                 None
             }
-            Ok(Ok(Err(FtsError::Put(e)))) => return Err(e.into()),
-            Ok(Ok(Err(FtsError::Build(e)))) => {
+            Err(FtsError::Put(e)) => return Err(e.into()),
+            Err(FtsError::Aborted) => return Err(IngestError::Internal(".fts task aborted".into())),
+            Err(FtsError::Build(e)) => {
                 tracing::error!(segment = %w.meta.id, error = %e, ".fts build failed; segment committed without it");
                 None
             }
-            Ok(Err(Aborted)) => return Err(IngestError::Internal(".fts task aborted".into())),
-            Err(e) => {
+            Err(FtsError::Panic(e)) => {
                 tracing::error!(segment = %w.meta.id, error = %e, ".fts build panicked; segment committed without it");
                 None
             }
@@ -246,12 +254,7 @@ mod tests {
         let loc = object_store::path::Path::from(paths::fts_path(&seg.path).as_str());
         let bytes = os.get(&loc).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes.len() as u64, len);
-        let fetch = |rs: Vec<std::ops::Range<u64>>| {
-            std::future::ready(Ok(rs
-                .into_iter()
-                .map(|r| bytes.slice(r.start as usize..r.end as usize))
-                .collect()))
-        };
+        let fetch = forge_index::read::bytes_fetch(bytes.clone());
         let f = forge_index::FtsFile::open("t", len, &fetch).await.unwrap().0;
         let an = &mut forge_index::Analyzer::default();
         let lookup = async |an: &mut forge_index::Analyzer, t: &str| {

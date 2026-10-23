@@ -8,6 +8,7 @@ use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::SpanRow;
 use forge_model::testing::pid;
 use forge_query::search::{SearchBody, SearchRequest};
+use forge_query::testing::{positions, search_pages};
 
 fn cell(r: &SpanRow, c: FtsColumn) -> Option<&str> {
     match c {
@@ -50,38 +51,19 @@ fn ref_search(reference: &[SpanRow], project: &str, q: &str) -> Vec<(i64, TraceI
 }
 
 async fn pages(f: &Fixture, project: &str, q: &str, limit: usize) -> Vec<(i64, TraceId, SpanId)> {
-    use arrow::array::{Array, AsArray};
-    let mut out = Vec::new();
-    let mut cursor = None;
-    loop {
+    let req = |cursor| {
         let body = SearchBody {
             q: q.into(),
             limit: Some(limit),
-            cursor: cursor.take(),
+            cursor,
             ..Default::default()
         };
-        let r = SearchRequest::parse(body, pid(project)).unwrap();
-        let page = f.engine.search(&r).await.unwrap();
-        let b = &page.rows;
-        let s = b.schema();
-        let st = b
-            .column(s.index_of("start_time").unwrap())
-            .as_primitive::<arrow::datatypes::TimestampNanosecondType>();
-        let t = b.column(s.index_of("trace_id").unwrap()).as_binary::<i32>();
-        let sp = b.column(s.index_of("span_id").unwrap()).as_binary::<i32>();
-        for i in 0..b.num_rows() {
-            assert!(st.is_valid(i));
-            out.push((
-                st.value(i),
-                TraceId::from_slice(t.value(i)).unwrap(),
-                SpanId::from_slice(sp.value(i)).unwrap(),
-            ));
-        }
-        assert!(b.num_rows() <= limit);
-        match page.next_cursor {
-            Some(c) => cursor = Some(r.encode_cursor(&c)),
-            None => break,
-        }
+        SearchRequest::parse(body, pid(project)).unwrap()
+    };
+    let mut out = Vec::new();
+    for p in search_pages(&f.engine, req, usize::MAX).await {
+        out.extend(positions(&p.rows));
+        assert!(p.rows.num_rows() <= limit);
     }
     out
 }

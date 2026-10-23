@@ -287,11 +287,9 @@ impl QueryEngine {
         r: &RunsRequest,
     ) -> Result<(RunsPage, MemoryReservation), QueryError> {
         let view = self.read_view(); // FIRST (invariant 1)
-        let cols = read_columns(&RUN_COLUMNS);
         let hi = upper_bound(r.end_ns, r.cursor);
         let segs = newest_first_segments(&view, &r.project, r.start_ns, hi).await?;
-        let src = RootScan { r, hi, cols: &cols };
-        page(q, &view, &src, segs, r.limit, &projected_schema(&cols)).await
+        page(q, &view, &RootScan { r, hi }, segs, r.limit, 0).await
     }
 }
 
@@ -350,11 +348,8 @@ pub(crate) trait CandidateSource: Send + Sync {
     async fn start(&self, _q: &QueryCtx, _view: &ReadView, _segs: &[SegmentMeta]) -> Result<(), QueryError> {
         Ok(())
     }
-    /// Lookahead window size; 0 = no prefetch.
-    fn prefetch_window(&self) -> usize {
-        0
-    }
-    /// Lookahead over one whole window of the next segments in frontier order (search: index lookups, D10).
+    /// Lookahead over one whole window of the next segments in frontier order (search: index lookups, D10; `page`'s
+    /// `prefetch` sets the window).
     async fn prefetch(&self, _q: &QueryCtx, _view: &ReadView, _next: &[SegmentMeta]) -> Result<(), QueryError> {
         Ok(())
     }
@@ -397,14 +392,15 @@ impl Candidate {
 
 const MIN_CHUNK: usize = 256;
 
-/// The shared early-stop loop (D8): the newest `k` verified rows of `src` over `segs`, as a page.
+/// The shared early-stop loop (D8): the newest `k` verified rows of `src` over `segs` (RUN_COLUMNS), as a page.
+/// `prefetch`: the lookahead window (0 = none).
 pub(crate) async fn page(
     q: &QueryCtx,
     view: &ReadView,
     src: &dyn CandidateSource,
     mut segs: Vec<SegmentMeta>,
     k: usize,
-    schema: &SchemaRef,
+    prefetch: usize,
 ) -> Result<(RunsPage, MemoryReservation), QueryError> {
     let k = k.max(1);
     src.start(q, view, &segs).await?;
@@ -434,9 +430,9 @@ pub(crate) async fn page(
         }
         let frontier = segs.get(i).and_then(|s| src.frontier(s));
         let above = |p: &Pos| frontier.is_none_or(|f| p.0 > f);
-        // Done when the K-th verified row is above the frontier AND no unverified candidate is newer than it: a row
-        // verified from an Unpositioned candidate can land below positioned candidates not yet verified.
-        // and no Unpositioned candidate is pending (its merged position is unknown until verified).
+        // Done when no Unpositioned candidate is pending (its merged position is unknown until verified), the K-th
+        // verified row is above the frontier, and no unverified candidate is newer than it (a row verified from an
+        // Unpositioned candidate can land below positioned candidates not yet verified).
         let kth_above =
             |v: &BTreeMap<Reverse<Pos>, (usize, usize)>, cand: &BTreeSet<Reverse<Pos>>, pending: &[Candidate]| {
                 pending.is_empty()
@@ -475,7 +471,7 @@ pub(crate) async fn page(
             break;
         }
         let end = src.group_end(&segs, i).min(segs.len());
-        let w = src.prefetch_window();
+        let w = prefetch;
         while w > 0 && horizon < end {
             // Whole windows: one round of lookups per `w` segments, not one per group (RA M3).
             horizon = horizon.max(i);
@@ -502,7 +498,7 @@ pub(crate) async fn page(
     let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
     let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
     let rows = if idx.is_empty() {
-        RecordBatch::new_empty(schema.clone())
+        RecordBatch::new_empty(projected_schema(&read_columns(&RUN_COLUMNS)))
     } else {
         interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?
     };
@@ -514,7 +510,6 @@ pub(crate) async fn page(
 struct RootScan<'a> {
     r: &'a RunsRequest,
     hi: Option<i64>,
-    cols: &'a [&'static str],
 }
 
 #[async_trait::async_trait]
@@ -576,7 +571,7 @@ impl CandidateSource for RootScan<'_> {
                 Candidate::Unpositioned(..) => unreachable!("a root candidate has a start"),
             })
             .collect();
-        verify(q, view, self.r, self.hi, self.cols, &wave, res).await
+        verify(q, view, self.r, self.hi, &wave, res).await
     }
 }
 
@@ -588,10 +583,10 @@ async fn verify(
     view: &ReadView,
     r: &RunsRequest,
     hi: Option<i64>,
-    cols: &[&'static str],
     wave: &[Pos],
     res: MemoryReservation,
 ) -> Result<(RecordBatch, MemoryReservation), QueryError> {
+    let cols = read_columns(&RUN_COLUMNS);
     let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
     let filter = span_filter(&keys.iter().map(|k| k.1).collect());
     let k = KeyFilters {
@@ -600,8 +595,8 @@ async fn verify(
         ..KeyFilters::project(&r.project, None)
     };
     let parts = coalesce(view.locate_versions(&k).await?, VERIFY_GAP);
-    let scanned = view.scan(&parts, cols, filter).await?;
-    let schema: SchemaRef = projected_schema(cols);
+    let scanned = view.scan(&parts, &cols, filter).await?;
+    let schema: SchemaRef = projected_schema(&cols);
     let name_q =
         r.q.as_ref()
             .map(|q| {
@@ -614,13 +609,7 @@ async fn verify(
             .transpose()?;
     let (snap, r) = (view.mem().clone(), r.clone());
     q.blocking("runs.verify", move |cancel| {
-        let mut batches = Vec::new();
-        for b in scanned {
-            batches.push(match k.key_mask(&b)? {
-                Some(m) => filter_record_batch(&b, &m)?,
-                None => b,
-            });
-        }
+        let mut batches: Vec<RecordBatch> = scanned.into_iter().map(|b| k.apply(b)).collect::<Result<_, _>>()?;
         let mem = mem_versions(&snap, &k, &schema, cancel)?;
         let merge = needs_merge(&parts, !mem.is_empty());
         batches.extend(mem);

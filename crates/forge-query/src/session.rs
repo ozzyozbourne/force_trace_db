@@ -38,9 +38,9 @@ impl QueryEngine {
             counters: self.fts.clone(),
         };
         ctx.register_table("spans", Arc::new(provider))?;
-        ctx.register_udf(ScalarUDF::new_from_impl(fts::SearchUdf::default()));
-        ctx.register_udf(ScalarUDF::new_from_impl(fts::JsonKeySearchUdf::default()));
-        ctx.register_udf(ScalarUDF::new_from_impl(fts::JsonKeyUdf::default()));
+        for u in [fts::Udf::Search, fts::Udf::JsonKeySearch, fts::Udf::JsonKey] {
+            ctx.register_udf(ScalarUDF::new_from_impl(fts::FtsUdf::new(u)));
+        }
         ctx.register_udtf(
             "trace_tree",
             Arc::new(fts::TraceTreeFunc {

@@ -88,25 +88,21 @@ async fn snapshot(fx: &Fixture) -> Vec<String> {
                     .unwrap()
                     .to_string(),
             );
-            let mut cursor = None;
-            loop {
+            let req = |cursor| {
                 let body = forge_query::search::SearchBody {
                     q: q.into(),
                     limit: Some(7),
-                    cursor: cursor.take(),
+                    cursor,
                     ..Default::default()
                 };
-                let r = forge_query::search::SearchRequest::parse(body, ProjectId::new(p.clone()).unwrap()).unwrap();
-                let page = fx.engine.search(&r).await.unwrap();
+                forge_query::search::SearchRequest::parse(body, ProjectId::new(p.clone()).unwrap()).unwrap()
+            };
+            for page in forge_query::testing::search_pages(&fx.engine, req, usize::MAX).await {
                 out.push(
                     arrow::util::pretty::pretty_format_batches(&[page.rows])
                         .unwrap()
                         .to_string(),
                 );
-                match page.next_cursor {
-                    Some(c) => cursor = Some(r.encode_cursor(&c)),
-                    None => break,
-                }
             }
         }
     }

@@ -2,8 +2,7 @@
 //! merge agree on randomized and forced-edge fixtures.
 mod common;
 
-use arrow::array::{AsArray, RecordBatch};
-use arrow::datatypes::TimestampNanosecondType;
+use arrow::array::AsArray;
 use common::*;
 use forge_model::config::QueryConfig;
 use forge_model::dotted::resolve_dotted_orders;
@@ -14,27 +13,10 @@ use forge_model::schema::{PAYLOAD_COLUMNS, col};
 use forge_model::testing::{RefNode, Rng, pid, ref_tree, sid, tid};
 use forge_query::QueryError;
 use forge_query::runs::{Cursor, Pos, RUN_COLUMNS, RunsParams, RunsRequest};
+use forge_query::testing::positions;
 use forge_query::trace::TraceFormat;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-
-fn positions(b: &RecordBatch) -> Vec<Pos> {
-    let s = b.schema();
-    let st = b
-        .column(s.index_of(col::START_TIME).unwrap())
-        .as_primitive::<TimestampNanosecondType>();
-    let t = b.column(s.index_of(col::TRACE_ID).unwrap()).as_binary::<i32>();
-    let sp = b.column(s.index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
-    (0..b.num_rows())
-        .map(|i| {
-            (
-                st.value(i),
-                TraceId::from_slice(t.value(i)).unwrap(),
-                SpanId::from_slice(sp.value(i)).unwrap(),
-            )
-        })
-        .collect()
-}
 
 fn no_payload_or_dotted(projections: &[Vec<&str>], what: &str) {
     assert!(!projections.is_empty(), "{what}: nothing scanned");

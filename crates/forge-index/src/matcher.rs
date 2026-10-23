@@ -596,9 +596,7 @@ mod tests {
                     b.add_batch(&batch).unwrap();
                 }
                 let file = Bytes::from(b.finish().unwrap().0);
-                let fetch = |rs: Vec<std::ops::Range<u64>>| {
-                    std::future::ready(Ok::<_, IndexError>(rs.into_iter().map(|r| file.slice(r.start as usize..r.end as usize)).collect()))
-                };
+                let fetch = crate::read::bytes_fetch(file.clone());
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 let f = rt.block_on(FtsFile::open("t.fts", file.len() as u64, &fetch)).unwrap().0;
                 let nulls: RoaringBitmap = rows.iter().enumerate().filter(|(_, r)| r.1).map(|(i, _)| i as u32).collect();

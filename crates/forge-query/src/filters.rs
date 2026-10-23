@@ -229,6 +229,14 @@ impl KeyFilters {
         }
     }
 
+    /// `b` without the rows `key_mask` drops.
+    pub(crate) fn apply(&self, b: RecordBatch) -> Result<RecordBatch, ArrowError> {
+        match self.key_mask(&b)? {
+            Some(m) => arrow::compute::filter_record_batch(&b, &m),
+            None => Ok(b),
+        }
+    }
+
     /// The rows that pass the KEY filters (never time: start_time is mutable before the merge); None = no key
     /// filter. Columns are found by name, so any batch with the key columns works.
     pub(crate) fn key_mask(&self, b: &RecordBatch) -> Result<Option<BooleanArray>, ArrowError> {
