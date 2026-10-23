@@ -1,6 +1,7 @@
 use crate::AppState;
 use crate::error::ApiError;
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -50,8 +51,10 @@ async fn list(State(s): State<AppState>) -> Result<Json<Vec<ProjectView>>, ApiEr
 
 async fn create(
     State(s): State<AppState>,
-    Json(req): Json<CreateProject>,
+    req: Result<Json<CreateProject>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ProjectView>), ApiError> {
+    // Bad bodies get the same 400 {"error": ..} shape as other invalid input (axum defaults to 415/422 text).
+    let Json(req) = req.map_err(|e| ApiError::invalid_input(e.body_text()))?;
     let id = ProjectId::new(req.id)?;
     let p = Project::new(id, req.name, req.retention_days, now_ms())?;
     s.meta.create_project(p.clone()).await?;

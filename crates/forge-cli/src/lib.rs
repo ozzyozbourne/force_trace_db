@@ -95,6 +95,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Serve => {
             // Before any startup work, so an early SIGTERM is queued instead of killing the process.
             let signals = ShutdownSignals::install().context("installing signal handlers")?;
+            tracing::info!("starting");
             let cfg = ForgeConfig::load(cli.config.as_deref()).context("loading config")?;
             Forge::open(cfg).await?.serve(signals).await
         }

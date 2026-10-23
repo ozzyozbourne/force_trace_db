@@ -163,6 +163,7 @@ async fn commit_flush_round_trip() {
     let s = SqliteMetastore::open_in_memory().unwrap();
     let a = seg("p", Level::L0, Some((10, 20)), 0, 7);
     let mut b = seg("q", Level::L0, Some((30, 40)), 0, 9);
+    b.meta.row_count = 25;
     b.traces.push(TraceRange {
         trace_id: TraceId([3; 16]),
         row_start: 20,
@@ -273,10 +274,18 @@ async fn failed_commit_changes_nothing() {
 #[tokio::test]
 async fn u64_overflow_is_an_error() {
     let s = SqliteMetastore::open_in_memory().unwrap();
-    assert!(s.commit_flush(flush(vec![], u64::MAX, 1)).await.is_err());
-    let mut big = seg("p", Level::L0, None, 1, 1);
+    let e = s.commit_flush(flush(vec![], u64::MAX, 1)).await.unwrap_err();
+    assert!(
+        matches!(e, MetaError::InvalidInput(ref m) if m.contains("flushed_wal_seq")),
+        "{e:?}"
+    );
+    let mut big = seg("p", Level::L0, None, 20, 1);
     big.meta.max_version = u64::MAX;
-    assert!(s.commit_flush(flush(vec![big], 1, 1)).await.is_err());
+    let e = s.commit_flush(flush(vec![big], 1, 1)).await.unwrap_err();
+    assert!(
+        matches!(e, MetaError::InvalidInput(ref m) if m.contains("max_version")),
+        "{e:?}"
+    );
     assert_eq!(s.wal_checkpoint("n").await.unwrap(), None);
 }
 
@@ -389,10 +398,126 @@ async fn urls() {
             url: "postgres://x".into()
         })
         .await,
-        Err(MetaError::Unimplemented(_))
+        Err(MetaError::Config { ref msg, .. }) if msg == "postgres metastore is not supported yet"
     ));
     assert!(matches!(
         open(&MetastoreConfig { url: "bogus://".into() }).await,
-        Err(MetaError::Config(_))
+        Err(MetaError::Config { .. })
     ));
+}
+
+#[tokio::test]
+async fn mkdir_failure_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("file"), b"x").unwrap();
+    let url = format!("sqlite://{}/file/x/meta.db", dir.path().display());
+    let e = open(&MetastoreConfig { url }).await.err().unwrap();
+    assert!(matches!(e, MetaError::CreateDir { .. }), "{e:?}");
+    let msg = e.to_string();
+    assert!(msg.starts_with("cannot create ") && msg.contains("file/x"), "{msg}");
+}
+
+#[test]
+fn busy_and_locked_are_transient() {
+    use forge_model::error::{Classify, ErrorKind};
+    use rusqlite::ffi;
+    for code in [ffi::SQLITE_BUSY, ffi::SQLITE_LOCKED] {
+        let e = MetaError::Sqlite(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    }
+    let e = MetaError::Sqlite(rusqlite::Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_CORRUPT),
+        None,
+    ));
+    assert_eq!(e.kind(), ErrorKind::Internal);
+}
+
+#[test]
+fn upgrade_from_v1_applies_only_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = Connection::open(dir.path().join("m.db")).unwrap();
+    assert_eq!(migrate_with(&mut c, MIGRATIONS).unwrap(), 1);
+    assert_eq!(
+        migrate_with(&mut c, &[MIGRATIONS[0], (2, "t2", "CREATE TABLE t2(x)")]).unwrap(),
+        2
+    );
+    assert_eq!(version_rows(&c), 2);
+    assert!(has_table(&c, "t2"));
+}
+
+#[tokio::test]
+async fn retried_commit_is_idempotent() {
+    let s = SqliteMetastore::open_in_memory().unwrap();
+    let a = seg("p", Level::L0, Some((1, 2)), 0, 3);
+    s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
+    s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
+    assert_eq!(
+        s.list_segments(&SegmentFilter::default()).await.unwrap(),
+        std::slice::from_ref(&a.meta)
+    );
+    assert_eq!(s.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+    assert_eq!(
+        s.wal_checkpoint("n").await.unwrap(),
+        Some(WalCheckpoint {
+            flushed_seq: 5,
+            max_version: 3
+        })
+    );
+    // Same id, different path: a real conflict.
+    let mut other = a.clone();
+    other.meta.path.push_str(".other");
+    let e = s.commit_flush(flush(vec![other], 6, 3)).await.unwrap_err();
+    assert!(matches!(e, MetaError::Conflict(_)), "{e:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_retried_after_cancellation_succeeds() {
+    let s = SqliteMetastore::open_in_memory().unwrap();
+    let a = seg("p", Level::L0, Some((1, 2)), 0, 3);
+    // Poll the commit once (it starts on the blocking pool), then drop it: the txn may still land.
+    tokio::select! {
+        biased;
+        _ = s.commit_flush(flush(vec![a.clone()], 5, 3)) => {}
+        _ = std::future::ready(()) => {}
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    s.commit_flush(flush(vec![a.clone()], 5, 3)).await.unwrap();
+    assert_eq!(s.get_segment(a.meta.id).await.unwrap(), Some(a.meta));
+}
+
+#[tokio::test]
+async fn bad_trace_ranges_are_invalid_input() {
+    let s = SqliteMetastore::open_in_memory().unwrap();
+    let mut past_end = seg("p", Level::L0, None, 20, 1);
+    past_end.traces[1].row_start = 15; // 15..25 of 20 rows
+    let mut overlap = seg("p", Level::L0, None, 20, 1);
+    overlap.traces[1].row_start = 5; // 0..10 and 5..15
+    let mut overflow = seg("p", Level::L0, None, 20, 1);
+    overflow.traces[1].row_start = u64::MAX;
+    for bad in [past_end, overlap, overflow] {
+        let e = s.commit_flush(flush(vec![bad], 1, 1)).await.unwrap_err();
+        assert!(matches!(e, MetaError::InvalidInput(_)), "{e:?}");
+    }
+    assert!(s.list_segments(&SegmentFilter::default()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn limit_is_applied_after_the_rust_filters() {
+    let s = SqliteMetastore::open_in_memory().unwrap();
+    // Newest-first puts the all-null L1 segment first in SQL order; the levels filter drops it.
+    let l1_null = seg("p", Level::L1, None, 20, 1);
+    let early = seg("p", Level::L0, Some((100, 200)), 0, 1);
+    s.commit_flush(flush(vec![l1_null, early.clone()], 1, 1)).await.unwrap();
+    let f = SegmentFilter {
+        levels: Some(vec![Level::L0]),
+        newest_first: true,
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(s.list_segments(&f).await.unwrap(), [early.meta]);
+    let none = SegmentFilter {
+        limit: Some(0),
+        ..Default::default()
+    };
+    assert!(s.list_segments(&none).await.unwrap().is_empty());
 }

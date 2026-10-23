@@ -11,7 +11,9 @@ pub fn ops_router(state: AppState) -> Router {
         .route(
             "/readyz",
             get(|State(s): State<AppState>| async move {
-                if s.ready.load(Ordering::Acquire) {
+                if s.shutdown.is_cancelled() {
+                    (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+                } else if s.ready.load(Ordering::Acquire) {
                     (StatusCode::OK, "ready")
                 } else {
                     (StatusCode::SERVICE_UNAVAILABLE, "starting")

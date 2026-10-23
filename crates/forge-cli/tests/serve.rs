@@ -140,12 +140,16 @@ impl ServerProc {
         assert_eq!(body, "ok");
     }
 
-    fn sigterm(&self) {
+    fn signal(&self, sig: &str) {
         let st = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
+            .args([&format!("-{sig}"), &self.child.id().to_string()])
             .status()
             .expect("run kill");
-        assert!(st.success(), "kill -TERM failed: {st}");
+        assert!(st.success(), "kill -{sig} failed: {st}");
+    }
+
+    fn sigterm(&self) {
+        self.signal("TERM");
     }
 
     async fn wait_exit(&mut self, within: Duration) -> ExitStatus {
@@ -326,11 +330,35 @@ async fn projects_persist_across_restart() {
     assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
     drop(s);
 
+    // Run 2 stops with Ctrl-C (SIGINT).
     let (mut s, p) = start(tmp.path(), "2s").await;
     let body = project_list(&c, p.api).await;
     assert!(body.contains("\"demo\""), "{body}");
+    s.signal("INT");
+    let st = s.wait_exit(Duration::from_secs(10)).await;
+    let logs = s.logs();
+    assert!(st.success(), "{st}\n{logs}");
+    assert!(logs.contains("shutdown signal received"), "{logs}");
+}
+
+#[tokio::test]
+async fn signal_during_startup_is_queued_and_drains() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = write_config(tmp.path(), "2s");
+    // Hold an exclusive lock on meta.db so startup blocks in the metastore open, after signal install.
+    let lock = rusqlite::Connection::open(tmp.path().join("meta.db")).expect("open meta.db");
+    lock.execute_batch("BEGIN EXCLUSIVE").expect("lock meta.db");
+    let mut s = ServerProc::spawn(tmp.path(), Some(&cfg), &[]);
+    s.wait_for_log("\"starting\"", Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!s.logs().contains("listening"), "startup was not blocked\n{}", s.logs());
     s.sigterm();
-    assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(lock);
+    let st = s.wait_exit(Duration::from_secs(15)).await;
+    let logs = s.logs();
+    assert!(st.success(), "{st}\n{logs}");
+    assert!(logs.contains("shutdown signal received"), "{logs}");
 }
 
 #[tokio::test]

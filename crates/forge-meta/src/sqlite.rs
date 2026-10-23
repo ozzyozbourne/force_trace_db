@@ -113,8 +113,8 @@ fn to_u64(table: &'static str, v: i64) -> MetaResult<u64> {
 fn lock(m: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
-fn to_i64(v: u64) -> MetaResult<i64> {
-    i64::try_from(v).map_err(|_| MetaError::Conflict(format!("value {v} exceeds i64")))
+fn to_i64(what: &str, v: u64) -> MetaResult<i64> {
+    i64::try_from(v).map_err(|_| MetaError::InvalidInput(format!("{what} {v} exceeds i64::MAX")))
 }
 
 /// Borrows column `i` as text or blob (no allocation); a wrong type gives the same error as `Row::get`.
@@ -173,9 +173,49 @@ fn project_from_row(r: &Row<'_>) -> MetaResult<Project> {
     })
 }
 
+/// Trace ranges must not overlap and must lie inside the segment's rows (invariant 2).
+fn check_trace_ranges(s: &NewSegment) -> MetaResult<()> {
+    let m = &s.meta;
+    let mut ranges: Vec<_> = s.traces.iter().collect();
+    ranges.sort_by_key(|t| t.row_start);
+    let mut end = 0u64;
+    for t in ranges {
+        let bad = |why: &str| {
+            MetaError::InvalidInput(format!(
+                "segment {}: trace {} rows {}+{} {why} (segment has {} rows)",
+                m.id, t.trace_id, t.row_start, t.row_count, m.row_count
+            ))
+        };
+        if t.row_start < end {
+            return Err(bad("overlap another trace range"));
+        }
+        end = t.row_start.checked_add(t.row_count).ok_or_else(|| bad("overflow"))?;
+        if end > m.row_count {
+            return Err(bad("exceed the row count"));
+        }
+    }
+    Ok(())
+}
+
+/// Inserts one segment, or skips it when the same id and path are already committed (a retried commit).
 fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<()> {
     let m = &s.meta;
     let id = m.id.to_string();
+    check_trace_ranges(s)?;
+    let existing: Option<String> = tx
+        .prepare_cached("SELECT path FROM segments WHERE id = ?1")?
+        .query_row([&id], |r| r.get(0))
+        .optional()?;
+    match existing {
+        Some(path) if path == m.path => return Ok(()),
+        Some(path) => {
+            return Err(MetaError::Conflict(format!(
+                "segment {id} already exists with path {path}, not {}",
+                m.path
+            )));
+        }
+        None => {}
+    }
     let p = Project::new(m.project_id.clone(), None, None, now)?;
     tx.prepare_cached(&INSERT_PROJECT_IF_ABSENT)?.execute(params![
         p.id.as_str(),
@@ -191,16 +231,16 @@ fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<
             m.level.as_u8(),
             m.partition_hour.0,
             m.path,
-            to_i64(m.row_count)?,
-            to_i64(m.byte_size)?,
-            m.fts_byte_size.map(to_i64).transpose()?,
+            to_i64("row_count", m.row_count)?,
+            to_i64("byte_size", m.byte_size)?,
+            m.fts_byte_size.map(|v| to_i64("fts_byte_size", v)).transpose()?,
             m.min_start_ns,
             m.max_start_ns,
-            to_i64(m.start_time_nulls)?,
+            to_i64("start_time_nulls", m.start_time_nulls)?,
             m.min_trace_id.as_bytes(),
             m.max_trace_id.as_bytes(),
-            to_i64(m.min_version)?,
-            to_i64(m.max_version)?,
+            to_i64("min_version", m.min_version)?,
+            to_i64("max_version", m.max_version)?,
             m.schema_version,
             m.created_at_ms,
             SegmentState::Live.as_str(),
@@ -213,8 +253,8 @@ fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<
             m.project_id.as_str(),
             t.trace_id.as_bytes(),
             id,
-            to_i64(t.row_start)?,
-            to_i64(t.row_count)?
+            to_i64("row_start", t.row_start)?,
+            to_i64("row_count", t.row_count)?
         ])
         .map_err(|e| map_err(e, &format!("trace {} in segment {id}", t.trace_id)))?;
     }
@@ -319,7 +359,10 @@ impl Metastore for SqliteMetastore {
     }
 
     async fn commit_flush(&self, c: FlushCommit) -> MetaResult<()> {
-        let (seq, max_version) = (to_i64(c.flushed_wal_seq)?, to_i64(c.max_version)?);
+        let (seq, max_version) = (
+            to_i64("flushed_wal_seq", c.flushed_wal_seq)?,
+            to_i64("max_version", c.max_version)?,
+        );
         self.write(move |tx| {
             let now = now_ms();
             for s in &c.segments {
@@ -388,12 +431,12 @@ impl Metastore for SqliteMetastore {
             )?;
             let mut out = Vec::new();
             for r in rows {
+                if f.limit.is_some_and(|l| out.len() >= l) {
+                    break;
+                }
                 let s = r??;
                 if f.levels.as_ref().is_none_or(|l| l.contains(&s.level)) && s.may_overlap_time(f.start_ns, f.end_ns) {
                     out.push(s);
-                    if f.limit.is_some_and(|l| out.len() >= l) {
-                        break;
-                    }
                 }
             }
             Ok(out)

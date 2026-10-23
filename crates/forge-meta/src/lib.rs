@@ -24,8 +24,10 @@ pub enum MetaError {
     Conflict(String),
     #[error("corrupt row in {table}: {msg}")]
     Corrupt { table: &'static str, msg: String },
-    #[error("invalid metastore url {0:?}")]
-    Config(String),
+    #[error("invalid metastore url {url:?}: {msg}")]
+    Config { url: String, msg: String },
+    #[error("cannot create {}: {source}", path.display())]
+    CreateDir { path: PathBuf, source: std::io::Error },
     #[error("{0}")]
     InvalidInput(String),
     #[error(transparent)]
@@ -41,6 +43,15 @@ impl Classify for MetaError {
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::InvalidInput(_) => ErrorKind::InvalidInput,
             Self::Unimplemented(e) => e.kind(),
+            // Another process held the database past busy_timeout: retry later.
+            Self::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+                if matches!(
+                    f.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                ErrorKind::Transient
+            }
             _ => ErrorKind::Internal,
         }
     }
@@ -134,6 +145,9 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     /// Ordered by id.
     async fn list_projects(&self) -> MetaResult<Vec<Project>>;
     /// One BEGIN IMMEDIATE txn: auto-create projects, insert segments (live) + trace_index, upsert checkpoint.
+    /// Idempotent: a segment whose id and path are already committed is skipped, so retrying after an
+    /// ambiguous error (timeout, cancelled future) is safe. The checkpoint never moves backwards.
+    /// `InvalidInput` for trace ranges that overlap or exceed the segment's row count, or u64 values > i64::MAX.
     async fn commit_flush(&self, c: FlushCommit) -> MetaResult<()>;
     async fn wal_checkpoint(&self, node_id: &str) -> MetaResult<Option<WalCheckpoint>>;
     /// max(segments.max_version, wal_checkpoints.max_version); 0 when empty.
@@ -147,19 +161,25 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
 /// `sqlite::memory:` | `sqlite://<path>` (relative to the cwd unless it starts with `/`) | `postgres://` (later).
 pub async fn open(cfg: &MetastoreConfig) -> MetaResult<Arc<dyn Metastore>> {
     let url = cfg.url.as_str();
+    let config_err = |msg: &str| MetaError::Config {
+        url: url.to_string(),
+        msg: msg.to_string(),
+    };
     let path = match split_scheme(url) {
         _ if url == "sqlite::memory:" => None,
         Some(("sqlite", p)) if !p.is_empty() => Some(PathBuf::from(p)),
-        Some(("postgres" | "postgresql", _)) => return Err(Unimplemented("postgres metastore").into()),
-        _ => return Err(MetaError::Config(cfg.url.clone())),
+        Some(("postgres" | "postgresql", _)) => return Err(config_err("postgres metastore is not supported yet")),
+        _ => return Err(config_err("expected sqlite://<path> or sqlite::memory:")),
     };
     // All file work (mkdir, open, migrate) happens on the blocking pool.
     let m = tokio::task::spawn_blocking(move || match path {
         None => SqliteMetastore::open_in_memory(),
         Some(path) => {
             if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| MetaError::Config(format!("cannot create {}: {e}", parent.display())))?;
+                std::fs::create_dir_all(parent).map_err(|source| MetaError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
             }
             SqliteMetastore::open_path(&path)
         }

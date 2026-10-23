@@ -20,6 +20,15 @@ impl<E: Classify> From<E> for ApiError {
     }
 }
 
+impl ApiError {
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::InvalidInput,
+            msg: msg.into(),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = match self.kind {

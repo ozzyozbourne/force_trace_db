@@ -18,6 +18,8 @@ pub enum ModelError {
     UnknownEnum { what: &'static str, value: String },
     #[error("batch does not match the spans schema: {0}")]
     Schema(String),
+    #[error("hour bucket {0} is outside the supported time range")]
+    HourOutOfRange(i64),
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }

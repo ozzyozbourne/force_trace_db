@@ -1,5 +1,6 @@
 //! Catalog types shared by meta, storage, index, ingest and query.
 use crate::enums::str_enum;
+use crate::error::ModelError;
 use crate::ids::{ProjectId, TraceId};
 use chrono::format::{Item, StrftimeItems};
 use std::sync::LazyLock;
@@ -58,18 +59,23 @@ impl HourBucket {
     pub fn from_nanos(ns: i64) -> Self {
         Self(ns.div_euclid(Self::NANOS))
     }
-    pub fn start_nanos(self) -> i64 {
-        self.0 * Self::NANOS
+    /// First nanosecond of the hour; `HourOutOfRange` when it does not fit in i64 nanoseconds.
+    pub fn start_nanos(self) -> Result<i64, ModelError> {
+        self.0
+            .checked_mul(Self::NANOS)
+            .ok_or(ModelError::HourOutOfRange(self.0))
     }
     /// `yyyy-mm-dd/hh` (object layout).
-    pub fn path_component(self) -> String {
-        self.path_display().to_string()
+    pub fn path_component(self) -> Result<String, ModelError> {
+        Ok(self.path_display()?.to_string())
     }
-    fn path_display(self) -> impl fmt::Display {
+    fn path_display(self) -> Result<impl fmt::Display, ModelError> {
         static ITEMS: LazyLock<Vec<Item<'static>>> = LazyLock::new(|| StrftimeItems::new("%Y-%m-%d/%H").collect());
-        chrono::DateTime::<chrono::Utc>::from_timestamp(self.0 * 3600, 0)
-            .expect("hour in range")
-            .format_with_items(ITEMS.iter())
+        // Same range as the data timestamps (i64 ns), so every in-range bucket also formats.
+        self.start_nanos()?;
+        let t = chrono::DateTime::<chrono::Utc>::from_timestamp(self.0 * 3600, 0)
+            .ok_or(ModelError::HourOutOfRange(self.0))?;
+        Ok(t.format_with_items(ITEMS.iter()))
     }
 }
 
@@ -153,9 +159,15 @@ impl TraceLocation {
 
 pub mod paths {
     use super::{HourBucket, Level, SegmentId};
+    use crate::error::ModelError;
     use crate::ids::ProjectId;
-    pub fn segment_path(p: &ProjectId, level: Level, hour: HourBucket, id: SegmentId) -> String {
-        format!("segments/{p}/{}/{}/{id}.vortex", level.as_str(), hour.path_display())
+    /// `HourOutOfRange` for a bucket outside the i64-nanosecond time range.
+    pub fn segment_path(p: &ProjectId, level: Level, hour: HourBucket, id: SegmentId) -> Result<String, ModelError> {
+        Ok(format!(
+            "segments/{p}/{}/{}/{id}.vortex",
+            level.as_str(),
+            hour.path_display()?
+        ))
     }
     pub fn fts_path(segment_path: &str) -> String {
         format!("{}.fts", segment_path.strip_suffix(".vortex").unwrap_or(segment_path))
@@ -194,8 +206,32 @@ mod tests {
             .timestamp_nanos_opt()
             .unwrap();
         let h = HourBucket::from_nanos(ns);
-        assert_eq!(h.path_component(), "2026-10-22/10");
-        assert_eq!(HourBucket::from_nanos(h.start_nanos()), h);
+        assert_eq!(h.path_component().unwrap(), "2026-10-22/10");
+        assert_eq!(HourBucket::from_nanos(h.start_nanos().unwrap()), h);
+    }
+
+    #[test]
+    fn out_of_range_hours_are_errors_not_panics() {
+        let lo = HourBucket::from_nanos(i64::MIN + HourBucket::NANOS);
+        let hi = HourBucket::from_nanos(i64::MAX);
+        for h in [lo, hi] {
+            assert!(h.path_component().is_ok(), "{h:?}");
+            assert!(h.start_nanos().is_ok(), "{h:?}");
+        }
+        for h in [
+            HourBucket(hi.0 + 1),
+            HourBucket(lo.0 - 1),
+            HourBucket(i64::MAX / 3600),
+            HourBucket(i64::MIN),
+        ] {
+            assert!(
+                matches!(h.path_component(), Err(ModelError::HourOutOfRange(_))),
+                "{h:?}"
+            );
+            assert!(matches!(h.start_nanos(), Err(ModelError::HourOutOfRange(_))), "{h:?}");
+            let p = crate::testing::pid("p");
+            assert!(paths::segment_path(&p, Level::L0, h, SegmentId::new()).is_err());
+        }
     }
 
     #[test]
@@ -204,7 +240,7 @@ mod tests {
         assert_eq!(id.to_string().parse::<SegmentId>().unwrap(), id);
         assert!("nope".parse::<SegmentId>().is_err());
         let p = crate::testing::pid("p");
-        let path = paths::segment_path(&p, Level::L1, HourBucket(0), id);
+        let path = paths::segment_path(&p, Level::L1, HourBucket(0), id).unwrap();
         assert_eq!(path, "segments/p/L1/1970-01-01/00/01JAAAAAAAAAAAAAAAAAAAAAAA.vortex");
         assert_eq!(
             paths::fts_path(&path),

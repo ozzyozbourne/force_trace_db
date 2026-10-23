@@ -148,14 +148,26 @@ impl ForgeConfig {
             None => fig,
         };
         // Only nested keys are config, so FORGE_CONFIG / FORGE_LOG / FORGE_LOG_FORMAT (CLI) are ignored.
-        fig.merge(
-            Env::prefixed("FORGE_")
-                .filter(|k| k.as_str().contains("__"))
-                .split("__"),
-        )
-        .extract()
+        let env = Env::prefixed("FORGE_")
+            .filter(|k| k.as_str().contains("__"))
+            .split("__");
+        // figment type-sniffs env values (`007` -> 7), which loses text for string and path keys, so those
+        // keys are merged again with the raw env text.
+        let raw: Vec<(String, String)> = env
+            .iter()
+            .filter(|(k, _)| RAW_ENV_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        fig = fig.merge(env);
+        for (k, v) in raw {
+            fig = fig.merge(Serialized::default(&k, v));
+        }
+        fig.extract()
     }
 }
+
+/// Config keys whose type is String or PathBuf: env overrides keep their exact text.
+const RAW_ENV_KEYS: [&str; 5] = ["node.id", "storage.url", "metastore.url", "wal.dir", "cache.disk_dir"];
 
 impl Default for NodeConfig {
     fn default() -> Self {

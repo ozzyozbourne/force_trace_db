@@ -47,6 +47,11 @@ async fn ops_endpoints() {
     assert_eq!(call(&ops, get("/readyz")).await.0, StatusCode::SERVICE_UNAVAILABLE);
     f.ready.store(true, Ordering::Release);
     assert_eq!(call(&ops, get("/readyz")).await.0, StatusCode::OK);
+    f.shutdown.cancel();
+    assert_eq!(
+        call(&ops, get("/readyz")).await,
+        (StatusCode::SERVICE_UNAVAILABLE, Value::String("shutting down".into()))
+    );
     let resp = ops.clone().oneshot(get("/metrics")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["content-type"], "text/plain; version=0.0.4");
@@ -73,6 +78,25 @@ async fn projects_api() {
     assert!(v["error"].is_string(), "{v}");
     let (st, v) = call(&api, post("/v1/projects", json!({"id": "zero", "retention_days": 0}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // Body rejections (missing field, wrong type, bad JSON, no content-type) use the same 400 JSON shape.
+    let no_type = Request::post("/v1/projects")
+        .body(Body::from(json!({"id": "x"}).to_string()))
+        .unwrap();
+    let bad_json = Request::post("/v1/projects")
+        .header("content-type", "application/json")
+        .body(Body::from("{"))
+        .unwrap();
+    for req in [
+        post("/v1/projects", json!({"name": "no id"})),
+        post("/v1/projects", json!({"id": "neg", "retention_days": -1})),
+        bad_json,
+        no_type,
+    ] {
+        let (st, v) = call(&api, req).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].is_string(), "{v}");
+    }
 
     let (st, v) = call(&api, get("/v1/projects")).await;
     assert_eq!(st, StatusCode::OK);

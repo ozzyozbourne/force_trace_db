@@ -10,19 +10,21 @@ use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use forge_model::catalog::{SegmentMeta, SegmentState, TraceRange, paths};
+use forge_model::error::ModelError;
 use forge_model::ids::TraceId;
 use forge_model::row::validate_batch;
 use forge_model::schema::{SPANS_SCHEMA_VERSION, col, projected_schema, spans_schema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::path::Path;
-use object_store::{PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ArrowSessionExt;
+use vortex::dtype::DType;
 use vortex::error::VortexResult;
 use vortex::expr::{root, select};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
@@ -34,14 +36,22 @@ pub struct VortexSegmentStore {
     store: Arc<dyn ObjectStore>,
     local_root: Option<PathBuf>,
     session: VortexSession,
+    /// spans_schema as a Vortex dtype, converted once.
+    dtype: DType,
 }
 
 impl VortexSegmentStore {
     pub fn new(built: BuiltStore) -> Self {
+        let session = VortexSession::default().with_tokio();
+        let dtype = session
+            .arrow()
+            .from_arrow_schema(&spans_schema())
+            .expect("the static spans schema converts to a Vortex dtype");
         Self {
             store: built.store,
             local_root: built.local_root,
-            session: VortexSession::default().with_tokio(),
+            session,
+            dtype,
         }
     }
     /// Some(absolute root) for file:// stores.
@@ -64,11 +74,24 @@ fn lock(m: &Mutex<Ingest>) -> MutexGuard<'_, Ingest> {
 struct SegmentStats {
     rows: u64,
     traces: Vec<TraceRange>,
+    /// Sort key of the last row of the previous batch.
+    last: Option<OwnedKey>,
     min_start: Option<i64>,
     max_start: Option<i64>,
     start_nulls: u64,
     min_version: Option<u64>,
     max_version: Option<u64>,
+}
+
+/// Physical sort key: (trace_id, dotted_order NULLS LAST, span_id, version); the project is checked separately.
+type Key<'a> = (&'a [u8], (bool, &'a str), &'a [u8], i64);
+type OwnedKey = (Vec<u8>, (bool, String), Vec<u8>, i64);
+
+fn owned(k: Key<'_>) -> OwnedKey {
+    (k.0.to_vec(), (k.1.0, k.1.1.to_string()), k.2.to_vec(), k.3)
+}
+fn borrowed(k: &OwnedKey) -> Key<'_> {
+    (&k.0, (k.1.0, &k.1.1), &k.2, k.3)
 }
 
 /// Extends the running [lo, hi] range with `x`.
@@ -77,15 +100,25 @@ fn widen<T: Ord + Copy>(lo: &mut Option<T>, hi: &mut Option<T>, x: T) {
     *hi = Some(hi.map_or(x, |m| m.max(x)));
 }
 
+fn version(v: i64) -> StorageResult<u64> {
+    u64::try_from(v).map_err(|_| ModelError::Schema("version must be >= 0".into()).into())
+}
+
 impl SegmentStats {
     fn push(&mut self, spec_project: &str, b: &RecordBatch) -> StorageResult<()> {
         let p = b.column_by_name(col::PROJECT_ID).unwrap().as_string::<i32>();
         let t = b.column_by_name(col::TRACE_ID).unwrap().as_binary::<i32>();
+        let d = b.column_by_name(col::DOTTED_ORDER).unwrap().as_string::<i32>();
+        let sp = b.column_by_name(col::SPAN_ID).unwrap().as_binary::<i32>();
         let s = b
             .column_by_name(col::START_TIME)
             .unwrap()
             .as_primitive::<TimestampNanosecondType>();
         let v = b.column_by_name(col::VERSION).unwrap().as_primitive::<Int64Type>();
+        let key = |i: usize| -> Key<'_> {
+            let dotted = if d.is_null(i) { (true, "") } else { (false, d.value(i)) };
+            (t.value(i), dotted, sp.value(i), v.value(i))
+        };
         for i in 0..b.num_rows() {
             let proj = p.value(i);
             if proj != spec_project {
@@ -93,22 +126,39 @@ impl SegmentStats {
                     "row project {proj} != segment project {spec_project}"
                 )));
             }
-            let raw = t.value(i);
+            let cur = key(i);
+            let prev = if i > 0 {
+                Some(key(i - 1))
+            } else {
+                self.last.as_ref().map(borrowed)
+            };
+            if let Some(prev) = prev
+                && prev >= cur
+            {
+                let what = if prev == cur {
+                    "duplicate row"
+                } else {
+                    "row sorts before the previous row"
+                };
+                return Err(StorageError::Unsorted(format!(
+                    "{what} at row {}: trace_id {}, span_id {}, version {}",
+                    self.rows + i as u64,
+                    hex(cur.0),
+                    hex(cur.2),
+                    cur.3
+                )));
+            }
             match self.traces.last_mut() {
-                Some(last) if last.trace_id.as_bytes()[..] == *raw => last.row_count += 1,
-                Some(last) if last.trace_id.as_bytes()[..] > *raw => {
-                    let tid = TraceId::from_slice(raw).map_err(|e| StorageError::Unsorted(e.to_string()))?;
-                    return Err(StorageError::Unsorted(format!(
-                        "trace_id {tid} after {}",
-                        last.trace_id
-                    )));
-                }
+                Some(last) if last.trace_id.as_bytes()[..] == *cur.0 => last.row_count += 1,
                 _ => self.traces.push(TraceRange {
-                    trace_id: TraceId::from_slice(raw).map_err(|e| StorageError::Unsorted(e.to_string()))?,
+                    trace_id: TraceId::from_slice(cur.0)?,
                     row_start: self.rows + i as u64,
                     row_count: 1,
                 }),
             }
+        }
+        if let Some(i) = b.num_rows().checked_sub(1) {
+            self.last = Some(owned(key(i)));
         }
         self.rows += b.num_rows() as u64;
         self.start_nulls += s.null_count() as u64;
@@ -117,11 +167,27 @@ impl SegmentStats {
             widen(&mut self.min_start, &mut self.max_start, hi);
         }
         if let (Some(lo), Some(hi)) = (min(v), max(v)) {
-            widen(&mut self.min_version, &mut self.max_version, lo as u64);
-            widen(&mut self.min_version, &mut self.max_version, hi as u64);
+            widen(&mut self.min_version, &mut self.max_version, version(lo)?);
+            widen(&mut self.min_version, &mut self.max_version, version(hi)?);
         }
         Ok(())
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The writer's outcome: a stashed input error first, then the writer's own error, then an empty input.
+fn outcome(stashed: Option<StorageError>, written: StorageResult<()>, rows: u64) -> StorageResult<()> {
+    if let Some(e) = stashed {
+        return Err(e);
+    }
+    written?;
+    if rows == 0 {
+        return Err(StorageError::EmptySegment);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -131,7 +197,7 @@ impl SegmentStore for VortexSegmentStore {
         // gets the original StorageError rather than its Vortex wrapping.
         let state = Arc::new(Mutex::new(Ingest::default()));
         let schema = spans_schema();
-        let dtype = self.session.arrow().from_arrow_schema(&schema)?;
+        let dtype = self.dtype.clone();
         let (st, session, project) = (state.clone(), self.session.clone(), spec.project_id.clone());
         let stream = rows.map(move |b| -> VortexResult<ArrayRef> {
             let checked = b.and_then(|b| {
@@ -153,27 +219,26 @@ impl SegmentStore for VortexSegmentStore {
             .session
             .write_options()
             .write(&mut buf, ArrayStreamAdapter::new(dtype, stream))
-            .await;
+            .await
+            .map(drop)
+            .map_err(StorageError::from);
         let Ingest { stats, err } = std::mem::take(&mut *lock(&state));
-        if let Some(e) = err {
-            return Err(e);
-        }
-        if stats.rows == 0 {
-            return Err(StorageError::EmptySegment);
-        }
-        written?;
-        let path = paths::segment_path(&spec.project_id, spec.level, spec.partition_hour, spec.id);
+        outcome(err, written, stats.rows)?;
+        let path = paths::segment_path(&spec.project_id, spec.level, spec.partition_hour, spec.id)?;
         let byte_size = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-        self.store
-            .put_opts(
-                &path.clone().into(),
-                PutPayload::from(buf),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let location = Path::from(path.as_str());
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        if let Err(e) = self.store.put_opts(&location, PutPayload::from(buf), create).await {
+            // A retry of a put that landed but was reported as failed: same id, same size counts as written.
+            let landed = matches!(e, object_store::Error::AlreadyExists { .. })
+                && self.store.head(&location).await.is_ok_and(|m| m.size == byte_size);
+            if !landed {
+                return Err(e.into());
+            }
+        }
         let traces = stats.traces;
         let meta = SegmentMeta {
             id: spec.id,
@@ -200,6 +265,14 @@ impl SegmentStore for VortexSegmentStore {
     }
 
     async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream> {
+        if let RowSelection::Range(r) = &req.rows
+            && (r.start > r.end || r.end > seg.row_count)
+        {
+            return Err(StorageError::InvalidInput(format!(
+                "row range {}..{} is invalid for segment {} with {} rows",
+                r.start, r.end, seg.id, seg.row_count
+            )));
+        }
         let file = self
             .session
             .open_options()
@@ -207,10 +280,11 @@ impl SegmentStore for VortexSegmentStore {
             .open_object_store(&self.store, Path::from(seg.path.as_str()))
             .await?;
         let mut sb = file.scan()?;
-        let schema = match &req.projection {
+        let schema = match req.projection {
             Some(cols) => {
-                sb = sb.with_projection(select(cols.clone(), root()).bind(file.dtype())?);
-                projected_schema(cols)
+                let schema = projected_schema(&cols);
+                sb = sb.with_projection(select(cols, root()).bind(file.dtype())?);
+                schema
             }
             None => spans_schema(),
         };
@@ -230,5 +304,26 @@ impl SegmentStore for VortexSegmentStore {
 
     fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_error_wins_over_empty_input() {
+        let vortex_err = || StorageError::Vortex(vortex::error::vortex_err!("writer failed"));
+        assert!(matches!(
+            outcome(None, Err(vortex_err()), 0),
+            Err(StorageError::Vortex(_))
+        ));
+        assert!(matches!(outcome(None, Ok(()), 0), Err(StorageError::EmptySegment)));
+        let stashed = Some(StorageError::Unsorted("x".into()));
+        assert!(matches!(
+            outcome(stashed, Err(vortex_err()), 0),
+            Err(StorageError::Unsorted(_))
+        ));
+        assert!(outcome(None, Ok(()), 1).is_ok());
     }
 }

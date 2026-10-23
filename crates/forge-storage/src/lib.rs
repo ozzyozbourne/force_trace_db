@@ -26,8 +26,13 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Model(#[from] forge_model::error::ModelError),
-    #[error("segment input not sorted by (project_id, trace_id, dotted_order): {0}")]
+    #[error(
+        "segment rows must be strictly increasing by (project_id, trace_id, dotted_order NULLS LAST, span_id, \
+         version) within one project: {0}"
+    )]
     Unsorted(String),
+    #[error("{0}")]
+    InvalidInput(String),
     #[error("segment has no rows")]
     EmptySegment,
     #[error("invalid storage url {url:?}: {msg}")]
@@ -59,6 +64,7 @@ impl Classify for StorageError {
                 ErrorKind::Transient
             }
             Self::Model(e) => e.kind(),
+            Self::InvalidInput(_) => ErrorKind::InvalidInput,
             Self::Unimplemented(e) => e.kind(),
             _ => ErrorKind::Internal,
         }
@@ -111,9 +117,12 @@ pub struct ScanRequest {
 
 #[async_trait]
 pub trait SegmentStore: Send + Sync + std::fmt::Debug + 'static {
-    /// rows: spans_schema, one project, sorted by (project_id, trace_id, dotted_order NULLS LAST, span_id),
-    /// one row per span key. Writes one Vortex file (PutMode::Create). Invisible until the metastore commit.
+    /// rows: spans_schema, one project, strictly increasing by (project_id, trace_id, dotted_order NULLS LAST,
+    /// span_id, version); checked, else `Unsorted`. Writes one Vortex file (PutMode::Create). A retry with the
+    /// same spec after an ambiguous error is safe: an existing object of the same size counts as written.
+    /// Invisible until the metastore commit.
     async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment>;
+    /// `InvalidInput` for a row range with start > end or end > `seg.row_count`.
     async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream>;
     /// The full store stack (later: prefix + fault injection + caching); forge-index reads .fts through it.
     fn object_store(&self) -> Arc<dyn ObjectStore>;

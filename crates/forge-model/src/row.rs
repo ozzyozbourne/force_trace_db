@@ -219,6 +219,13 @@ pub fn validate_batch(b: &RecordBatch) -> Result<()> {
             return Err(ModelError::Schema(format!("{name} must be {len} bytes")));
         }
     }
+    // Versions are u64 in the model; the i64 column must never hold a negative one.
+    let version = b
+        .column(col_idx(col::VERSION))
+        .as_primitive::<arrow::datatypes::Int64Type>();
+    if arrow::compute::min(version).is_some_and(|m| m < 0) {
+        return Err(ModelError::Schema("version must be >= 0".into()));
+    }
     Ok(())
 }
 
@@ -308,5 +315,10 @@ mod tests {
         cols[crate::schema::col_idx(col::TRACE_ID)] = Arc::new(BinaryArray::from_vec(vec![&[0u8; 15][..]]));
         let bad = RecordBatch::try_new(spans_schema(), cols).unwrap();
         assert!(matches!(validate_batch(&bad), Err(ModelError::Schema(_))));
+        let mut cols = good.columns().to_vec();
+        cols[crate::schema::col_idx(col::VERSION)] = Arc::new(Int64Array::from(vec![-5i64]));
+        let negative = RecordBatch::try_new(spans_schema(), cols).unwrap();
+        let e = validate_batch(&negative).unwrap_err();
+        assert!(e.to_string().contains("version must be >= 0"), "{e}");
     }
 }

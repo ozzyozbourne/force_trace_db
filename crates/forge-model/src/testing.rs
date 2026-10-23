@@ -13,7 +13,7 @@ pub fn segment_meta(project: &str, level: Level, hour: HourBucket) -> SegmentMet
     let project_id = pid(project);
     SegmentMeta {
         id,
-        path: paths::segment_path(&project_id, level, hour, id),
+        path: paths::segment_path(&project_id, level, hour, id).expect("test hour in range"),
         project_id,
         level,
         partition_hour: hour,

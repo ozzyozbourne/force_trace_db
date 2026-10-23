@@ -1,9 +1,12 @@
-use arrow::compute::concat_batches;
+use arrow::array::{AsArray, Int64Array};
+use arrow::compute::{concat_batches, max, min};
 use arrow::datatypes::SchemaRef;
+use arrow::datatypes::TimestampNanosecondType;
 use arrow::record_batch::RecordBatch;
 use forge_model::catalog::{HourBucket, Level, SegmentId, paths};
 use forge_model::config::StorageConfig;
 use forge_model::dotted::dotted_order;
+use forge_model::error::{Classify, ErrorKind, ModelError};
 use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::{SpanBatchBuilder, SpanRow};
 use forge_model::schema::{col, col_idx, projected_schema, spans_schema};
@@ -11,6 +14,7 @@ use forge_model::testing::pid;
 use forge_storage::*;
 use futures::{TryStreamExt, stream};
 use object_store::ObjectStoreExt;
+use std::sync::Arc;
 
 fn trace(t: usize) -> TraceId {
     TraceId((t as u128 + 1).to_be_bytes())
@@ -115,11 +119,18 @@ async fn memory_round_trip_multi_batch() {
         all.column_by_name(col::START_TIME).unwrap().null_count() as u64
     );
     assert!(m.start_time_nulls > 0);
+    // The extremes sit in different batches: a per-batch (not per-segment) min/max would miss them.
+    let starts = all
+        .column_by_name(col::START_TIME)
+        .unwrap()
+        .as_primitive::<TimestampNanosecondType>();
+    assert_eq!((m.min_start_ns, m.max_start_ns), (min(starts), max(starts)));
+    assert!(m.min_start_ns.is_some() && m.min_start_ns < m.max_start_ns);
     assert_eq!((m.min_trace_id, m.max_trace_id), (trace(0), trace(9)));
     assert_eq!((m.min_version, m.max_version), (1, 100));
     assert_eq!(
         m.path,
-        paths::segment_path(&sp.project_id, sp.level, sp.partition_hour, sp.id)
+        paths::segment_path(&sp.project_id, sp.level, sp.partition_hour, sp.id).unwrap()
     );
     assert_eq!(m.fts_byte_size, None);
     let head = st.object_store().head(&m.path.as_str().into()).await.unwrap();
@@ -151,7 +162,22 @@ async fn multi_chunk_ranges() {
     let all = to_batch(&rows(2_000, 10));
     let w = st.write_segment(spec("p"), input(vec![all.clone()])).await.unwrap();
     assert_eq!(w.meta.row_count, 20_000);
+    let parts: Vec<_> = st
+        .scan(&w.meta, ScanRequest::default())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        parts.len() > 1,
+        "expected more than one Vortex split, got {}",
+        parts.len()
+    );
     assert_eq!(scan_range(&st, &w.meta, 8190..8200).await, all.slice(8190, 10));
+    // Straddles the first split (row 16384).
+    assert_eq!(scan_range(&st, &w.meta, 16_380..16_390).await, all.slice(16_380, 10));
+    assert_eq!(scan_range(&st, &w.meta, 0..20_000).await, all);
     assert_eq!(scan_range(&st, &w.meta, 19_995..20_000).await, all.slice(19_995, 5));
 }
 
@@ -208,11 +234,148 @@ async fn write_invariants() {
 
     let sp = spec("p");
     st.write_segment(sp.clone(), input(vec![all.clone()])).await.unwrap();
-    let e = st.write_segment(sp, input(vec![all])).await.unwrap_err();
+    let e = st.write_segment(sp, input(vec![all.slice(0, 3)])).await.unwrap_err();
     assert!(
         matches!(e, StorageError::ObjectStore(object_store::Error::AlreadyExists { .. })),
+        "same id, different content: {e:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_a_put_that_landed_succeeds() {
+    let st = store("memory://");
+    let all = to_batch(&rows(4, 3));
+    let sp = spec("p");
+    let first = st.write_segment(sp.clone(), input(vec![all.clone()])).await.unwrap();
+    // The caller saw an error (e.g. a timeout) and retries the same spec with the same rows.
+    let again = st.write_segment(sp, input(vec![all.clone()])).await.unwrap();
+    assert_eq!(
+        (again.meta.path, again.meta.byte_size),
+        (first.meta.path.clone(), first.meta.byte_size)
+    );
+    assert_eq!(
+        collect(
+            st.scan(&first.meta, ScanRequest::default()).await.unwrap(),
+            spans_schema()
+        )
+        .await,
+        all
+    );
+}
+
+fn with_version(b: &RecordBatch, versions: Vec<i64>) -> RecordBatch {
+    let mut cols = b.columns().to_vec();
+    cols[col_idx(col::VERSION)] = Arc::new(Int64Array::from(versions));
+    RecordBatch::try_new(spans_schema(), cols).unwrap()
+}
+
+#[tokio::test]
+async fn negative_versions_are_rejected() {
+    let st = store("memory://");
+    let b = with_version(&to_batch(&rows(1, 2)), vec![-1, 3]);
+    let e = st.write_segment(spec("p"), input(vec![b])).await.unwrap_err();
+    assert!(
+        matches!(&e, StorageError::Model(ModelError::Schema(m)) if m.contains("version")),
         "{e:?}"
     );
+}
+
+async fn write(st: &VortexSegmentStore, rows: &[SpanRow]) -> StorageResult<WrittenSegment> {
+    st.write_segment(spec("p"), input(vec![to_batch(rows)])).await
+}
+
+#[tokio::test]
+async fn full_sort_key_is_enforced() {
+    let st = store("memory://");
+    let base = rows(1, 3);
+
+    let mut desc = base.clone();
+    desc.reverse(); // one trace, dotted_order descending
+    let e = write(&st, &desc).await.unwrap_err();
+    assert!(matches!(e, StorageError::Unsorted(_)), "{e:?}");
+    assert!(
+        e.to_string().contains("dotted_order NULLS LAST, span_id, version"),
+        "{e}"
+    );
+
+    let mut dup = base.clone();
+    dup.push(base[2].clone()); // the exact same row twice
+    let e = write(&st, &dup).await.unwrap_err();
+    assert!(e.to_string().contains("duplicate row"), "{e}");
+
+    // Several versions of one span are fine in ascending order, not in descending order.
+    let mut v2 = base[2].clone();
+    v2.version = 99;
+    let mut versions = base.clone();
+    versions.push(v2.clone());
+    assert_eq!(write(&st, &versions).await.unwrap().meta.row_count, 4);
+    let mut versions_desc = base.clone();
+    versions_desc.insert(2, v2);
+    assert!(matches!(
+        write(&st, &versions_desc).await,
+        Err(StorageError::Unsorted(_))
+    ));
+
+    // Same span key, two different spans, sorted by span_id when dotted_order is equal.
+    let mut sibling = base[2].clone();
+    sibling.span_id = SpanId([0xff; 8]);
+    let mut by_span = base.clone();
+    by_span.push(sibling.clone());
+    assert!(write(&st, &by_span).await.is_ok());
+
+    // NULLS LAST: a null dotted_order may follow a non-null one, not the reverse.
+    let mut null_dotted = sibling.clone();
+    null_dotted.dotted_order = None;
+    let mut nulls_last = base.clone();
+    nulls_last.push(null_dotted.clone());
+    assert!(write(&st, &nulls_last).await.is_ok());
+    let mut nulls_first = base.clone();
+    nulls_first.insert(0, null_dotted);
+    assert!(matches!(write(&st, &nulls_first).await, Err(StorageError::Unsorted(_))));
+
+    // The check holds across batch boundaries.
+    let b = to_batch(&dup);
+    let e = st
+        .write_segment(spec("p"), input(vec![b.slice(0, 3), b.slice(3, 1)]))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("duplicate row"), "across batches: {e}");
+}
+
+#[tokio::test]
+async fn scan_rejects_bad_row_ranges() {
+    let st = store("memory://");
+    let w = st
+        .write_segment(spec("p"), input(vec![to_batch(&rows(10, 10))]))
+        .await
+        .unwrap();
+    #[allow(clippy::reversed_empty_ranges)]
+    for r in [95..200u64, 150..160, 10..5] {
+        let req = ScanRequest {
+            rows: RowSelection::Range(r.clone()),
+            ..Default::default()
+        };
+        match st.scan(&w.meta, req).await {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput, "{r:?}: {e:?}"),
+            Ok(_) => panic!("{r:?} accepted"),
+        }
+    }
+    assert_eq!(scan_range(&st, &w.meta, 100..100).await.num_rows(), 0);
+    assert_eq!(scan_range(&st, &w.meta, 90..100).await.num_rows(), 10);
+}
+
+#[tokio::test]
+async fn out_of_range_hour_is_an_error_not_a_panic() {
+    let st = store("memory://");
+    let sp = SegmentSpec {
+        partition_hour: HourBucket(i64::MAX / 3600),
+        ..spec("p")
+    };
+    let e = st
+        .write_segment(sp, input(vec![to_batch(&rows(1, 1))]))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, StorageError::Model(ModelError::HourOutOfRange(_))), "{e:?}");
 }
 
 #[test]
