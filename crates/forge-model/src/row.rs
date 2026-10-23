@@ -38,6 +38,18 @@ pub struct SpanRow {
     pub deleted: bool,
 }
 
+impl SpanRow {
+    /// The payload columns, in `schema::PAYLOAD_COLUMNS` order.
+    pub fn payload_columns_mut(&mut self) -> [(&'static str, &mut Option<String>); 4] {
+        [
+            (col::INPUTS, &mut self.inputs),
+            (col::OUTPUTS, &mut self.outputs),
+            (col::EVENTS, &mut self.events),
+            (col::ATTRIBUTES, &mut self.attributes),
+        ]
+    }
+}
+
 /// Appends SpanRows into Arrow builders; finish() yields a spans_schema() batch.
 pub struct SpanBatchBuilder {
     project_id: StringBuilder,
@@ -300,6 +312,13 @@ mod tests {
             [Some(false), Some(false), Some(true)]
         );
         assert_eq!(rows_from_batch(&batch).unwrap(), vec![full, patch, tomb]);
+    }
+
+    #[test]
+    fn payload_columns_follow_the_schema_list() {
+        let mut r = SpanRow::default();
+        let names = r.payload_columns_mut().map(|(n, _)| n);
+        assert_eq!(names, crate::schema::PAYLOAD_COLUMNS);
     }
 
     #[test]

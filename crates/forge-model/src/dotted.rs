@@ -1,6 +1,8 @@
-use crate::ids::SpanId;
+use crate::ids::{ProjectId, SpanId, TraceId};
+use crate::row::SpanRow;
 use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::LazyLock;
 
@@ -35,6 +37,82 @@ fn push_segment(out: &mut String, start_time_ns: i64, span_id: SpanId) {
 /// Number of ancestors + 1. Works for LangSmith (UUID) and Forge (hex16) segments alike.
 pub fn depth(dotted: &str) -> usize {
     dotted.bytes().filter(|&b| b == b'.').count() + 1
+}
+
+// ---- resolving a batch: dotted_order is computed when the whole ancestor chain is in the batch (ending at a
+// root); otherwise it stays null (compaction fills it). ----
+
+type Key = (ProjectId, TraceId, SpanId);
+
+/// Sets `dotted_order` on every row that lacks one and whose ancestor chain is complete in `rows`. Keys are
+/// `(project, trace, span)`; for duplicates (start + end post of one span) the last occurrence defines the node;
+/// cycles resolve to null.
+pub fn resolve_dotted_orders(rows: &mut [SpanRow]) {
+    // Last occurrence wins for duplicates (start + end post of one span in one batch).
+    let mut nodes: HashMap<Key, (Option<SpanId>, Option<i64>)> = HashMap::with_capacity(rows.len());
+    for r in rows.iter() {
+        let Some(p) = &r.project_id else { continue };
+        nodes.insert((p.clone(), r.trace_id, r.span_id), (r.parent_span_id, r.start_time_ns));
+    }
+    let mut memo: HashMap<Key, Option<String>> = HashMap::with_capacity(rows.len());
+    for r in rows.iter_mut() {
+        if r.dotted_order.is_some() {
+            continue; // already set by the producer (LangSmith runs API)
+        }
+        let Some(p) = &r.project_id else { continue };
+        let key = (p.clone(), r.trace_id, r.span_id);
+        r.dotted_order = resolve(&key, &nodes, &mut memo);
+    }
+}
+
+fn resolve(
+    key: &Key,
+    nodes: &HashMap<Key, (Option<SpanId>, Option<i64>)>,
+    memo: &mut HashMap<Key, Option<String>>,
+) -> Option<String> {
+    enum Base {
+        Root,
+        Prefix(String),
+        Unknown,
+    }
+    if let Some(m) = memo.get(key) {
+        return m.clone(); // resolved earlier as someone's ancestor
+    }
+    // Walk up until a memoized node, a root, a parent outside the batch, or a cycle.
+    let mut chain: Vec<(Key, Option<i64>)> = Vec::new();
+    let mut cur = key.clone();
+    let base = loop {
+        if let Some(m) = memo.get(&cur) {
+            break m.clone().map_or(Base::Unknown, Base::Prefix);
+        }
+        let Some(&(parent, start)) = nodes.get(&cur) else {
+            break Base::Unknown;
+        };
+        chain.push((cur.clone(), start));
+        if chain.len() > nodes.len() {
+            break Base::Unknown; // cycle
+        }
+        match parent {
+            None => break Base::Root,
+            Some(ps) => cur = (cur.0.clone(), cur.1, ps),
+        }
+    };
+    let mut prefix = match base {
+        Base::Root => Some(None),
+        Base::Prefix(s) => Some(Some(s)),
+        Base::Unknown => None,
+    };
+    let mut last = None;
+    for (k, start) in chain.into_iter().rev() {
+        let v = match (&prefix, start) {
+            (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.2)),
+            _ => None,
+        };
+        memo.insert(k, v.clone());
+        prefix = v.clone().map(Some);
+        last = v;
+    }
+    last
 }
 
 #[cfg(test)]

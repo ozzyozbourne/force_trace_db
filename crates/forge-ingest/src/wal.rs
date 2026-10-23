@@ -9,6 +9,8 @@
 //! the first request of the group), does ONE `write_all` + `sync_data`, hands `(seq, item)` to
 //! `on_durable` **in seq order** (forge-ingest inserts into the memtable there: invariant 7), and
 //! only then acks. A failed write/fsync aborts the process (never retry fsync).
+use forge_model::config::{WalConfig, WalMode};
+use forge_model::error::Unimplemented;
 use forge_model::failpoint;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
@@ -80,8 +82,61 @@ pub struct WriterStats {
 pub struct Wal<T> {
     tx: std::sync::Mutex<Option<mpsc::Sender<Append<T>>>>,
     thread: std::sync::Mutex<Option<JoinHandle<WriterStats>>>,
-    dir: PathBuf,
+}
+
+/// One node's WAL, `<wal.dir>/<node_id>`, holding the directory lock for its lifetime. Its lifecycle is
+/// `open` (lock) -> `replay` -> `start` (writer thread) -> `truncate` after each committed flush.
+/// Local mode only: `wal.mode = object_store` is M5.
+#[derive(Debug)]
+pub struct WalLog {
+    opts: WalOptions,
     _lock: File,
+}
+
+impl WalLog {
+    /// Blocking (creates and locks the directory): call from `spawn_blocking`.
+    pub fn open(cfg: &WalConfig, node_id: &str) -> Result<Self, crate::IngestError> {
+        if cfg.mode == WalMode::ObjectStore {
+            return Err(Unimplemented("M5").into());
+        }
+        let dir = cfg.dir.join(node_id);
+        let lock = lock_dir(&dir)?;
+        let opts = WalOptions {
+            segment_bytes: cfg.segment_bytes.as_u64(),
+            group_commit_max_bytes: cfg.group_commit_max_bytes.as_u64() as usize,
+            group_commit_max_delay: cfg.group_commit_max_delay,
+            ..WalOptions::new(dir)
+        };
+        Ok(Self { opts, _lock: lock })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.opts.dir
+    }
+
+    /// See [`replay`]. Must run before `start`.
+    pub fn replay<E: std::fmt::Display>(
+        &self,
+        flushed_seq: u64,
+        apply: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    ) -> Result<ReplayStats, WalError> {
+        replay(&self.opts.dir, flushed_seq, apply)
+    }
+
+    /// See [`Wal::start`].
+    pub fn start<T: Send + 'static>(
+        &self,
+        next_seq: u64,
+        encode: impl FnMut(&mut T) -> Vec<u8> + Send + 'static,
+        on_durable: impl FnMut(&mut Vec<(u64, T)>) + Send + 'static,
+    ) -> Result<Wal<T>, WalError> {
+        Wal::start(self.opts.clone(), next_seq, encode, on_durable)
+    }
+
+    /// See [`truncate`]. Blocking.
+    pub fn truncate(&self, flushed_seq: u64) -> io::Result<usize> {
+        truncate(&self.opts.dir, flushed_seq)
+    }
 }
 
 pub fn segment_path(dir: &Path, first_seq: u64) -> PathBuf {
@@ -122,24 +177,28 @@ fn new_segment(dir: &Path, first_seq: u64) -> io::Result<File> {
     Ok(f)
 }
 
-fn frame(buf: &mut Vec<u8>, seq: u64, payload: &[u8]) {
+/// The record checksum: crc32 over `seq || payload`.
+fn record_crc(seq: u64, payload: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(&seq.to_le_bytes());
     h.update(payload);
+    h.finalize()
+}
+
+fn frame(buf: &mut Vec<u8>, seq: u64, payload: &[u8]) {
     buf.extend_from_slice(&u32::try_from(payload.len()).expect("record < 4 GiB").to_le_bytes());
-    buf.extend_from_slice(&h.finalize().to_le_bytes());
+    buf.extend_from_slice(&record_crc(seq, payload).to_le_bytes());
     buf.extend_from_slice(&seq.to_le_bytes());
     buf.extend_from_slice(payload);
 }
 
 impl<T: Send + 'static> Wal<T> {
-    /// `dir` must already hold `lock` (call `lock_dir` before `replay`). `next_seq` comes from
+    /// The caller holds the directory lock (`lock_dir`, taken before `replay`). `next_seq` comes from
     /// `replay`. `encode` runs on the writer thread, in seq order, right before the record is framed
     /// (P2: Forge stamps versions there). `on_durable` runs after the group fsync with the group's
     /// records in seq order, before the acks are sent.
     pub fn start(
         opts: WalOptions,
-        lock: File,
         next_seq: u64,
         encode: impl FnMut(&mut T) -> Vec<u8> + Send + 'static,
         on_durable: impl FnMut(&mut Vec<(u64, T)>) + Send + 'static,
@@ -147,15 +206,12 @@ impl<T: Send + 'static> Wal<T> {
         assert!(next_seq >= 1, "seq 0 is reserved for 'nothing flushed'");
         let (tx, rx) = mpsc::channel(opts.queue);
         let file = new_segment(&opts.dir, next_seq)?;
-        let dir = opts.dir.clone();
         let thread = std::thread::Builder::new()
             .name("forge-wal".into())
             .spawn(move || writer_loop(opts, file, rx, next_seq, encode, on_durable))?;
         Ok(Self {
             tx: std::sync::Mutex::new(Some(tx)),
             thread: std::sync::Mutex::new(Some(thread)),
-            dir,
-            _lock: lock,
         })
     }
 
@@ -172,10 +228,6 @@ impl<T: Send + 'static> Wal<T> {
         let (ack, rx) = oneshot::channel();
         tx.send(Append { item, ack }).await.map_err(|_| WalError::Closed)?;
         rx.await.map_err(|_| WalError::Closed)
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// Stops accepting, lets the thread drain and fsync everything queued, joins it. Blocking:
@@ -380,10 +432,7 @@ pub fn replay<E: std::fmt::Display>(
             }
             payload.resize(len as usize, 0);
             r.read_exact(&mut payload)?;
-            let mut h = crc32fast::Hasher::new();
-            h.update(&seq.to_le_bytes());
-            h.update(&payload);
-            if h.finalize() != crc {
+            if record_crc(seq, &payload) != crc {
                 torn("crc mismatch")?;
                 break;
             }

@@ -1,17 +1,17 @@
 //! The write path: WAL + memtable + flush behind the `Ingest` trait.
 use crate::blob::offload_blobs;
-use crate::flush::{Backoff, FlushCtx, FlushReport, flush_frozen};
+use crate::flush::{FlushCtx, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
 use crate::version::VersionAllocator;
-use crate::wal::{self, Wal, WalOptions};
+use crate::wal::{self, Wal, WalLog};
 use crate::{Ingest, IngestError};
 use arrow::array::{AsArray, Int64Array};
 use arrow::datatypes::Int64Type;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use forge_meta::Metastore;
-use forge_model::config::{ForgeConfig, WalMode};
-use forge_model::error::Unimplemented;
+use forge_model::config::ForgeConfig;
+use forge_model::retry::Backoff;
 use forge_model::row::{SpanBatchBuilder, SpanRow, validate_batch};
 use forge_model::schema::{col, col_idx};
 use forge_storage::{SegmentStore, StorageError};
@@ -44,7 +44,7 @@ pub struct Pipeline {
 impl std::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline")
-            .field("wal_dir", &self.wal.dir())
+            .field("wal_dir", &self.flush.wal.dir())
             .field("unflushed_bytes", &self.mem.unflushed_bytes())
             .finish_non_exhaustive()
     }
@@ -56,18 +56,16 @@ impl Pipeline {
         meta: Arc<dyn Metastore>,
         segments: Arc<dyn SegmentStore>,
     ) -> Result<(Arc<Self>, OpenReport), IngestError> {
-        if cfg.wal.mode == WalMode::ObjectStore {
-            return Err(Unimplemented("M5").into());
-        }
         let internal = |e: &dyn std::fmt::Display| IngestError::Internal(e.to_string());
         let node_id = cfg.node.id.clone();
-        let dir = cfg.wal.dir.join(&node_id);
         let flush_bytes = cfg.memtable.flush_bytes.as_u64() as usize;
-        let lock = {
-            let dir = dir.clone();
-            tokio::task::spawn_blocking(move || wal::lock_dir(&dir))
-                .await
-                .map_err(|e| internal(&e))??
+        let log = {
+            let (c, n) = (cfg.wal.clone(), node_id.clone());
+            Arc::new(
+                tokio::task::spawn_blocking(move || WalLog::open(&c, &n))
+                    .await
+                    .map_err(|e| internal(&e))??,
+            )
         };
         let flushed = meta.wal_checkpoint(&node_id).await?.map_or(0, |c| c.flushed_seq);
         let versions = Arc::new(VersionAllocator::new(meta.max_version().await?));
@@ -78,15 +76,15 @@ impl Pipeline {
             segments,
             meta,
             mem: mem.clone(),
-            wal_dir: dir.clone(),
+            wal: log.clone(),
             versions: versions.clone(),
             backoff: Backoff::default(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, RecordBatch, usize)>(64);
-        let rdir = dir.clone();
+        let rlog = log.clone();
         let reader = tokio::task::spawn_blocking(move || {
-            wal::replay(&rdir, flushed, |seq, payload| {
+            rlog.replay(flushed, |seq, payload| {
                 let b = wal::decode_batch(payload).map_err(|e| e.to_string())?;
                 validate_batch(&b).map_err(|e| e.to_string())?;
                 let len = accounted_bytes(&b);
@@ -108,13 +106,6 @@ impl Pipeline {
         }
         let replay = reader.await.map_err(|e| internal(&e))??;
 
-        let opts = WalOptions {
-            dir: dir.clone(),
-            segment_bytes: cfg.wal.segment_bytes.as_u64(),
-            group_commit_max_bytes: cfg.wal.group_commit_max_bytes.as_u64() as usize,
-            group_commit_max_delay: cfg.wal.group_commit_max_delay,
-            queue: 4096,
-        };
         // P2 / invariant 9: versions are reserved here, on the WAL thread, in seq order.
         let v = versions.clone();
         let encode = move |item: &mut Item| -> Vec<u8> {
@@ -141,9 +132,9 @@ impl Pipeline {
                 }
             }
         };
-        let wal = Wal::start(opts, lock, replay.next_seq, encode, on_durable)?;
+        let wal: Wal<Item> = log.start(replay.next_seq, encode, on_durable)?;
         let watermark = flush.meta.wal_checkpoint(&node_id).await?.map_or(0, |c| c.flushed_seq);
-        wal::truncate(&dir, watermark).map_err(wal::WalError::from)?;
+        log.truncate(watermark).map_err(wal::WalError::from)?;
         let next_version = versions.high_water() + 1;
         tracing::info!(
             applied = replay.applied,
@@ -182,12 +173,21 @@ impl Pipeline {
             .map(Some)
             .map_err(|e| IngestError::Internal(e.to_string()))
     }
-    /// Shutdown step 2: stop accepting appends, drain + fsync the queue, join the writer thread.
+    /// Spawns the background flusher. Stop it with `IngestTasks::shutdown`.
+    pub fn start_background(self: &Arc<Self>) -> IngestTasks {
+        let stop = CancellationToken::new();
+        IngestTasks {
+            flusher: tokio::spawn(run_flusher(self.clone(), stop.clone())),
+            pipeline: self.clone(),
+            stop,
+        }
+    }
+    /// Stop accepting appends, drain + fsync the queue, join the writer thread.
     pub async fn close_wal(self: &Arc<Self>) {
         let p = self.clone();
         let _ = tokio::task::spawn_blocking(move || p.wal.shutdown()).await;
     }
-    /// Shutdown step 3: flush the frozen memtable, then the active one.
+    /// Flush the frozen memtable, then the active one.
     pub async fn flush_all(&self) -> Result<(), IngestError> {
         while self.flush_now().await?.is_some() {}
         Ok(())
@@ -234,8 +234,32 @@ fn with_versions(b: &RecordBatch, r: Range<u64>) -> Result<RecordBatch, ArrowErr
     RecordBatch::try_new(b.schema(), cols)
 }
 
+/// The pipeline's background tasks (the flusher).
+#[derive(Debug)]
+pub struct IngestTasks {
+    pipeline: Arc<Pipeline>,
+    stop: CancellationToken,
+    flusher: tokio::task::JoinHandle<()>,
+}
+
+impl IngestTasks {
+    /// The stop sequence, after the listeners have stopped: close the WAL (queued appends are fsynced and in the
+    /// memtable; new appends get `WalError::Closed`), stop the flusher between flushes, then the final flush.
+    /// Joining the flusher and the final flush are bounded by `grace`; on a timeout the rows replay from the WAL
+    /// on the next start.
+    pub async fn shutdown(self, grace: Duration) -> Result<Result<(), IngestError>, tokio::time::error::Elapsed> {
+        self.pipeline.close_wal().await;
+        self.stop.cancel();
+        let final_flush = async {
+            let _ = self.flusher.await;
+            self.pipeline.flush_all().await
+        };
+        tokio::time::timeout(grace, final_flush).await
+    }
+}
+
 /// Background flusher. Cancellation is observed only BETWEEN flushes.
-pub async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
+async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
     let tick = (p.flush_interval / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
     loop {
         tokio::select! {

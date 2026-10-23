@@ -1,30 +1,25 @@
 //! Golden fixtures: research/fixtures/*.json -> exact normalized SpanRow fields.
-use forge_ingest::normalize::pricing::Pricing;
+mod common;
+use common::j;
 use forge_ingest::normalize::{NormalizeConfig, Normalized, normalize_request};
 use forge_ingest::version::{VersionAllocator, stamp};
 use forge_model::enums::{RunType, SpanStatus};
-use forge_model::ids::{ProjectId, SpanId};
-use forge_model::row::{SpanBatchBuilder, SpanRow, validate_batch};
+use forge_model::ids::SpanId;
+use forge_model::row::{SpanRow, validate_batch};
+use forge_model::testing::batch_from_rows;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use serde_json::{Value as J, json};
-use std::sync::Arc;
+use serde_json::json;
 
 const BASE: i64 = 1_792_663_200_000_000_000; // 2026-10-22T10:00:00Z
 fn ms(m: i64) -> Option<i64> {
     Some(BASE + m * 1_000_000)
 }
 
-fn cfg() -> NormalizeConfig {
-    NormalizeConfig {
-        default_project: ProjectId::new("default").unwrap(),
-        pricing: Arc::new(Pricing::builtin()),
-    }
-}
 fn load(name: &str) -> ExportTraceServiceRequest {
-    serde_json::from_slice(&std::fs::read(forge_model::testing::fixture_path(name)).unwrap()).unwrap()
+    serde_json::from_slice(&forge_model::testing::fixture_bytes(name)).unwrap()
 }
 fn norm(name: &str) -> Normalized {
-    let n = normalize_request(load(name), None, &cfg());
+    let n = normalize_request(load(name), None, &NormalizeConfig::default());
     assert_eq!(n.rejected, 0, "{:?}", n.first_error);
     n
 }
@@ -34,9 +29,6 @@ fn row<'a>(n: &'a Normalized, span: &str) -> &'a SpanRow {
         .iter()
         .find(|r| r.span_id == id)
         .unwrap_or_else(|| panic!("no row {span}"))
-}
-fn j(s: &Option<String>) -> J {
-    s.as_deref().map_or(J::Null, |s| serde_json::from_str(s).unwrap())
 }
 
 /// Scalar columns of one row.
@@ -617,11 +609,7 @@ fn rows_build_valid_batches() {
         let mut n = norm(f);
         let r = alloc.reserve(n.rows.len() as u64);
         stamp(&mut n.rows, r);
-        let mut b = SpanBatchBuilder::with_capacity(n.rows.len());
-        for row in &n.rows {
-            b.push(row).unwrap();
-        }
-        validate_batch(&b.finish().unwrap()).unwrap();
+        validate_batch(&batch_from_rows(&n.rows)).unwrap();
     }
     assert_eq!(alloc.high_water(), 41 + 4 + 5 + 7 + 4);
 }

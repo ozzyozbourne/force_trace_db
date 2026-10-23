@@ -9,7 +9,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, path::Path};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// Replaces every payload column value (`inputs`, `outputs`, `events`, `attributes`) longer than
+/// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
 /// `threshold` bytes with a blob reference, after writing the exact UTF-8 bytes to the object store.
 /// Content-addressed, so writes are idempotent: `PutMode::Create` + AlreadyExists = success.
 /// Returns the number of distinct blobs written (or found).
@@ -21,7 +21,7 @@ pub async fn offload_blobs(
     let mut puts: HashMap<String, Bytes> = HashMap::new();
     for r in rows.iter_mut() {
         let project: ProjectId = r.project_id.clone().expect("normalized rows carry a project");
-        for col in [&mut r.inputs, &mut r.outputs, &mut r.events, &mut r.attributes] {
+        for (_, col) in r.payload_columns_mut() {
             let Some(text) = col.as_deref() else { continue };
             if text.len() <= threshold || parse_blob_ref(text).is_some() {
                 continue;

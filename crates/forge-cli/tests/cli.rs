@@ -44,25 +44,21 @@ fn sql_target_flags_conflict() {
 async fn write_segment(dir: &std::path::Path) -> std::path::PathBuf {
     use forge_model::catalog::{HourBucket, Level, SegmentId};
     use forge_model::merge::{Tombstones, merge_versions};
-    use forge_model::row::SpanBatchBuilder;
-    use forge_model::testing::{Rng, pid, random_row};
-    use forge_storage::{SegmentSpec, SegmentStore, VortexSegmentStore, build_object_store};
+    use forge_model::testing::{Rng, batch_from_rows, pid, random_row};
+    use forge_storage::{SegmentSpec, SegmentStore};
     use futures::StreamExt;
     let mut r = Rng(5);
-    let mut b = SpanBatchBuilder::with_capacity(100);
-    for v in 1..=100u64 {
-        b.push(&random_row(&mut r, "p", v % 7, v % 13, v)).unwrap();
-    }
-    let merged = merge_versions(&[b.finish().unwrap()], Tombstones::Keep).unwrap();
-    let url = format!("file://{}", dir.join("data").display());
-    let store = VortexSegmentStore::new(build_object_store(&forge_model::config::StorageConfig { url }).unwrap());
+    let rows: Vec<_> = (1..=100u64)
+        .map(|v| random_row(&mut r, "p", v % 7, v % 13, v))
+        .collect();
+    let merged = merge_versions(&[batch_from_rows(&rows)], Tombstones::Keep).unwrap();
     let spec = SegmentSpec {
         id: SegmentId::new(),
         project_id: pid("p"),
         level: Level::L0,
         partition_hour: HourBucket(0),
     };
-    let w = store
+    let w = common::segment_store(dir)
         .write_segment(spec, futures::stream::iter([Ok(merged)]).boxed())
         .await
         .unwrap();

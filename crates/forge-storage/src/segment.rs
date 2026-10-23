@@ -4,7 +4,7 @@ use crate::{
     BatchStream, BuiltStore, RowSelection, ScanRequest, SegmentSpec, SegmentStore, StorageError, StorageResult,
     WrittenSegment,
 };
-use arrow::array::{Array, AsArray};
+use arrow::array::{Array, AsArray, StringArray};
 use arrow::compute::{max, min};
 use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
@@ -114,8 +114,13 @@ fn borrowed(k: &OwnedKey) -> Key<'_> {
     (&k.0, (k.1.0, &k.1.1), &k.2)
 }
 
+/// The dotted_order part of the sort key: NULLS LAST.
+pub(crate) fn nulls_last(d: &StringArray, i: usize) -> (bool, &str) {
+    if d.is_null(i) { (true, "") } else { (false, d.value(i)) }
+}
+
 /// Extends the running [lo, hi] range with `x`.
-fn widen<T: Ord + Copy>(lo: &mut Option<T>, hi: &mut Option<T>, x: T) {
+pub(crate) fn widen<T: Ord + Copy>(lo: &mut Option<T>, hi: &mut Option<T>, x: T) {
     *lo = Some(lo.map_or(x, |m| m.min(x)));
     *hi = Some(hi.map_or(x, |m| m.max(x)));
 }
@@ -135,10 +140,7 @@ impl SegmentStats {
             .unwrap()
             .as_primitive::<TimestampNanosecondType>();
         let v = b.column_by_name(col::VERSION).unwrap().as_primitive::<Int64Type>();
-        let key = |i: usize| -> Key<'_> {
-            let dotted = if d.is_null(i) { (true, "") } else { (false, d.value(i)) };
-            (t.value(i), dotted, sp.value(i))
-        };
+        let key = |i: usize| -> Key<'_> { (t.value(i), nulls_last(d, i), sp.value(i)) };
         for i in 0..b.num_rows() {
             let proj = p.value(i);
             if proj != spec_project {
@@ -156,8 +158,8 @@ impl SegmentStats {
                 StorageError::Unsorted(format!(
                     "{what} at row {}: trace_id {}, span_id {}, version {}",
                     self.rows + i as u64,
-                    hex(cur.0),
-                    hex(cur.2),
+                    hex::encode(cur.0),
+                    hex::encode(cur.2),
                     v.value(i)
                 ))
             };
@@ -194,10 +196,6 @@ impl SegmentStats {
         }
         Ok(())
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// The writer's outcome: a stashed input error first, then the writer's own error, then an empty input.

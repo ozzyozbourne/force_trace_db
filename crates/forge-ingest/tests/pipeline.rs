@@ -450,8 +450,7 @@ async fn size_trigger_flushes_without_flush_now() {
     let tmp = tempfile::tempdir().unwrap();
     let s = stack(tmp.path());
     let (ing, _) = open(tmp.path(), &s, 64 << 10, 64 << 20).await;
-    let stop = tokio_util::sync::CancellationToken::new();
-    let flusher = tokio::spawn(forge_ingest::run_flusher(ing.clone(), stop.clone()));
+    let tasks = ing.start_background();
     for i in 0..100u64 {
         let mut r = start("alpha", 1, i);
         r.inputs = Some(format!("{{\"pad\":\"{}\"}}", "x".repeat(1000)));
@@ -471,15 +470,14 @@ async fn size_trigger_flushes_without_flush_now() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    stop.cancel();
-    flusher.await.unwrap();
+    tasks.shutdown(Duration::from_secs(10)).await.unwrap().unwrap();
 }
 
 #[test]
 fn failed_frozen_flush_is_retried_while_idle() {
     // A frozen memtable left over by a failed flush makes the flusher try again even with nothing new.
     let m = forge_ingest::memtable::MemtableSet::new(0, 1 << 30, Duration::from_secs(3600));
-    let b = batch(&[start("alpha", 1, 1)]);
+    let b = batch_from_rows(&[start("alpha", 1, 1)]);
     let bytes = forge_ingest::memtable::accounted_bytes(&b);
     m.insert(1, b, bytes).unwrap();
     let now = std::time::Instant::now();

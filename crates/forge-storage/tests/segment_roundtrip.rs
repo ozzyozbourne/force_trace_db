@@ -8,9 +8,9 @@ use forge_model::config::StorageConfig;
 use forge_model::dotted::dotted_order;
 use forge_model::error::{Classify, ErrorKind, ModelError};
 use forge_model::ids::{SpanId, TraceId};
-use forge_model::row::{SpanBatchBuilder, SpanRow};
+use forge_model::row::SpanRow;
 use forge_model::schema::{col, col_idx, projected_schema, spans_schema};
-use forge_model::testing::pid;
+use forge_model::testing::{batch_from_rows, pid};
 use forge_storage::*;
 use futures::{TryStreamExt, stream};
 use object_store::ObjectStoreExt;
@@ -62,14 +62,6 @@ fn rows(traces: usize, spans_per: usize) -> Vec<SpanRow> {
     out
 }
 
-fn to_batch(rows: &[SpanRow]) -> RecordBatch {
-    let mut b = SpanBatchBuilder::with_capacity(rows.len());
-    for r in rows {
-        b.push(r).unwrap();
-    }
-    b.finish().unwrap()
-}
-
 fn input(batches: Vec<RecordBatch>) -> BatchStream {
     Box::pin(stream::iter(batches.into_iter().map(Ok)))
 }
@@ -107,7 +99,7 @@ async fn scan_range(
 #[tokio::test]
 async fn memory_round_trip_multi_batch() {
     let st = store("memory://");
-    let all = to_batch(&rows(10, 10));
+    let all = batch_from_rows(&rows(10, 10));
     let sp = spec("p");
     let parts = vec![all.slice(0, 15), all.slice(15, 40), all.slice(55, 45)];
     let w = st.write_segment(sp.clone(), input(parts)).await.unwrap();
@@ -159,7 +151,7 @@ async fn memory_round_trip_multi_batch() {
 #[tokio::test]
 async fn multi_chunk_ranges() {
     let st = store("memory://");
-    let all = to_batch(&rows(2_000, 10));
+    let all = batch_from_rows(&rows(2_000, 10));
     let w = st.write_segment(spec("p"), input(vec![all.clone()])).await.unwrap();
     assert_eq!(w.meta.row_count, 20_000);
     let parts: Vec<_> = st
@@ -185,7 +177,7 @@ async fn multi_chunk_ranges() {
 async fn file_store_writes_under_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let st = store(&format!("file://{}/data", tmp.path().display()));
-    let all = to_batch(&rows(3, 4));
+    let all = batch_from_rows(&rows(3, 4));
     let w = st.write_segment(spec("p"), input(vec![all.clone()])).await.unwrap();
     assert!(w.meta.path.starts_with("segments/p/L0/"), "{}", w.meta.path);
     let on_disk = tmp.path().join("data").join(&w.meta.path);
@@ -210,12 +202,12 @@ fn file_url_paths() {
 async fn write_invariants() {
     let st = store("memory://");
     let r = rows(10, 3);
-    let all = to_batch(&r);
+    let all = batch_from_rows(&r);
 
     let mut reversed = r.clone();
     reversed.reverse();
     let e = st
-        .write_segment(spec("p"), input(vec![to_batch(&reversed)]))
+        .write_segment(spec("p"), input(vec![batch_from_rows(&reversed)]))
         .await
         .unwrap_err();
     assert!(matches!(e, StorageError::Unsorted(_)), "{e:?}");
@@ -244,7 +236,7 @@ async fn write_invariants() {
 #[tokio::test]
 async fn retry_after_a_put_that_landed_succeeds() {
     let st = store("memory://");
-    let all = to_batch(&rows(4, 3));
+    let all = batch_from_rows(&rows(4, 3));
     let sp = spec("p");
     let first = st.write_segment(sp.clone(), input(vec![all.clone()])).await.unwrap();
     // The caller saw an error (e.g. a timeout) and retries the same spec with the same rows.
@@ -272,7 +264,7 @@ fn with_version(b: &RecordBatch, versions: Vec<i64>) -> RecordBatch {
 #[tokio::test]
 async fn negative_versions_are_rejected() {
     let st = store("memory://");
-    let b = with_version(&to_batch(&rows(1, 2)), vec![-1, 3]);
+    let b = with_version(&batch_from_rows(&rows(1, 2)), vec![-1, 3]);
     let e = st.write_segment(spec("p"), input(vec![b])).await.unwrap_err();
     assert!(
         matches!(&e, StorageError::Model(ModelError::Schema(m)) if m.contains("version")),
@@ -281,7 +273,7 @@ async fn negative_versions_are_rejected() {
 }
 
 async fn write(st: &VortexSegmentStore, rows: &[SpanRow]) -> StorageResult<WrittenSegment> {
-    st.write_segment(spec("p"), input(vec![to_batch(rows)])).await
+    st.write_segment(spec("p"), input(vec![batch_from_rows(rows)])).await
 }
 
 #[tokio::test]
@@ -338,13 +330,13 @@ async fn full_sort_key_is_enforced() {
     assert!(matches!(write(&st, &nulls_first).await, Err(StorageError::Unsorted(_))));
 
     // The check holds across batch boundaries.
-    let b = to_batch(&dup);
+    let b = batch_from_rows(&dup);
     let e = st
         .write_segment(spec("p"), input(vec![b.slice(0, 3), b.slice(3, 1)]))
         .await
         .unwrap_err();
     assert!(e.to_string().contains("span appears twice"), "across batches: {e}");
-    let b = to_batch(&desc);
+    let b = batch_from_rows(&desc);
     let e = st
         .write_segment(spec("p"), input(vec![b.slice(0, 1), b.slice(1, 2)]))
         .await
@@ -356,7 +348,7 @@ async fn full_sort_key_is_enforced() {
 async fn scan_rejects_bad_row_ranges() {
     let st = store("memory://");
     let w = st
-        .write_segment(spec("p"), input(vec![to_batch(&rows(10, 10))]))
+        .write_segment(spec("p"), input(vec![batch_from_rows(&rows(10, 10))]))
         .await
         .unwrap();
     #[allow(clippy::reversed_empty_ranges)]
@@ -382,7 +374,7 @@ async fn out_of_range_hour_is_an_error_not_a_panic() {
         ..spec("p")
     };
     let e = st
-        .write_segment(sp, input(vec![to_batch(&rows(1, 1))]))
+        .write_segment(sp, input(vec![batch_from_rows(&rows(1, 1))]))
         .await
         .unwrap_err();
     assert!(matches!(e, StorageError::Model(ModelError::HourOutOfRange(_))), "{e:?}");

@@ -1,11 +1,9 @@
 //! End to end: tonic + axum receivers on ephemeral ports with a fake Ingest.
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 use async_trait::async_trait;
-use forge_ingest::normalize::NormalizeConfig;
-use forge_ingest::normalize::pricing::Pricing;
 use forge_ingest::wal::WalError;
 use forge_ingest::{Ingest, IngestError};
-use forge_model::ids::ProjectId;
+use forge_model::config::IngestConfig;
 use forge_model::row::SpanRow;
 use forge_server::otlp::{OtlpReceiver, RpcStatus, grpc_service, http_router};
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
@@ -41,13 +39,7 @@ struct Harness {
 
 async fn start() -> Harness {
     let ingest = Arc::new(FakeIngest::default());
-    let r = OtlpReceiver {
-        ingest: ingest.clone(),
-        cfg: Arc::new(NormalizeConfig {
-            default_project: ProjectId::new("default").unwrap(),
-            pricing: Arc::new(Pricing::builtin()),
-        }),
-    };
+    let r = OtlpReceiver::new(ingest.clone(), &IngestConfig::default()).unwrap();
     let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc = format!("http://{}", gl.local_addr().unwrap());
     let svc = grpc_service(r.clone(), MAX);
@@ -66,7 +58,7 @@ async fn start() -> Harness {
 }
 
 fn fixture_json() -> Vec<u8> {
-    std::fs::read(forge_model::testing::fixture_path("genai_semconv_agent.json")).unwrap()
+    forge_model::testing::fixture_bytes("genai_semconv_agent.json")
 }
 fn fixture() -> ExportTraceServiceRequest {
     serde_json::from_slice(&fixture_json()).unwrap()
@@ -203,7 +195,7 @@ async fn http_export() {
     assert_eq!(r.status(), 415, "unsupported content-encoding");
     let r = post("application/json", None, b"{not json".to_vec()).await.unwrap();
     assert_eq!(r.status(), 400);
-    let v: serde_json::Value = r.json_text().await;
+    let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["code"], 3);
     let r = post("application/x-protobuf", None, vec![0xff, 0xff, 0xff])
         .await
@@ -239,13 +231,4 @@ async fn http_export() {
         post("application/json", None, fixture_json()).await.unwrap().status(),
         400
     );
-}
-
-trait JsonText {
-    async fn json_text(self) -> serde_json::Value;
-}
-impl JsonText for reqwest::Response {
-    async fn json_text(self) -> serde_json::Value {
-        serde_json::from_str(&self.text().await.unwrap()).unwrap()
-    }
 }

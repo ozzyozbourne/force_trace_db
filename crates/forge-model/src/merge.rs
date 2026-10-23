@@ -190,17 +190,9 @@ pub fn split_by_project(b: &RecordBatch) -> Result<Vec<(ProjectId, RecordBatch)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{SpanBatchBuilder, SpanRow};
-    use crate::testing::{Rng, random_row, reference_merge, rows_from_batch};
+    use crate::row::SpanRow;
+    use crate::testing::{Rng, batch_from_rows, random_row, reference_merge, rows_from_batch};
     use proptest::prelude::*;
-
-    fn batch(rows: &[SpanRow]) -> RecordBatch {
-        let mut b = SpanBatchBuilder::with_capacity(rows.len());
-        for r in rows {
-            b.push(r).unwrap();
-        }
-        b.finish().unwrap()
-    }
 
     fn row(project: &str, span: u64, version: u64) -> SpanRow {
         SpanRow {
@@ -213,7 +205,7 @@ mod tests {
     }
 
     fn merge(rows: &[SpanRow], t: Tombstones) -> Vec<SpanRow> {
-        rows_from_batch(&merge_versions(&[batch(rows)], t).unwrap()).unwrap()
+        rows_from_batch(&merge_versions(&[batch_from_rows(rows)], t).unwrap()).unwrap()
     }
 
     #[test]
@@ -341,7 +333,7 @@ mod tests {
     }
 
     fn chunked(rows: &[SpanRow], chunk: usize) -> Vec<RecordBatch> {
-        rows.chunks(chunk).map(batch).collect()
+        rows.chunks(chunk).map(batch_from_rows).collect()
     }
 
     proptest! {

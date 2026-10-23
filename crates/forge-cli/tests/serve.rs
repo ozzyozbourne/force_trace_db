@@ -37,11 +37,7 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
             .await
             .expect("empty export is OK");
 
-        let r = c
-            .post(format!("http://{}/v1/traces", p.otlp_http))
-            .send()
-            .await
-            .expect("otlp http");
+        let r = c.post(p.traces_url()).send().await.expect("otlp http");
         assert_eq!(r.status(), 415, "{}", s.logs());
     }
     assert!(
@@ -49,10 +45,7 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
         "exited before SIGTERM\n{}",
         s.logs()
     );
-    s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(10)).await;
-    let logs = s.logs();
-    assert!(st.success(), "{st}\n{logs}");
+    let logs = s.stop_ok(Duration::from_secs(10)).await;
     assert!(logs.contains("shutdown signal received"), "{logs}");
     assert!(logs.contains("all listeners stopped"), "{logs}");
     assert!(!logs.contains("drain deadline exceeded"), "{logs}");
@@ -73,10 +66,7 @@ async fn half_open_connection_hits_drain_deadline_and_still_exits_0() {
     api.write_all(b"GET /v1/projects HTTP/1.1\r\nHost: x\r\n")
         .expect("partial request");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(6)).await;
-    let logs = s.logs();
-    assert!(st.success(), "{st}\n{logs}");
+    let logs = s.stop_ok(Duration::from_secs(6)).await;
     assert!(logs.contains("drain deadline exceeded"), "{logs}");
 }
 
@@ -111,8 +101,7 @@ async fn projects_persist_across_restart() {
     }
     let body = project_list(&c, p.api).await;
     assert!(body.contains("\"demo\""), "{body}");
-    s.sigterm();
-    assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
+    s.stop_ok(Duration::from_secs(10)).await;
     drop(s);
 
     // Run 2 stops with Ctrl-C (SIGINT).
@@ -137,11 +126,8 @@ async fn signal_during_startup_exits_0() {
     s.wait_for_log("\"starting\"", Duration::from_secs(30)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!s.logs().contains("listening"), "startup was not blocked\n{}", s.logs());
-    s.sigterm();
     // Exits while startup is still blocked: the lock is held until after the exit.
-    let st = s.wait_exit(Duration::from_secs(15)).await;
-    let logs = s.logs();
-    assert!(st.success(), "{st}\n{logs}");
+    let logs = s.stop_ok(Duration::from_secs(15)).await;
     assert!(logs.contains("shutdown signal received during startup"), "{logs}");
     drop(lock);
 }
@@ -157,10 +143,9 @@ async fn serve_without_config_uses_relative_defaults() {
         ("FORGE_SERVER__SHUTDOWN_GRACE", "2s"),
     ];
     let (mut s, _) = spawn_ready(tmp.path(), None, &env).await;
-    s.sigterm();
-    assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
-    assert!(tmp.path().join("forge-data/meta.db").is_file(), "{}", s.logs());
-    assert!(tmp.path().join("forge-data/data").is_dir(), "{}", s.logs());
+    let logs = s.stop_ok(Duration::from_secs(10)).await;
+    assert!(tmp.path().join("forge-data/meta.db").is_file(), "{logs}");
+    assert!(tmp.path().join("forge-data/data").is_dir(), "{logs}");
 }
 
 #[tokio::test]

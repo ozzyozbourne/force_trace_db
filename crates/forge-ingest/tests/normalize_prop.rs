@@ -1,15 +1,13 @@
 //! Normalization never panics, and every row it produces is a valid spans row.
-use forge_ingest::normalize::pricing::Pricing;
 use forge_ingest::normalize::{NormalizeConfig, normalize_request};
-use forge_model::ids::ProjectId;
-use forge_model::row::{SpanBatchBuilder, validate_batch};
+use forge_model::row::validate_batch;
+use forge_model::testing::batch_from_rows;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value::Value};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::Event;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use proptest::prelude::*;
-use std::sync::Arc;
 
 const KEYS: &[&str] = &[
     "gen_ai.operation.name",
@@ -156,15 +154,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
     fn normalize_never_panics(req in request()) {
-        let cfg = NormalizeConfig {
-            default_project: ProjectId::new("default").unwrap(),
-            pricing: Arc::new(Pricing::builtin()),
-        };
+        let cfg = NormalizeConfig::default();
         let spans: usize = req.resource_spans.iter().flat_map(|r| &r.scope_spans).map(|s| s.spans.len()).sum();
         let n = normalize_request(req, None, &cfg);
         prop_assert_eq!(n.rows.len() as u64 + n.rejected, spans as u64);
-        let mut b = SpanBatchBuilder::with_capacity(n.rows.len());
-        for (i, r) in n.rows.iter().enumerate() {
+        let mut rows = n.rows.clone();
+        for (i, r) in rows.iter_mut().enumerate() {
             for (c, v) in [
                 ("inputs", &r.inputs),
                 ("outputs", &r.outputs),
@@ -176,10 +171,8 @@ proptest! {
                     prop_assert!(serde_json::from_str::<serde_json::Value>(v).is_ok(), "{} is not JSON: {}", c, v);
                 }
             }
-            let mut r = r.clone();
             r.version = i as u64 + 1;
-            b.push(&r).unwrap();
         }
-        validate_batch(&b.finish().unwrap()).unwrap();
+        validate_batch(&batch_from_rows(&rows)).unwrap();
     }
 }

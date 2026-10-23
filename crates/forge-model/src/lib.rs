@@ -44,6 +44,7 @@ pub mod failpoint;
 pub mod ids;
 pub mod memtable;
 pub mod merge;
+pub mod retry;
 pub mod row;
 pub mod schema;
 #[cfg(any(test, feature = "test-util"))]

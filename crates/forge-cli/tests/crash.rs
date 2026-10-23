@@ -7,14 +7,14 @@ mod common;
 
 use common::*;
 use forge_meta::{Metastore, SqliteMetastore};
+use forge_model::testing::{RowKey, files_under, row_key};
 use opentelemetry_proto::tonic::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status::StatusCode};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,12 +117,8 @@ struct Post {
 type Ledger = Arc<Mutex<Vec<Post>>>;
 
 /// One client: sequential OTLP/HTTP protobuf posts; stops at the first non-OK answer or after MAX_REQUESTS.
-async fn client(http: SocketAddr, round: u64, c: u64, ledger: Ledger) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client");
-    let url = format!("http://{http}/v1/traces");
+async fn client(ports: Ports, round: u64, c: u64, ledger: Ledger) {
+    let client = http_client();
     let project = format!("p{}", c % 2);
     for r in 0..MAX_REQUESTS {
         let update = r % 4 == 3;
@@ -138,13 +134,7 @@ async fn client(http: SocketAddr, round: u64, c: u64, ledger: Ledger) {
             });
             l.len() - 1
         };
-        let resp = client
-            .post(&url)
-            .header("content-type", "application/x-protobuf")
-            .header("x-forge-project", &project)
-            .body(body)
-            .send()
-            .await;
+        let resp = post_otlp(&client, &ports, "application/x-protobuf", None, Some(&project), body).await;
         let ok = match resp {
             Ok(r) if r.status() == 200 => match r.bytes().await {
                 Ok(b) => ExportTraceServiceResponse::decode(b).is_ok_and(|x| x.partial_success.is_none()),
@@ -159,29 +149,14 @@ async fn client(http: SocketAddr, round: u64, c: u64, ledger: Ledger) {
     }
 }
 
-/// Runs CLIENTS clients until they all stop, or until `cut` elapses (the clients keep running in the background
-/// and stop when the server goes away).
-async fn load(
-    http: SocketAddr,
-    round: u64,
-    ledger: &Ledger,
-    cut: Option<Duration>,
-) -> Vec<tokio::task::JoinHandle<()>> {
+/// Starts CLIENTS clients and returns after `cut` (the clients keep running in the background and stop when the
+/// server goes away).
+async fn load(ports: Ports, round: u64, ledger: &Ledger, cut: Duration) -> Vec<tokio::task::JoinHandle<()>> {
     let tasks: Vec<_> = (0..CLIENTS)
-        .map(|c| tokio::spawn(client(http, round, c, ledger.clone())))
+        .map(|c| tokio::spawn(client(ports, round, c, ledger.clone())))
         .collect();
-    match cut {
-        Some(d) => {
-            tokio::time::sleep(d).await;
-            tasks
-        }
-        None => {
-            for t in tasks {
-                t.await.expect("client task");
-            }
-            Vec::new()
-        }
-    }
+    tokio::time::sleep(cut).await;
+    tasks
 }
 
 async fn join(tasks: Vec<tokio::task::JoinHandle<()>>) {
@@ -237,14 +212,16 @@ async fn restart_and_post(dir: &Path, ledger: &Ledger) -> Replay {
     };
     let mut req = request(9, 9, 0, false);
     req.resource_spans[0].scope_spans[0].spans.truncate(1);
-    let r = reqwest::Client::new()
-        .post(format!("http://{}/v1/traces", p.otlp_http))
-        .header("content-type", "application/x-protobuf")
-        .header("x-forge-project", "post-restart")
-        .body(req.encode_to_vec())
-        .send()
-        .await
-        .expect("post-restart post");
+    let r = post_otlp(
+        &reqwest::Client::new(),
+        &p,
+        "application/x-protobuf",
+        None,
+        Some("post-restart"),
+        req.encode_to_vec(),
+    )
+    .await
+    .expect("post-restart post");
     assert_eq!(r.status(), 200, "{}", s.logs());
     ledger.lock().unwrap().push(Post {
         project: "post-restart".into(),
@@ -252,9 +229,7 @@ async fn restart_and_post(dir: &Path, ledger: &Ledger) -> Replay {
         acked: true,
         round: 99,
     });
-    s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(20)).await;
-    assert!(st.success(), "{st}\n{}", s.logs());
+    s.stop_ok(Duration::from_secs(20)).await;
     replay
 }
 
@@ -283,19 +258,19 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     let mut kv = HashSet::new();
     for r in &rows {
         assert!(
-            kv.insert((key(r), r.version)),
+            kv.insert((row_key(r), r.version)),
             "{ctx} C: duplicate {:?} v{}",
-            key(r),
+            row_key(r),
             r.version
         );
     }
 
     // Normalized rows per post, then per key: acked posts in order + the in-doubt post (at most one per key).
     let norm: Vec<Vec<_>> = posts.iter().map(|p| normalize(&p.req, Some(&p.project))).collect();
-    let mut acked: BTreeMap<Key, Vec<usize>> = BTreeMap::new();
-    let mut doubt: BTreeMap<Key, Vec<usize>> = BTreeMap::new();
+    let mut acked: BTreeMap<RowKey, Vec<usize>> = BTreeMap::new();
+    let mut doubt: BTreeMap<RowKey, Vec<usize>> = BTreeMap::new();
     for (i, rs) in norm.iter().enumerate() {
-        let keys: BTreeSet<Key> = rs.iter().map(key).collect();
+        let keys: BTreeSet<RowKey> = rs.iter().map(row_key).collect();
         for k in keys {
             if posts[i].acked { &mut acked } else { &mut doubt }
                 .entry(k)
@@ -321,11 +296,11 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
         .collect();
     assert!(invented.is_empty(), "{ctx} B: invented {invented:?}");
     // F
-    let post_restart: Vec<_> = rows.iter().filter(|r| key(r).0 == "post-restart").collect();
+    let post_restart: Vec<_> = rows.iter().filter(|r| row_key(r).0 == "post-restart").collect();
     if let Some(pr) = post_restart.iter().map(|r| r.version).max() {
         let others = rows
             .iter()
-            .filter(|r| key(r).0 != "post-restart")
+            .filter(|r| row_key(r).0 != "post-restart")
             .map(|r| r.version)
             .max()
             .unwrap_or(0);
@@ -335,7 +310,7 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     for (k, row) in &got {
         let rows_of = |idx: &[usize]| -> Vec<Vec<forge_model::row::SpanRow>> {
             idx.iter()
-                .map(|&i| norm[i].iter().filter(|r| key(r) == *k).cloned().collect())
+                .map(|&i| norm[i].iter().filter(|r| row_key(r) == *k).cloned().collect())
                 .collect()
         };
         let mut a: Vec<usize> = acked.get(k).cloned().unwrap_or_default();
@@ -368,14 +343,14 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     // H: orphan objects (on disk, not visible). `*.vortex#N` staging files are reported, not counted.
     let visible_paths: HashSet<_> = segs.iter().map(|s| dir.join("data").join(&s.path)).collect();
     let (mut on_disk, mut staging) = (Vec::new(), Vec::new());
-    walk(&dir.join("data/segments"), &mut |p| {
+    for p in files_under(&dir.join("data/segments")) {
         let name = p.to_string_lossy();
         if name.ends_with(".vortex") {
-            on_disk.push(p.to_path_buf());
+            on_disk.push(p);
         } else if name.contains(".vortex#") {
-            staging.push(p.to_path_buf());
+            staging.push(p);
         }
-    });
+    }
     let n = on_disk.iter().filter(|p| !visible_paths.contains(*p)).count();
     if !staging.is_empty() {
         eprintln!("{ctx}: {} staging files: {staging:?}", staging.len());
@@ -394,36 +369,57 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     );
 }
 
-fn walk(dir: &Path, f: &mut impl FnMut(&Path)) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd {
-        let p = e.expect("dir entry").path();
-        if p.is_dir() {
-            walk(&p, f);
-        } else {
-            f(&p);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------------------------------------------
 
+/// A fresh data dir with its config (`grace`) and an empty ledger.
+struct Case {
+    tmp: tempfile::TempDir,
+    cfg: PathBuf,
+    ledger: Ledger,
+}
+
+impl Case {
+    fn new(grace: &str) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = write_config(tmp.path(), grace);
+        Self {
+            tmp,
+            cfg,
+            ledger: Ledger::default(),
+        }
+    }
+
+    fn dir(&self) -> &Path {
+        self.tmp.path()
+    }
+
+    /// Load until the failpoint SIGKILLs the server.
+    async fn kill_under_load(&self, fp: &str, interval: &str) {
+        let (mut s, p) = spawn_ready(self.dir(), Some(&self.cfg), &env(Some(fp), interval, &[])).await;
+        let tasks = load(p, 0, &self.ledger, Duration::ZERO).await;
+        let st = s.wait_exit(Duration::from_secs(20)).await;
+        assert_killed(st, &s.logs(), Some(fp));
+        join(tasks).await;
+    }
+
+    /// 300 ms of load, then SIGTERM: exit 0 with `log` in the logs.
+    async fn sigterm_under_load(&self, interval: &str, log: &str) {
+        let (mut s, p) = spawn_ready(self.dir(), Some(&self.cfg), &env(None, interval, &[])).await;
+        let tasks = load(p, 0, &self.ledger, Duration::from_millis(300)).await;
+        let logs = s.stop_ok(Duration::from_secs(20)).await;
+        assert!(logs.contains(log), "{logs}");
+        join(tasks).await;
+    }
+}
+
 /// Load until the failpoint SIGKILLs the server, restart, verify.
 async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path();
-    let cfg = write_config(dir, "5s");
-    let ledger = Ledger::default();
-    let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(Some(fp), interval, &[])).await;
-    let tasks = load(p.otlp_http, 0, &ledger, Some(Duration::ZERO)).await;
-    let st = s.wait_exit(Duration::from_secs(20)).await;
-    assert_killed(st, &s.logs(), Some(fp));
-    join(tasks).await;
-    drop(s);
-    let replay = restart_and_post(dir, &ledger).await;
-    verify(dir, &ledger, orphans, &format!("{fp} {replay:?}")).await;
+    let c = Case::new("5s");
+    c.kill_under_load(fp, interval).await;
+    let replay = restart_and_post(c.dir(), &c.ledger).await;
+    verify(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
     replay
 }
 
@@ -491,22 +487,13 @@ async fn crash_after_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_replay_flush() {
     timed(async {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-        let cfg = write_config(dir, "5s");
-        let ledger = Ledger::default();
-        let fp = "wal_after_fsync@40";
-        let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(Some(fp), "1h", &[])).await;
-        let tasks = load(p.otlp_http, 0, &ledger, Some(Duration::ZERO)).await;
-        let st = s.wait_exit(Duration::from_secs(20)).await;
-        assert_killed(st, &s.logs(), Some(fp));
-        join(tasks).await;
-        drop(s);
+        let c = Case::new("5s");
+        c.kill_under_load("wal_after_fsync@40", "1h").await;
 
         let fp = "flush_before_upload@1";
         let mut s = ServerProc::spawn(
-            dir,
-            Some(&cfg),
+            c.dir(),
+            Some(&c.cfg),
             &env(Some(fp), "1h", &[("FORGE_MEMTABLE__FLUSH_BYTES", "512KiB")]),
         );
         let st = s.wait_exit(Duration::from_secs(20)).await;
@@ -515,8 +502,8 @@ async fn crash_replay_flush() {
         assert!(!logs.contains("wal replay done"), "died inside replay: {logs}");
         drop(s);
 
-        let replay = restart_and_post(dir, &ledger).await;
-        verify(dir, &ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
+        let replay = restart_and_post(c.dir(), &c.ledger).await;
+        verify(c.dir(), &c.ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
     })
     .await;
 }
@@ -537,14 +524,12 @@ async fn crash_random_sigkill() {
     eprintln!("crash_random_sigkill: FORGE_CRASH_SEED={seed}");
     let mut rng = forge_model::testing::Rng(seed | 1);
     timed(async {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-        let cfg = write_config(dir, "5s");
-        let ledger = Ledger::default();
+        let c = Case::new("5s");
+        let (dir, cfg) = (c.dir(), Some(c.cfg.as_path()));
         for round in 0..3 {
             let ms = 200 + rng.below(800);
-            let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(None, "300ms", &[])).await;
-            let tasks = load(p.otlp_http, round, &ledger, Some(Duration::from_millis(ms))).await;
+            let (mut s, p) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
+            let tasks = load(p, round, &c.ledger, Duration::from_millis(ms)).await;
             s.signal("KILL");
             let st = s.wait_exit(Duration::from_secs(20)).await;
             assert_killed(st, &s.logs(), None);
@@ -552,18 +537,13 @@ async fn crash_random_sigkill() {
             drop(s);
             let ctx = format!("seed {seed} round {round} (kill after {ms} ms)");
             // A per round: a graceful start/stop flushes the replayed WAL.
-            let (mut s, _) = spawn_ready(dir, Some(&cfg), &env(None, "300ms", &[])).await;
-            s.sigterm();
-            assert!(
-                s.wait_exit(Duration::from_secs(20)).await.success(),
-                "{ctx}\n{}",
-                s.logs()
-            );
+            let (mut s, _) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
+            s.stop_ok(Duration::from_secs(20)).await;
             drop(s);
-            verify(dir, &ledger, Orphans::Any, &ctx).await;
+            verify(dir, &c.ledger, Orphans::Any, &ctx).await;
         }
-        let replay = restart_and_post(dir, &ledger).await;
-        verify(dir, &ledger, Orphans::Any, &format!("seed {seed} final {replay:?}")).await;
+        let replay = restart_and_post(dir, &c.ledger).await;
+        verify(dir, &c.ledger, Orphans::Any, &format!("seed {seed} final {replay:?}")).await;
     })
     .await;
 }
@@ -571,22 +551,11 @@ async fn crash_random_sigkill() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_stop_under_load() {
     timed(async {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-        let cfg = write_config(dir, "5s");
-        let ledger = Ledger::default();
-        let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(None, "300ms", &[])).await;
-        let tasks = load(p.otlp_http, 0, &ledger, Some(Duration::from_millis(300))).await;
-        s.sigterm();
-        let st = s.wait_exit(Duration::from_secs(20)).await;
-        let logs = s.logs();
-        assert!(st.success(), "{st}\n{logs}");
-        assert!(logs.contains("final flush done"), "{logs}");
-        join(tasks).await;
-        drop(s);
-        let replay = restart_and_post(dir, &ledger).await;
+        let c = Case::new("5s");
+        c.sigterm_under_load("300ms", "final flush done").await;
+        let replay = restart_and_post(c.dir(), &c.ledger).await;
         assert_eq!(replay.applied, 0, "{replay:?}");
-        verify(dir, &ledger, Orphans::Zero, &format!("graceful {replay:?}")).await;
+        verify(c.dir(), &c.ledger, Orphans::Zero, &format!("graceful {replay:?}")).await;
     })
     .await;
 }
@@ -594,22 +563,17 @@ async fn graceful_stop_under_load() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_flush_timeout_replays() {
     timed(async {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-        let cfg = write_config(dir, "1ms");
-        let ledger = Ledger::default();
-        let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(None, "1h", &[])).await;
-        let tasks = load(p.otlp_http, 0, &ledger, Some(Duration::from_millis(300))).await;
-        s.sigterm();
-        let st = s.wait_exit(Duration::from_secs(20)).await;
-        let logs = s.logs();
-        assert!(st.success(), "{st}\n{logs}");
-        assert!(logs.contains("final flush timed out"), "{logs}");
-        join(tasks).await;
-        drop(s);
-        let replay = restart_and_post(dir, &ledger).await; // rewrites the config with a 5 s grace
+        let c = Case::new("1ms");
+        c.sigterm_under_load("1h", "final flush timed out").await;
+        let replay = restart_and_post(c.dir(), &c.ledger).await; // rewrites the config with a 5 s grace
         assert!(replay.applied > 0, "{replay:?}");
-        verify(dir, &ledger, Orphans::Any, &format!("final flush timeout {replay:?}")).await;
+        verify(
+            c.dir(),
+            &c.ledger,
+            Orphans::Any,
+            &format!("final flush timeout {replay:?}"),
+        )
+        .await;
     })
     .await;
 }

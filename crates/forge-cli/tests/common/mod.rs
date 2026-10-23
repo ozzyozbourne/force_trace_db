@@ -2,15 +2,14 @@
 //! offline (metastore + segments) after the server has exited.
 #![allow(dead_code)]
 
-use forge_ingest::normalize::pricing::Pricing;
-use forge_ingest::normalize::{NormalizeConfig, normalize_request};
+use forge_ingest::normalize::{NormalizeConfig, PROJECT_HEADER, normalize_request};
 use forge_meta::{Metastore, SegmentFilter, SqliteMetastore};
 use forge_model::catalog::SegmentMeta;
 use forge_model::config::StorageConfig;
-use forge_model::ids::{ProjectId, SpanId, TraceId};
+use forge_model::ids::{ProjectId, TraceId};
 use forge_model::merge::{Tombstones, merge_versions};
-use forge_model::row::{SpanBatchBuilder, SpanRow};
-use forge_model::testing::{reference_merge, rows_from_batch};
+use forge_model::row::SpanRow;
+use forge_model::testing::{RowKey, batch_from_rows, reference_merge, row_key, rows_from_batch};
 use forge_storage::inspect::{InspectOptions, inspect_segment};
 use forge_storage::{RowSelection, ScanRequest, SegmentStore, VortexSegmentStore, build_object_store};
 use futures::TryStreamExt;
@@ -38,6 +37,39 @@ pub struct Ports {
     pub api: SocketAddr,
     pub otlp_http: SocketAddr,
     pub otlp_grpc: SocketAddr,
+}
+
+impl Ports {
+    pub fn traces_url(&self) -> String {
+        format!("http://{}/v1/traces", self.otlp_http)
+    }
+}
+
+/// A client with a 10 s request timeout.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
+}
+
+/// POST /v1/traces with `content-type`, optional `content-encoding` and optional project header.
+pub async fn post_otlp(
+    c: &reqwest::Client,
+    p: &Ports,
+    content_type: &str,
+    encoding: Option<&str>,
+    project: Option<&str>,
+    body: Vec<u8>,
+) -> reqwest::Result<reqwest::Response> {
+    let mut r = c.post(p.traces_url()).header("content-type", content_type);
+    if let Some(e) = encoding {
+        r = r.header("content-encoding", e);
+    }
+    if let Some(p) = project {
+        r = r.header(PROJECT_HEADER, p);
+    }
+    r.body(body).send().await
 }
 
 pub struct ServerProc {
@@ -186,6 +218,15 @@ impl ServerProc {
         st
     }
 
+    /// SIGTERM, wait for the exit, assert exit 0; returns the logs.
+    pub async fn stop_ok(&mut self, within: Duration) -> String {
+        self.sigterm();
+        let st = self.wait_exit(within).await;
+        let logs = self.logs();
+        assert!(st.success(), "{st}\n{logs}");
+        logs
+    }
+
     pub async fn wait_for_log(&mut self, needle: &str, within: Duration) {
         let what = format!("log {needle:?} not seen");
         self.poll(within, &what, false, async |s: &mut Self| {
@@ -257,17 +298,7 @@ pub fn log_field(logs: &str, message: &str, key: &str) -> serde_json::Value {
 // Offline state
 // ---------------------------------------------------------------------------------------------------------------
 
-pub type Key = (String /*project*/, TraceId, SpanId);
-
-pub fn key(r: &SpanRow) -> Key {
-    (
-        r.project_id.as_ref().expect("project").to_string(),
-        r.trace_id,
-        r.span_id,
-    )
-}
-
-fn segment_store(dir: &Path) -> VortexSegmentStore {
+pub fn segment_store(dir: &Path) -> VortexSegmentStore {
     let url = format!("file://{}", dir.join("data").display());
     VortexSegmentStore::new(build_object_store(&StorageConfig { url }).expect("object store"))
 }
@@ -309,7 +340,7 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
         let r = scan(&store, s, RowSelection::All).await;
         assert_eq!(r.len() as u64, s.row_count, "{} row_count", s.path);
         for x in &r {
-            *per_trace.entry((key(x).0, x.trace_id)).or_default() += 1;
+            *per_trace.entry((row_key(x).0, x.trace_id)).or_default() += 1;
         }
         rows.extend(r);
     }
@@ -327,7 +358,7 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
                 l.segment.path
             );
             assert!(
-                r.iter().all(|x| x.trace_id == *t && key(x).0 == *p),
+                r.iter().all(|x| x.trace_id == *t && row_key(x).0 == *p),
                 "T: range {:?} of {} holds other traces",
                 l.rows(),
                 l.segment.path
@@ -339,53 +370,38 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
     (segs, rows)
 }
 
-fn build(rows: &[SpanRow]) -> arrow::record_batch::RecordBatch {
-    let mut b = SpanBatchBuilder::with_capacity(rows.len());
-    for r in rows {
-        b.push(r).expect("push");
-    }
-    b.finish().expect("finish")
+/// Version zeroed, keyed.
+fn by_key(rows: impl IntoIterator<Item = SpanRow>) -> BTreeMap<RowKey, SpanRow> {
+    rows.into_iter()
+        .map(|mut r| {
+            r.version = 0;
+            (row_key(&r), r)
+        })
+        .collect()
 }
 
 /// Per key: `merge_versions(Drop)` over all rows, version zeroed.
-pub fn merged(rows: &[SpanRow]) -> BTreeMap<Key, SpanRow> {
+pub fn merged(rows: &[SpanRow]) -> BTreeMap<RowKey, SpanRow> {
     if rows.is_empty() {
         return BTreeMap::new();
     }
-    let m = merge_versions(&[build(rows)], Tombstones::Drop).expect("merge");
-    rows_from_batch(&m)
-        .expect("rows")
-        .into_iter()
-        .map(|mut r| {
-            r.version = 0;
-            (key(&r), r)
-        })
-        .collect()
+    let m = merge_versions(&[batch_from_rows(rows)], Tombstones::Drop).expect("merge");
+    by_key(rows_from_batch(&m).expect("rows"))
 }
 
 /// The expected merged rows of posts applied in order: versions stamped in post order, `reference_merge`,
 /// tombstones dropped, version zeroed.
-pub fn expected(posts: &[Vec<SpanRow>]) -> BTreeMap<Key, SpanRow> {
+pub fn expected(posts: &[Vec<SpanRow>]) -> BTreeMap<RowKey, SpanRow> {
     let mut all: Vec<SpanRow> = posts.iter().flatten().cloned().collect();
     for (i, r) in all.iter_mut().enumerate() {
         r.version = i as u64 + 1;
     }
-    reference_merge(&all)
-        .into_iter()
-        .filter(|r| !r.deleted)
-        .map(|mut r| {
-            r.version = 0;
-            (key(&r), r)
-        })
-        .collect()
+    by_key(reference_merge(&all).into_iter().filter(|r| !r.deleted))
 }
 
 /// `normalize_request` with the server's defaults; every span must be accepted.
 pub fn normalize(req: &ExportTraceServiceRequest, header_project: Option<&str>) -> Vec<SpanRow> {
-    let cfg = NormalizeConfig {
-        default_project: ProjectId::new("default").expect("project"),
-        pricing: Arc::new(Pricing::builtin()),
-    };
+    let cfg = NormalizeConfig::default();
     let header = header_project.map(|p| ProjectId::new(p).expect("project"));
     let n = normalize_request(req.clone(), header.as_ref(), &cfg);
     assert_eq!(n.rejected, 0, "{:?}", n.first_error);

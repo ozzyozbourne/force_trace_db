@@ -61,8 +61,7 @@ impl Forge {
             tracing::warn!("second signal; exiting now");
             std::process::exit(130);
         });
-        let stop_flusher = CancellationToken::new();
-        let flusher = tokio::spawn(forge_ingest::run_flusher(self.ingest.clone(), stop_flusher.clone()));
+        let tasks = self.ingest.start_background();
 
         // Any listener failure stops the others; join! (not try_join!) lets every listener drain.
         let guard = |r: anyhow::Result<()>| {
@@ -97,13 +96,7 @@ impl Forge {
         };
         tracing::info!("all listeners stopped");
         // Queued appends are fsynced and in the memtable; new appends get 503.
-        self.ingest.close_wal().await;
-        stop_flusher.cancel();
-        let final_flush = async {
-            let _ = flusher.await;
-            self.ingest.flush_all().await
-        };
-        match tokio::time::timeout(grace, final_flush).await {
+        match tasks.shutdown(grace).await {
             Ok(Ok(())) => tracing::info!("final flush done"),
             Ok(Err(e)) => tracing::warn!(error = %e, "final flush failed; rows replay from the WAL on start"),
             Err(_) => tracing::warn!(?grace, "final flush timed out; rows replay from the WAL on start"),

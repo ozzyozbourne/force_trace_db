@@ -1,18 +1,13 @@
 //! dotted_order resolution against an oracle computed from the generator's own tree.
-use forge_ingest::normalize::resolve_dotted_orders;
 use forge_model::dotted::dotted_order;
-use forge_model::ids::{SpanId, TraceId};
+use forge_model::dotted::resolve_dotted_orders;
+use forge_model::ids::SpanId;
 use forge_model::row::SpanRow;
-use forge_model::testing::{Rng, pid, sid, tid};
+use forge_model::testing::{Rng, RowKey as Key, pid, row_key as key, sid, tid};
 use proptest::prelude::*;
 use std::collections::HashMap;
 
-type Key = (String, TraceId, SpanId);
 type Node = (Option<SpanId>, Option<i64>); // (parent, start)
-
-fn key(r: &SpanRow) -> Key {
-    (r.project_id.as_ref().unwrap().to_string(), r.trace_id, r.span_id)
-}
 
 /// Some(d) iff the whole chain is present, ends at a root and has start times; cycles are None.
 fn oracle(k: &Key, nodes: &HashMap<Key, Node>, path: &mut Vec<Key>) -> Option<String> {

@@ -1,7 +1,7 @@
 //! OTLP ExportTraceServiceRequest -> Vec<SpanRow> (pure, synchronous; versions are assigned later).
 use crate::normalize::attrs::{Attrs, any_to_json, json_payload, kvs_to_json, parse_json_text, unflatten};
-use crate::normalize::pricing::{Pricing, Usage, normalize_provider, provider_from_model};
-use forge_model::dotted::dotted_order;
+use crate::normalize::finalize::{Measured, finalize_rows, finalize_span};
+use crate::normalize::pricing::{Pricing, Usage, normalize_provider};
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
 use forge_model::row::SpanRow;
@@ -10,7 +10,6 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
 use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use opentelemetry_proto::tonic::trace::v1::{Span, status::StatusCode};
 use serde_json::{Map, Value as J, json};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// gRPC metadata key / HTTP header naming the project (M1; M6 derives it from the API key).
@@ -23,6 +22,23 @@ pub struct NormalizeConfig {
     /// `ingest.default_project` ("default").
     pub default_project: ProjectId,
     pub pricing: Arc<Pricing>,
+}
+
+impl NormalizeConfig {
+    pub fn new(default_project: ProjectId) -> Self {
+        Self {
+            default_project,
+            pricing: Arc::new(Pricing::builtin()),
+        }
+    }
+}
+
+/// `ingest.default_project`'s default ("default") and the built-in prices.
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        let p = forge_model::config::IngestConfig::default().default_project;
+        Self::new(ProjectId::new(p).expect("the default project id is valid"))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -87,28 +103,14 @@ pub fn normalize_request(
             }
         }
     }
-    resolve_dotted_orders(&mut out.rows);
+    finalize_rows(&mut out.rows);
     out
 }
 
-/// `forge.project` > `openinference.project.name`. Resource values are sanitized (not rejected):
-/// chars outside [A-Za-z0-9._-] become '-', leading dots are dropped, max 128 chars.
+/// `forge.project` > `openinference.project.name`. Resource values are sanitized, not rejected
+/// (`ProjectId::sanitize`).
 pub fn project_from_resource(res: &Attrs) -> Option<ProjectId> {
-    let raw = res.first_str(&[PROJECT_RESOURCE_ATTR, "openinference.project.name"])?;
-    let s: String = raw
-        .trim()
-        .trim_start_matches('.')
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(128)
-        .collect();
-    ProjectId::new(s).ok()
+    ProjectId::sanitize(res.first_str(&[PROJECT_RESOURCE_ATTR, "openinference.project.name"])?)
 }
 
 fn ts(ns: u64, what: &'static str) -> Result<Option<i64>, SpanError> {
@@ -248,26 +250,18 @@ pub fn normalize_span(
         cache_read: a.first_int(CACHE_READ_KEYS),
         cache_write: a.first_int(CACHE_WRITE_KEYS),
     };
-    let total = a.first_int(TOTAL_KEYS).or(match (usage.prompt, usage.completion) {
-        (None, None) => None,
-        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
-    });
-    let producer_cost = a.first_f64(COST_KEYS);
+    let measured = Measured {
+        usage,
+        producer_total: a.first_int(TOTAL_KEYS),
+        producer_cost: a.first_f64(COST_KEYS),
+    };
     let mut session_id = a.first_str(SESSION_KEYS).map(str::to_owned);
 
     // ---- consumed attributes (removed) ----
     // P9: once a payload is extracted, the OpenInference `*.value` copies are redundant (and would push a
-    // large prompt into `attributes` a second time).
-    let inputs = extract_inputs(&mut a, &mut events);
-    if inputs.is_some() {
-        a.take("input.value");
-        a.take("input.mime_type");
-    }
-    let outputs = extract_outputs(&mut a, &mut events);
-    if outputs.is_some() {
-        a.take("output.value");
-        a.take("output.mime_type");
-    }
+    // large prompt into `attributes` a second time): `redundant_on_hit`.
+    let inputs = extract_payload(&INPUTS, &mut a, &mut events);
+    let outputs = extract_payload(&OUTPUTS, &mut a, &mut events);
     let metadata = extract_metadata(&mut a);
     let tags = extract_tags(&mut a);
 
@@ -283,20 +277,11 @@ pub fn normalize_span(
         model = meta_str("ls_model_name");
     }
     if provider.is_none() {
-        provider = meta_str("ls_provider")
-            .and_then(|p| normalize_provider(&p))
-            .or_else(|| model.as_deref().and_then(provider_from_model));
+        provider = meta_str("ls_provider").and_then(|p| normalize_provider(&p));
     }
     if session_id.is_none() {
         session_id = SESSION_METADATA_KEYS.iter().find_map(|k| meta_str(k));
     }
-
-    // Master decision 14: only leaf model calls carry cost; agent/chain tokens are aggregates.
-    let cost_usd = if run_type.is_some_and(|r| r.is_costed()) {
-        producer_cost.or_else(|| model.as_deref().and_then(|m| cfg.pricing.cost(m, &usage)))
-    } else {
-        None
-    };
 
     // ---- attributes: everything left + forge.* envelope ----
     let mut attrs = a.into_json();
@@ -332,12 +317,12 @@ pub fn normalize_span(
         attrs.insert("forge.dropped".into(), dropped);
     }
 
-    Ok(SpanRow {
+    let mut row = SpanRow {
         project_id: Some(project.clone()),
         trace_id,
         span_id,
         parent_span_id,
-        dotted_order: None, // resolve_dotted_orders
+        dotted_order: None, // finalize_rows
         name: (!span.name.is_empty()).then_some(span.name),
         run_type,
         start_time_ns: start,
@@ -346,10 +331,10 @@ pub fn normalize_span(
         error,
         model,
         provider,
-        prompt_tokens: usage.prompt,
-        completion_tokens: usage.completion,
-        total_tokens: total,
-        cost_usd,
+        prompt_tokens: None,     // finalize_span
+        completion_tokens: None, // finalize_span
+        total_tokens: None,      // finalize_span
+        cost_usd: None,          // finalize_span
         session_id,
         tags,
         metadata: (!metadata.is_empty()).then(|| J::Object(metadata).to_string()),
@@ -359,7 +344,9 @@ pub fn normalize_span(
         outputs: outputs.map(|v| v.to_string()),
         version: 0, // Ingest::submit stamps versions
         deleted: false,
-    })
+    };
+    finalize_span(&mut row, measured, &cfg.pricing);
+    Ok(row)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -505,100 +492,161 @@ fn take_message_events(events: &mut Vec<Event>, names: &[&str]) -> Option<J> {
     (!out.is_empty()).then(|| messages(J::Array(out)))
 }
 
-pub fn extract_inputs(a: &mut Attrs, events: &mut Vec<Event>) -> Option<J> {
-    // GenAI semconv (current)
-    let mut g = Map::new();
-    for (k, out) in [
-        ("gen_ai.input.messages", "messages"),
-        ("gen_ai.system_instructions", "system_instructions"),
-        ("gen_ai.tool.definitions", "tools"),
-    ] {
-        if let Some(v) = take_json(a, k) {
-            g.insert(out.into(), v);
-        }
-    }
-    if !g.is_empty() {
-        return Some(J::Object(g));
-    }
-    if let Some(v) = take_json(a, "gen_ai.tool.call.arguments") {
-        return Some(v);
-    }
-    if let Some(q) = take_json(a, "gen_ai.retrieval.query.text") {
-        return Some(json!({ "query": q }));
-    }
-    // OpenInference
-    if a.has_indexed("llm.input_messages.") {
-        return Some(messages(unflatten(a.take_indexed("llm.input_messages."))));
-    }
-    if a.has_indexed("llm.prompts.") {
-        return Some(json!({ "prompts": unflatten(a.take_indexed("llm.prompts.")) }));
-    }
-    if let Some(v) = take_mime_value(a, "input.value", "input.mime_type") {
-        return Some(v);
-    }
-    // OpenLLMetry legacy + Traceloop
-    if a.has_indexed("gen_ai.prompt.") {
-        return Some(messages(unflatten(a.take_indexed("gen_ai.prompt."))));
-    }
-    if let Some(v) = take_json(a, "traceloop.entity.input") {
-        a.take("gen_ai.task.input"); // duplicate
-        return Some(unwrap_langchain(v, "inputs"));
-    }
-    if let Some(v) = take_json(a, "gen_ai.task.input") {
-        return Some(unwrap_langchain(v, "inputs"));
-    }
-    // Obsolete single attribute and event-based content
-    if let Some(v) = take_json(a, "gen_ai.prompt") {
-        return Some(messages(v));
-    }
-    take_message_events(
-        events,
-        &[
-            "gen_ai.content.prompt",
-            "gen_ai.system.message",
-            "gen_ai.user.message",
-            "gen_ai.assistant.message",
-            "gen_ai.tool.message",
-        ],
-    )
+/// Where one payload source lives in a span.
+enum Loc {
+    /// Several JSON attributes combined into one object: `(attribute, output key)`.
+    Group(&'static [(&'static str, &'static str)]),
+    Json(&'static str),
+    /// `prefix<digit>...` flattened attributes, unflattened.
+    Indexed(&'static str),
+    /// OpenInference `(value, mime_type)`.
+    MimeValue(&'static str, &'static str),
+    /// Legacy GenAI content events (already shaped as messages).
+    Events(&'static [&'static str]),
 }
 
-pub fn extract_outputs(a: &mut Attrs, events: &mut Vec<Event>) -> Option<J> {
-    if let Some(v) = take_json(a, "gen_ai.output.messages") {
-        return Some(messages(v));
+struct Source {
+    from: Loc,
+    shape: fn(J) -> J,
+    /// Duplicates of this source, removed when it wins.
+    also_consume: &'static [&'static str],
+}
+
+/// One payload column: sources in precedence order (the first present wins; only it is consumed), plus
+/// attributes made redundant by any hit (P9: the OpenInference `*.value` copies).
+pub struct Payload {
+    sources: &'static [Source],
+    redundant_on_hit: &'static [&'static str],
+}
+
+const fn src(from: Loc, shape: fn(J) -> J) -> Source {
+    Source {
+        from,
+        shape,
+        also_consume: &[],
     }
-    if let Some(v) = take_json(a, "gen_ai.tool.call.result") {
-        return Some(v);
+}
+fn same(v: J) -> J {
+    v
+}
+fn query(v: J) -> J {
+    json!({ "query": v })
+}
+fn prompts(v: J) -> J {
+    json!({ "prompts": v })
+}
+fn documents(v: J) -> J {
+    json!({ "documents": v })
+}
+fn choices(v: J) -> J {
+    json!({ "choices": v })
+}
+fn langchain_inputs(v: J) -> J {
+    unwrap_langchain(v, "inputs")
+}
+fn langchain_outputs(v: J) -> J {
+    unwrap_langchain(v, "outputs")
+}
+
+pub static INPUTS: Payload = Payload {
+    sources: &[
+        // GenAI semconv (current)
+        src(
+            Loc::Group(&[
+                ("gen_ai.input.messages", "messages"),
+                ("gen_ai.system_instructions", "system_instructions"),
+                ("gen_ai.tool.definitions", "tools"),
+            ]),
+            same,
+        ),
+        src(Loc::Json("gen_ai.tool.call.arguments"), same),
+        src(Loc::Json("gen_ai.retrieval.query.text"), query),
+        // OpenInference
+        src(Loc::Indexed("llm.input_messages."), messages),
+        src(Loc::Indexed("llm.prompts."), prompts),
+        src(Loc::MimeValue("input.value", "input.mime_type"), same),
+        // OpenLLMetry legacy + Traceloop
+        src(Loc::Indexed("gen_ai.prompt."), messages),
+        Source {
+            from: Loc::Json("traceloop.entity.input"),
+            shape: langchain_inputs,
+            also_consume: &["gen_ai.task.input"],
+        },
+        src(Loc::Json("gen_ai.task.input"), langchain_inputs),
+        // Obsolete single attribute and event-based content
+        src(Loc::Json("gen_ai.prompt"), messages),
+        src(
+            Loc::Events(&[
+                "gen_ai.content.prompt",
+                "gen_ai.system.message",
+                "gen_ai.user.message",
+                "gen_ai.assistant.message",
+                "gen_ai.tool.message",
+            ]),
+            same,
+        ),
+    ],
+    redundant_on_hit: &["input.value", "input.mime_type"],
+};
+
+pub static OUTPUTS: Payload = Payload {
+    sources: &[
+        src(Loc::Json("gen_ai.output.messages"), messages),
+        src(Loc::Json("gen_ai.tool.call.result"), same),
+        src(Loc::Json("gen_ai.retrieval.documents"), documents),
+        src(Loc::Indexed("llm.output_messages."), messages),
+        src(Loc::Indexed("retrieval.documents."), documents),
+        src(Loc::Indexed("llm.choices."), choices),
+        src(Loc::MimeValue("output.value", "output.mime_type"), same),
+        src(Loc::Indexed("gen_ai.completion."), messages),
+        Source {
+            from: Loc::Json("traceloop.entity.output"),
+            shape: langchain_outputs,
+            also_consume: &["gen_ai.task.output"],
+        },
+        src(Loc::Json("gen_ai.task.output"), langchain_outputs),
+        src(Loc::Json("gen_ai.completion"), messages),
+        src(Loc::Events(&["gen_ai.content.completion", "gen_ai.choice"]), same),
+    ],
+    redundant_on_hit: &["output.value", "output.mime_type"],
+};
+
+fn take_unflattened(a: &mut Attrs, prefix: &str) -> Option<J> {
+    let kv = a.take_indexed(prefix);
+    (!kv.is_empty()).then(|| unflatten(kv))
+}
+
+fn take_source(a: &mut Attrs, events: &mut Vec<Event>, from: &Loc) -> Option<J> {
+    match from {
+        Loc::Group(keys) => {
+            let mut g = Map::new();
+            for (k, out) in *keys {
+                if let Some(v) = take_json(a, k) {
+                    g.insert((*out).into(), v);
+                }
+            }
+            (!g.is_empty()).then_some(J::Object(g))
+        }
+        Loc::Json(k) => take_json(a, k),
+        Loc::Indexed(p) => take_unflattened(a, p),
+        Loc::MimeValue(v, m) => take_mime_value(a, v, m),
+        Loc::Events(names) => take_message_events(events, names),
     }
-    if let Some(v) = take_json(a, "gen_ai.retrieval.documents") {
-        return Some(json!({ "documents": v }));
+}
+
+/// The first source present wins; it and its duplicates are consumed, and on a hit `redundant_on_hit` too.
+pub fn extract_payload(p: &Payload, a: &mut Attrs, events: &mut Vec<Event>) -> Option<J> {
+    let v = p.sources.iter().find_map(|s| {
+        let v = take_source(a, events, &s.from)?;
+        for k in s.also_consume {
+            a.take(k);
+        }
+        Some((s.shape)(v))
+    })?;
+    for k in p.redundant_on_hit {
+        a.take(k);
     }
-    if a.has_indexed("llm.output_messages.") {
-        return Some(messages(unflatten(a.take_indexed("llm.output_messages."))));
-    }
-    if a.has_indexed("retrieval.documents.") {
-        return Some(json!({ "documents": unflatten(a.take_indexed("retrieval.documents.")) }));
-    }
-    if a.has_indexed("llm.choices.") {
-        return Some(json!({ "choices": unflatten(a.take_indexed("llm.choices.")) }));
-    }
-    if let Some(v) = take_mime_value(a, "output.value", "output.mime_type") {
-        return Some(v);
-    }
-    if a.has_indexed("gen_ai.completion.") {
-        return Some(messages(unflatten(a.take_indexed("gen_ai.completion."))));
-    }
-    if let Some(v) = take_json(a, "traceloop.entity.output") {
-        a.take("gen_ai.task.output");
-        return Some(unwrap_langchain(v, "outputs"));
-    }
-    if let Some(v) = take_json(a, "gen_ai.task.output") {
-        return Some(unwrap_langchain(v, "outputs"));
-    }
-    if let Some(v) = take_json(a, "gen_ai.completion") {
-        return Some(messages(v));
-    }
-    take_message_events(events, &["gen_ai.content.completion", "gen_ai.choice"])
+    Some(v)
 }
 
 /// OpenInference `metadata` (JSON object string) + `user.id`, Traceloop association properties and
@@ -729,79 +777,4 @@ fn link_json(l: Link) -> J {
         m.insert("attributes".into(), J::Object(kvs_to_json(l.attributes)));
     }
     J::Object(m)
-}
-
-// -------------------------------------------------------------------------------------------------
-// dotted_order: computed when the whole ancestor chain is in this batch (ending at a root);
-// otherwise null (compaction fills it).
-// -------------------------------------------------------------------------------------------------
-
-type Key = (ProjectId, TraceId, SpanId);
-
-pub fn resolve_dotted_orders(rows: &mut [SpanRow]) {
-    // Last occurrence wins for duplicates (start + end post of one span in one batch).
-    let mut nodes: HashMap<Key, (Option<SpanId>, Option<i64>)> = HashMap::with_capacity(rows.len());
-    for r in rows.iter() {
-        let Some(p) = &r.project_id else { continue };
-        nodes.insert((p.clone(), r.trace_id, r.span_id), (r.parent_span_id, r.start_time_ns));
-    }
-    let mut memo: HashMap<Key, Option<String>> = HashMap::with_capacity(rows.len());
-    for r in rows.iter_mut() {
-        if r.dotted_order.is_some() {
-            continue; // already set by the producer (LangSmith runs API)
-        }
-        let Some(p) = &r.project_id else { continue };
-        let key = (p.clone(), r.trace_id, r.span_id);
-        r.dotted_order = resolve(&key, &nodes, &mut memo);
-    }
-}
-
-fn resolve(
-    key: &Key,
-    nodes: &HashMap<Key, (Option<SpanId>, Option<i64>)>,
-    memo: &mut HashMap<Key, Option<String>>,
-) -> Option<String> {
-    enum Base {
-        Root,
-        Prefix(String),
-        Unknown,
-    }
-    if let Some(m) = memo.get(key) {
-        return m.clone(); // resolved earlier as someone's ancestor
-    }
-    // Walk up until a memoized node, a root, a parent outside the batch, or a cycle.
-    let mut chain: Vec<(Key, Option<i64>)> = Vec::new();
-    let mut cur = key.clone();
-    let base = loop {
-        if let Some(m) = memo.get(&cur) {
-            break m.clone().map_or(Base::Unknown, Base::Prefix);
-        }
-        let Some(&(parent, start)) = nodes.get(&cur) else {
-            break Base::Unknown;
-        };
-        chain.push((cur.clone(), start));
-        if chain.len() > nodes.len() {
-            break Base::Unknown; // cycle
-        }
-        match parent {
-            None => break Base::Root,
-            Some(ps) => cur = (cur.0.clone(), cur.1, ps),
-        }
-    };
-    let mut prefix = match base {
-        Base::Root => Some(None),
-        Base::Prefix(s) => Some(Some(s)),
-        Base::Unknown => None,
-    };
-    let mut last = None;
-    for (k, start) in chain.into_iter().rev() {
-        let v = match (&prefix, start) {
-            (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.2)),
-            _ => None,
-        };
-        memo.insert(k, v.clone());
-        prefix = v.clone().map(Some);
-        last = v;
-    }
-    last
 }

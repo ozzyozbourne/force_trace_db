@@ -1,21 +1,12 @@
 use forge_model::catalog::{HourBucket, Level, SegmentId};
 use forge_model::merge::{Tombstones, merge_versions, sort_physical, split_by_project};
-use forge_model::row::{SpanBatchBuilder, SpanRow};
 use forge_model::schema::spans_schema;
-use forge_model::testing::{Rng, pid, random_row, reference_merge, rows_from_batch};
+use forge_model::testing::{Rng, batch_from_rows, pid, random_row, reference_merge, rows_from_batch};
 use forge_storage::inspect::{InspectOptions, inspect_segment};
 use forge_storage::*;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use std::sync::Arc;
-
-fn batch(rows: &[SpanRow]) -> arrow::array::RecordBatch {
-    let mut b = SpanBatchBuilder::with_capacity(rows.len());
-    for r in rows {
-        b.push(r).unwrap();
-    }
-    b.finish().unwrap()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tuned_strategy_and_inspect() {
@@ -30,7 +21,7 @@ async fn tuned_strategy_and_inspect() {
         }
         rows.push(row);
     }
-    let merged = merge_versions(&[batch(&rows)], Tombstones::Keep).unwrap();
+    let merged = merge_versions(&[batch_from_rows(&rows)], Tombstones::Keep).unwrap();
     assert_eq!(rows_from_batch(&merged).unwrap(), reference_merge(&rows));
     let (_, slice) = split_by_project(&merged).unwrap().remove(0);
     let dir = tempfile::tempdir().unwrap();
@@ -106,7 +97,7 @@ async fn sorting_without_merging_is_rejected() {
     let rows: Vec<_> = (0..50u64)
         .map(|v| random_row(&mut r, "p", v % 3, v % 5, v + 1))
         .collect();
-    let unmerged = sort_physical(&batch(&rows)).unwrap();
+    let unmerged = sort_physical(&batch_from_rows(&rows)).unwrap();
     let st = VortexSegmentStore::new(BuiltStore {
         store: Arc::new(object_store::memory::InMemory::new()),
         local_root: None,

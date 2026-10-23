@@ -1,8 +1,9 @@
 //! OTLP receivers (forge-server): gRPC TraceService on 4317 and POST /v1/traces on 4318.
+use crate::error::{grpc_code, http_status, retry_after};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use forge_ingest::Ingest;
@@ -59,10 +60,7 @@ impl OtlpReceiver {
     pub fn new(ingest: Arc<dyn Ingest>, cfg: &forge_model::config::IngestConfig) -> anyhow::Result<Self> {
         Ok(Self {
             ingest,
-            cfg: Arc::new(NormalizeConfig {
-                default_project: ProjectId::new(cfg.default_project.clone())?,
-                pricing: Arc::new(forge_ingest::normalize::pricing::Pricing::builtin()),
-            }),
+            cfg: Arc::new(NormalizeConfig::new(ProjectId::new(cfg.default_project.clone())?)),
         })
     }
 }
@@ -118,17 +116,8 @@ impl OtlpReceiver {
 // gRPC
 // ------------------------------------------------------------------------------------------------
 
-pub fn to_status(e: ExportError) -> tonic::Status {
-    use tonic::Status;
-    match e.kind {
-        ErrorKind::InvalidInput => Status::invalid_argument(e.msg),
-        // M6: attach google.rpc.RetryInfo (tonic-types) so exporters retry with the given delay.
-        ErrorKind::Backpressure => Status::resource_exhausted(e.msg),
-        ErrorKind::Transient => Status::unavailable(e.msg),
-        ErrorKind::Unimplemented => Status::unimplemented(e.msg),
-        ErrorKind::Conflict => Status::aborted(e.msg),
-        ErrorKind::Internal => Status::internal(e.msg),
-    }
+fn to_status(e: ExportError) -> tonic::Status {
+    tonic::Status::new(grpc_code(e.kind), e.msg)
 }
 
 #[tonic::async_trait]
@@ -189,17 +178,6 @@ pub struct RpcStatus {
     pub message: String,
 }
 
-fn http_status(k: ErrorKind) -> (StatusCode, tonic::Code) {
-    match k {
-        ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument),
-        ErrorKind::Backpressure => (StatusCode::TOO_MANY_REQUESTS, tonic::Code::ResourceExhausted),
-        ErrorKind::Transient => (StatusCode::SERVICE_UNAVAILABLE, tonic::Code::Unavailable),
-        ErrorKind::Unimplemented => (StatusCode::NOT_IMPLEMENTED, tonic::Code::Unimplemented),
-        ErrorKind::Conflict => (StatusCode::CONFLICT, tonic::Code::Aborted),
-        ErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, tonic::Code::Internal),
-    }
-}
-
 fn encode_ok(enc: Encoding, resp: &ExportTraceServiceResponse) -> Response {
     let body = match enc {
         Encoding::Proto => resp.encode_to_vec(),
@@ -211,7 +189,7 @@ fn encode_ok(enc: Encoding, resp: &ExportTraceServiceResponse) -> Response {
 }
 
 fn encode_err(enc: Encoding, e: ExportError) -> Response {
-    let (status, code) = http_status(e.kind);
+    let (kind, code) = (e.kind, grpc_code(e.kind));
     let body = match enc {
         Encoding::Proto => RpcStatus {
             code: code as i32,
@@ -222,10 +200,9 @@ fn encode_err(enc: Encoding, e: ExportError) -> Response {
             serde_json::to_vec(&serde_json::json!({"code": code as i32, "message": e.msg})).expect("json")
         }
     };
-    let mut r = (status, [(header::CONTENT_TYPE, enc.content_type())], body).into_response();
-    if matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE) {
-        r.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    let mut r = (http_status(kind), [(header::CONTENT_TYPE, enc.content_type())], body).into_response();
+    if let Some(v) = retry_after(kind) {
+        r.headers_mut().insert(header::RETRY_AFTER, v);
     }
     r
 }

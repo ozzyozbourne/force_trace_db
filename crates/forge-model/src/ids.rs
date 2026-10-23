@@ -68,17 +68,39 @@ byte_id!(SpanId, 8, "span_id");
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectId(Arc<str>);
 impl ProjectId {
+    pub const MAX_LEN: usize = 128;
+
+    /// The charset rule: 1-128 bytes of `[A-Za-z0-9._-]`, not starting with `.`.
+    const fn valid_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    }
+
     pub fn new(s: impl Into<String>) -> Result<Self> {
         let s = s.into();
-        let ok = (1..=128).contains(&s.len())
-            && !s.starts_with('.')
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+        let ok = (1..=Self::MAX_LEN).contains(&s.len()) && !s.starts_with('.') && s.bytes().all(Self::valid_byte);
         if ok {
             Ok(Self(s.into()))
         } else {
             Err(ModelError::InvalidProjectId(s))
         }
+    }
+    /// Coerces free text (a resource attribute) into an id under the same rule: trimmed, leading dots dropped,
+    /// other invalid chars become `-`, at most `MAX_LEN` chars. None when nothing is left.
+    pub fn sanitize(raw: &str) -> Option<Self> {
+        let s: String = raw
+            .trim()
+            .trim_start_matches('.')
+            .chars()
+            .map(|c| {
+                if c.is_ascii() && Self::valid_byte(c as u8) {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(Self::MAX_LEN)
+            .collect();
+        Self::new(s).ok()
     }
     pub fn as_str(&self) -> &str {
         &self.0

@@ -9,7 +9,7 @@ pub mod normalize;
 pub mod pipeline;
 pub mod version;
 pub mod wal;
-pub use pipeline::{OpenReport, Pipeline, run_flusher};
+pub use pipeline::{IngestTasks, OpenReport, Pipeline};
 
 #[async_trait::async_trait]
 pub trait Ingest: Send + Sync + std::fmt::Debug + 'static {

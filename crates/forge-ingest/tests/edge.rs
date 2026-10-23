@@ -1,5 +1,6 @@
+mod common;
+use common::j;
 use forge_ingest::blob::offload_blobs;
-use forge_ingest::normalize::pricing::Pricing;
 use forge_ingest::normalize::{NormalizeConfig, normalize_request};
 use forge_ingest::version::{VersionAllocator, stamp};
 use forge_model::blob::{blob_ref, parse_blob_ref};
@@ -12,14 +13,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::Event;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use serde_json::{Value as J, json};
-use std::sync::Arc;
 
-fn cfg() -> NormalizeConfig {
-    NormalizeConfig {
-        default_project: ProjectId::new("default").unwrap(),
-        pricing: Arc::new(Pricing::builtin()),
-    }
-}
 fn s(v: &str) -> Option<AnyValue> {
     Some(AnyValue {
         value: Some(Value::StringValue(v.into())),
@@ -68,9 +62,6 @@ fn req(res: Vec<KeyValue>, spans: Vec<Span>) -> ExportTraceServiceRequest {
         }],
     }
 }
-fn j(x: &Option<String>) -> J {
-    x.as_deref().map_or(J::Null, |s| serde_json::from_str(s).unwrap())
-}
 
 #[test]
 fn invalid_ids_are_rejected_individually() {
@@ -86,7 +77,7 @@ fn invalid_ids_are_rejected_individually() {
     let n = normalize_request(
         req(vec![], vec![bad_trace, zero_span, bad_parent, zero_parent, huge_time]),
         None,
-        &cfg(),
+        &NormalizeConfig::default(),
     );
     assert_eq!(n.rejected, 4);
     assert_eq!(
@@ -114,7 +105,7 @@ fn dotted_order_only_when_chain_reaches_a_root_in_batch() {
             ],
         ),
         None,
-        &cfg(),
+        &NormalizeConfig::default(),
     );
     let d: Vec<Option<usize>> = n
         .rows
@@ -130,15 +121,23 @@ fn project_resolution() {
         kv("forge.project", s("My Project/α")),
         kv("openinference.project.name", s("oi")),
     ];
-    let n = normalize_request(req(res.clone(), vec![span(1, 1, None, 0, vec![])]), None, &cfg());
+    let n = normalize_request(
+        req(res.clone(), vec![span(1, 1, None, 0, vec![])]),
+        None,
+        &NormalizeConfig::default(),
+    );
     assert_eq!(n.rows[0].project_id.as_ref().unwrap().as_str(), "My-Project--");
     let hdr = ProjectId::new("hdr").unwrap();
-    let n = normalize_request(req(res, vec![span(1, 1, None, 0, vec![])]), Some(&hdr), &cfg());
+    let n = normalize_request(
+        req(res, vec![span(1, 1, None, 0, vec![])]),
+        Some(&hdr),
+        &NormalizeConfig::default(),
+    );
     assert_eq!(n.rows[0].project_id.as_ref().unwrap().as_str(), "hdr");
     let n = normalize_request(
         req(vec![kv("service.name", s("svc"))], vec![span(1, 1, None, 0, vec![])]),
         None,
-        &cfg(),
+        &NormalizeConfig::default(),
     );
     assert_eq!(n.rows[0].project_id.as_ref().unwrap().as_str(), "default");
 }
@@ -149,7 +148,7 @@ fn start_and_end_posts_in_one_batch_get_increasing_versions() {
     start.end_time_unix_nano = 0;
     start.status = None;
     let end = span(1, 1, None, 0, vec![kv("gen_ai.usage.input_tokens", i(3))]);
-    let mut n = normalize_request(req(vec![], vec![start, end]), None, &cfg());
+    let mut n = normalize_request(req(vec![], vec![start, end]), None, &NormalizeConfig::default());
     let a = VersionAllocator::new(100);
     let r = a.reserve(2);
     stamp(&mut n.rows, r);
@@ -184,7 +183,11 @@ fn indexed_messages_sort_numerically_and_nest() {
     ));
     attrs.push(kv("llm.model_name", s("gpt-4o")));
     attrs.push(kv("llm.token_count.prompt", s("1000")));
-    let n = normalize_request(req(vec![], vec![span(1, 1, None, 0, attrs)]), None, &cfg());
+    let n = normalize_request(
+        req(vec![], vec![span(1, 1, None, 0, attrs)]),
+        None,
+        &NormalizeConfig::default(),
+    );
     let r = &n.rows[0];
     assert_eq!(r.run_type, Some(RunType::ChatModel));
     assert_eq!(r.cost_usd, Some(0.5)); // producer cost wins over the table
@@ -231,7 +234,7 @@ fn legacy_content_events_become_messages() {
             ..Default::default()
         },
     ];
-    let n = normalize_request(req(vec![], vec![sp]), None, &cfg());
+    let n = normalize_request(req(vec![], vec![sp]), None, &NormalizeConfig::default());
     let r = &n.rows[0];
     assert_eq!(r.provider.as_deref(), Some("azure.ai.openai"));
     assert_eq!(r.run_type, Some(RunType::Llm)); // sniffed from model (no operation name)
@@ -256,7 +259,7 @@ async fn blob_offload() {
             vec![span(1, 1, None, 0, attrs.clone()), span(1, 2, None, 0, attrs)],
         ),
         None,
-        &cfg(),
+        &NormalizeConfig::default(),
     );
     let store = InMemory::new();
     let written = offload_blobs(&mut n.rows, &store, 1 << 20).await.unwrap();
@@ -278,7 +281,11 @@ async fn blob_offload() {
         kv("gen_ai.operation.name", s("chat")),
         kv("gen_ai.input.messages", s(&big)),
     ];
-    let mut fresh = normalize_request(req(vec![], vec![span(1, 3, None, 0, attrs)]), None, &cfg());
+    let mut fresh = normalize_request(
+        req(vec![], vec![span(1, 3, None, 0, attrs)]),
+        None,
+        &NormalizeConfig::default(),
+    );
     assert_eq!(offload_blobs(&mut fresh.rows, &store, 1 << 20).await.unwrap(), 1); // AlreadyExists counts as written
     assert_eq!(fresh.rows[0].inputs, n.rows[0].inputs);
     assert!(n.rows[0].outputs.is_none() && n.rows[0].attributes.as_ref().unwrap().len() < 1000);
@@ -289,7 +296,11 @@ fn unidentified_span_has_null_run_type_and_cost() {
     // No kind, model, provider or operation attributes: nothing identifies it, so a sparse post (e.g. an end
     // post) never overwrites a run_type or cost set by an earlier post.
     let attrs = vec![kv("gen_ai.usage.input_tokens", i(10)), kv("http.method", s("GET"))];
-    let n = normalize_request(req(vec![], vec![span(1, 1, None, 0, attrs)]), None, &cfg());
+    let n = normalize_request(
+        req(vec![], vec![span(1, 1, None, 0, attrs)]),
+        None,
+        &NormalizeConfig::default(),
+    );
     let r = &n.rows[0];
     assert_eq!(r.run_type, None);
     assert_eq!(r.cost_usd, None);

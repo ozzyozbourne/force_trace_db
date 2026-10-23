@@ -1476,6 +1476,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tracing",
  "ulid",
 ]
 
@@ -1528,6 +1530,7 @@ dependencies = [
  "bytes",
  "forge-model",
  "futures",
+ "hex",
  "object_store",
  "tempfile",
  "thiserror",

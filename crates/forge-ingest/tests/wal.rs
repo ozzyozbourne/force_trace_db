@@ -20,18 +20,17 @@ fn take(p: &mut Vec<u8>) -> Vec<u8> {
 
 fn payload(i: u64) -> Vec<u8> {
     let mut r = Rng(i + 1);
-    wal::encode_batch(&batch(&[random_row(&mut r, "p", i, i, i + 1)])).unwrap()
+    wal::encode_batch(&batch_from_rows(&[random_row(&mut r, "p", i, i, i + 1)])).unwrap()
 }
 
 /// Writes `n` records from 32 concurrent tasks; returns (dir records in on_durable order, stats).
 async fn fill(dir: &std::path::Path, next_seq: u64, n: u64, seg: u64) -> (Vec<u64>, wal::WriterStats) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
-    let lock = lock_dir(dir).unwrap();
+    let _lock = lock_dir(dir).unwrap();
     let w = Arc::new(
         Wal::start(
             opts(dir, seg),
-            lock,
             next_seq,
             take,
             move |items: &mut Vec<(u64, Vec<u8>)>| {
@@ -214,7 +213,7 @@ fn ipc_decoded_batches_overcount_memory() {
     // Why the memtable accounts WAL payload bytes, not get_array_memory_size().
     let mut r = Rng(3);
     let rows: Vec<_> = (0..100).map(|i| random_row(&mut r, "p", i, i, i + 1)).collect();
-    let b = batch(&rows);
+    let b = batch_from_rows(&rows);
     let p = wal::encode_batch(&b).unwrap();
     let d = wal::decode_batch(&p).unwrap();
     eprintln!(
@@ -231,7 +230,7 @@ fn ipc_decoded_batches_overcount_memory() {
     };
     eprintln!("get_slice_memory_size: built={} B, decoded={} B", slice(&b), slice(&d));
     assert_eq!(slice(&b), slice(&d));
-    let one = wal::encode_batch(&batch(&rows[..1])).unwrap();
+    let one = wal::encode_batch(&batch_from_rows(&rows[..1])).unwrap();
     eprintln!(
         "1-row IPC payload = {} B (schema message repeated per record)",
         one.len()
@@ -249,11 +248,10 @@ async fn child_writer() {
     let Ok(dir) = std::env::var("P2_CHILD_DIR") else { return };
     let dir = std::path::PathBuf::from(dir);
     let st = replay(&dir, 0, |_, _| Ok::<_, String>(())).unwrap();
-    let lock = lock_dir(&dir).unwrap();
+    let _lock = lock_dir(&dir).unwrap();
     let w = Arc::new(
         Wal::start(
             opts(&dir, 32 << 10),
-            lock,
             st.next_seq,
             take,
             |_: &mut Vec<(u64, Vec<u8>)>| {},
@@ -336,12 +334,12 @@ async fn encode_runs_in_seq_order() {
     let dir = tmp.path().join("n");
     let encoded = Arc::new(Mutex::new(Vec::new()));
     let e2 = encoded.clone();
-    let lock = lock_dir(&dir).unwrap();
+    let _lock = lock_dir(&dir).unwrap();
     let encode = move |p: &mut Vec<u8>| {
         e2.lock().unwrap().push(p[0]);
         std::mem::take(p)
     };
-    let w = Arc::new(Wal::start(opts(&dir, 1 << 20), lock, 1, encode, |_: &mut Vec<(u64, Vec<u8>)>| {}).unwrap());
+    let w = Arc::new(Wal::start(opts(&dir, 1 << 20), 1, encode, |_: &mut Vec<(u64, Vec<u8>)>| {}).unwrap());
     let mut tasks = Vec::new();
     for t in 0..16u8 {
         let w = w.clone();

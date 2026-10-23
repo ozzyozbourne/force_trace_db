@@ -16,7 +16,7 @@ use std::time::Duration;
 use tonic::codec::CompressionEncoding;
 
 fn fixture(name: &str) -> String {
-    std::fs::read_to_string(forge_model::testing::fixture_path(name)).expect("fixture")
+    String::from_utf8(forge_model::testing::fixture_bytes(name)).expect("utf-8 fixture")
 }
 
 fn parse(json: &str) -> ExportTraceServiceRequest {
@@ -69,11 +69,7 @@ async fn run() {
     let cfg = write_config(dir, "5s");
     let env = [("FORGE_MEMTABLE__FLUSH_INTERVAL", "1h")];
     let (mut s, p) = spawn_ready(dir, Some(&cfg), &env).await;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client");
-    let url = format!("http://{}/v1/traces", p.otlp_http);
+    let http = http_client();
 
     let (langgraph, oi, genai, legacy) = (
         fixture("openllmetry_langgraph.json"),
@@ -92,11 +88,7 @@ async fn run() {
     ];
 
     // 1. langgraph: HTTP JSON.
-    let r = http
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(langgraph.clone())
-        .send()
+    let r = post_otlp(&http, &p, "application/json", None, None, langgraph.clone().into())
         .await
         .expect("post langgraph");
     assert_eq!(r.status(), 200, "{}", s.logs());
@@ -105,12 +97,8 @@ async fn run() {
     // 2. openinference: HTTP protobuf + gzip.
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     gz.write_all(&posts[1].0.encode_to_vec()).expect("gzip");
-    let r = http
-        .post(&url)
-        .header("content-type", "application/x-protobuf")
-        .header("content-encoding", "gzip")
-        .body(gz.finish().expect("gzip"))
-        .send()
+    let body = gz.finish().expect("gzip");
+    let r = post_otlp(&http, &p, "application/x-protobuf", Some("gzip"), None, body)
         .await
         .expect("post openinference");
     assert_eq!(r.status(), 200, "{}", s.logs());
@@ -131,26 +119,21 @@ async fn run() {
         .await
         .expect("grpc connect");
     let mut req = tonic::Request::new(posts[3].0.clone());
-    req.metadata_mut()
-        .insert("x-forge-project", "legacy".parse().expect("metadata"));
+    req.metadata_mut().insert(
+        forge_ingest::normalize::PROJECT_HEADER,
+        "legacy".parse().expect("metadata"),
+    );
     let resp = plain.export(req).await.expect("legacy export").into_inner();
     assert_eq!(resp.partial_success, None);
 
     // 5. genai re-post: HTTP JSON (end post of b106, changed b102 name, b103 without input messages).
-    let r = http
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(repost)
-        .send()
+    let r = post_otlp(&http, &p, "application/json", None, None, repost.into())
         .await
         .expect("post repost");
     assert_eq!(r.status(), 200, "{}", s.logs());
     assert_ok_body(&r.bytes().await.expect("body"), true, "repost");
 
-    s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(20)).await;
-    let logs = s.logs();
-    assert!(st.success(), "{st}\n{logs}");
+    let logs = s.stop_ok(Duration::from_secs(20)).await;
     assert!(logs.contains("final flush done"), "{logs}");
     drop(s);
 
@@ -203,10 +186,7 @@ async fn run() {
 
     // Restart: nothing to replay, nothing new committed.
     let (mut s, _) = spawn_ready(dir, Some(&cfg), &env).await;
-    s.sigterm();
-    let st = s.wait_exit(Duration::from_secs(20)).await;
-    let logs = s.logs();
-    assert!(st.success(), "{st}\n{logs}");
+    let logs = s.stop_ok(Duration::from_secs(20)).await;
     assert_eq!(
         log_field(&logs, "wal replay done", "applied").as_u64(),
         Some(0),

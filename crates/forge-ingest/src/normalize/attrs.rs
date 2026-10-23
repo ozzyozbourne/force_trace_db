@@ -44,6 +44,11 @@ pub fn parse_json_text(s: String) -> J {
     J::String(s)
 }
 
+fn is_indexed(k: &str, p: &str) -> bool {
+    k.strip_prefix(p)
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 #[derive(Debug, Default)]
 pub struct Attrs(HashMap<String, AnyValue>);
 
@@ -64,10 +69,7 @@ impl Attrs {
     }
     /// `prefix` followed by a numeric index: `gen_ai.prompt.0.role` matches `gen_ai.prompt.`.
     pub fn has_indexed(&self, p: &str) -> bool {
-        self.0.keys().any(|k| {
-            k.strip_prefix(p)
-                .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
-        })
+        self.0.keys().any(|k| is_indexed(k, p))
     }
     /// Non-empty string value.
     pub fn str(&self, k: &str) -> Option<&str> {
@@ -117,25 +119,15 @@ impl Attrs {
     }
     /// Removes every `prefix*` key; returns (key without prefix, value), unsorted.
     pub fn take_prefix(&mut self, p: &str) -> Vec<(String, AnyValue)> {
-        let keys: Vec<String> = self.0.keys().filter(|k| k.starts_with(p)).cloned().collect();
-        keys.into_iter()
-            .filter_map(|k| {
-                let v = self.0.remove(&k)?;
-                Some((k[p.len()..].to_string(), v))
-            })
-            .collect()
+        self.take_where(p, |k| k.starts_with(p))
     }
     /// Like `take_prefix`, only for `prefix<digit>...` keys.
     pub fn take_indexed(&mut self, p: &str) -> Vec<(String, AnyValue)> {
-        let keys: Vec<String> = self
-            .0
-            .keys()
-            .filter(|k| {
-                k.strip_prefix(p)
-                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
-            })
-            .cloned()
-            .collect();
+        self.take_where(p, |k| is_indexed(k, p))
+    }
+    /// Removes the keys matching `keep` (all start with `p`); returns (key without `p`, value).
+    fn take_where(&mut self, p: &str, keep: impl Fn(&str) -> bool) -> Vec<(String, AnyValue)> {
+        let keys: Vec<String> = self.0.keys().filter(|k| keep(k)).cloned().collect();
         keys.into_iter()
             .filter_map(|k| {
                 let v = self.0.remove(&k)?;

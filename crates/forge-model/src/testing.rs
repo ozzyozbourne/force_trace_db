@@ -44,6 +44,37 @@ pub fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/")).join(name)
 }
 
+pub fn fixture_bytes(name: &str) -> Vec<u8> {
+    std::fs::read(fixture_path(name)).expect("fixture")
+}
+
+/// Row identity as tests compare it: (project, trace, span).
+pub type RowKey = (String, TraceId, SpanId);
+pub fn row_key(r: &SpanRow) -> RowKey {
+    (
+        r.project_id.as_ref().expect("project").to_string(),
+        r.trace_id,
+        r.span_id,
+    )
+}
+
+/// Every file under `dir`, recursively; empty if `dir` is missing.
+pub fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd {
+        let p = e.expect("dir entry").path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 pub struct Rng(pub u64);
 impl Rng {
     pub fn next_u64(&mut self) -> u64 {
@@ -173,7 +204,16 @@ pub fn reference_merge(rows: &[SpanRow]) -> Vec<SpanRow> {
     out
 }
 
-/// Inverse of `SpanBatchBuilder`: a spans_schema batch -> rows.
+/// Rows -> one spans_schema batch through `SpanBatchBuilder`; panics on an invalid row (tests only).
+pub fn batch_from_rows(rows: &[SpanRow]) -> RecordBatch {
+    let mut b = crate::row::SpanBatchBuilder::with_capacity(rows.len());
+    for r in rows {
+        b.push(r).expect("valid test row");
+    }
+    b.finish().expect("valid test batch")
+}
+
+/// Inverse of `batch_from_rows`: a spans_schema batch -> rows.
 pub fn rows_from_batch(b: &RecordBatch) -> Result<Vec<SpanRow>> {
     use arrow::datatypes::{Float64Type, Int64Type, TimestampNanosecondType};
     crate::row::validate_batch(b)?;

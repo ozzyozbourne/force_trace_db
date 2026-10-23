@@ -23,6 +23,8 @@ thiserror.workspace = true
 figment.workspace = true
 bytesize.workspace = true
 humantime-serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

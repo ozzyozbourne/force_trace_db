@@ -1,6 +1,7 @@
 //! `forge inspect segment <path>`.
 //! Footer-only facts first (no data I/O), then a key-column scan that re-checks the segment
 //! contract (invariant 3) and summarizes traces/versions.
+use crate::segment::{nulls_last, widen};
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use forge_model::schema::{col, projected_schema};
@@ -70,7 +71,7 @@ pub async fn inspect_segment(path: &std::path::Path, o: &InspectOptions) -> crat
                     };
                     // ids are Binary: print hex, not Vortex's space-separated bytes
                     let t = match v.as_binary_opt().and_then(|b| b.value().cloned()) {
-                        Some(bytes) => bytes.as_slice().iter().map(|x| format!("{x:02x}")).collect(),
+                        Some(bytes) => hex::encode(bytes.as_slice()),
                         None => format!("{v}"),
                     };
                     let t = if t.len() > 40 { format!("{}…", &t[..40]) } else { t };
@@ -127,8 +128,8 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
     type Key = (String, Vec<u8>, (bool, String), Vec<u8>);
     let mut prev: Option<Key> = None;
     let (mut rows, mut traces, mut deleted, mut start_nulls) = (0u64, 0u64, 0u64, 0u64);
-    let (mut vmin, mut vmax) = (i64::MAX, i64::MIN);
-    let (mut tmin, mut tmax) = (i64::MAX, i64::MIN);
+    let (mut vmin, mut vmax) = (None, None);
+    let (mut tmin, mut tmax) = (None, None);
     let (mut per_trace_max, mut cur_trace_rows) = (0u64, 0u64);
     let mut projects = HashSet::new();
     let mut spans_in_trace: HashSet<Vec<u8>> = HashSet::new();
@@ -142,11 +143,8 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
         let st = b.column(5).as_primitive::<TimestampNanosecondType>();
         let del = b.column(6).as_boolean();
         for i in 0..b.num_rows() {
-            let dotted = if d.is_null(i) {
-                (true, String::new())
-            } else {
-                (false, d.value(i).to_string())
-            };
+            let (null, dotted) = nulls_last(d, i);
+            let dotted = (null, dotted.to_string());
             let k: Key = (p.value(i).to_string(), t.value(i).to_vec(), dotted, s.value(i).to_vec());
             let new_trace = prev.as_ref().is_none_or(|q| q.0 != k.0 || q.1 != k.1);
             if new_trace {
@@ -163,13 +161,11 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
                 problems.push(format!("row {rows}: span appears twice in its trace"));
             }
             projects.insert(k.0.clone());
-            vmin = vmin.min(v.value(i));
-            vmax = vmax.max(v.value(i));
+            widen(&mut vmin, &mut vmax, v.value(i));
             if st.is_null(i) {
                 start_nulls += 1;
             } else {
-                tmin = tmin.min(st.value(i));
-                tmax = tmax.max(st.value(i));
+                widen(&mut tmin, &mut tmax, st.value(i));
             }
             deleted += u64::from(del.value(i));
             rows += 1;
@@ -177,6 +173,9 @@ fn verify_rows(batches: &[arrow::record_batch::RecordBatch]) -> String {
         }
     }
     per_trace_max = per_trace_max.max(cur_trace_rows);
+    // An empty range prints as the i64 MAX..MIN sentinels.
+    let (vmin, vmax) = (vmin.unwrap_or(i64::MAX), vmax.unwrap_or(i64::MIN));
+    let (tmin, tmax) = (tmin.unwrap_or(i64::MAX), tmax.unwrap_or(i64::MIN));
     let mut out = String::new();
     writeln!(
         out,
