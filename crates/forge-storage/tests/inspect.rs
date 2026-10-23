@@ -1,8 +1,8 @@
 use forge_model::catalog::{HourBucket, Level, SegmentId};
 use forge_model::merge::{Tombstones, merge_versions, sort_physical, split_by_project};
-use forge_model::row::{SpanBatchBuilder, SpanRow, rows_from_batch};
+use forge_model::row::{SpanBatchBuilder, SpanRow};
 use forge_model::schema::spans_schema;
-use forge_model::testing::{Rng, pid, random_row, reference_merge};
+use forge_model::testing::{Rng, pid, random_row, reference_merge, rows_from_batch};
 use forge_storage::inspect::{InspectOptions, inspect_segment};
 use forge_storage::*;
 use futures::{StreamExt, TryStreamExt};

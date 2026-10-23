@@ -1,21 +1,57 @@
 //! Embedded model pricing ($ per 1M tokens) + model-name normalization.
-use serde::{Deserialize, Serialize};
+//!
+//! List prices in USD per 1M tokens. UNVERIFIED: written from memory (normalize.md §2.5); check every price
+//! before a release. Siblings (gpt-4, o3-mini, …) must exist so boundary-prefix lookup never borrows a parent's price.
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelPrice {
     /// $ / 1M uncached input tokens.
     pub input: f64,
     /// $ / 1M output tokens (embeddings: 0).
     pub output: f64,
     /// $ / 1M cache-read input tokens (defaults to `input`).
-    #[serde(default)]
     pub cached_input: Option<f64>,
     /// $ / 1M cache-write input tokens (defaults to `input`).
-    #[serde(default)]
     pub cache_write: Option<f64>,
 }
+
+const fn p(input: f64, output: f64, cached_input: Option<f64>, cache_write: Option<f64>) -> ModelPrice {
+    ModelPrice {
+        input,
+        output,
+        cached_input,
+        cache_write,
+    }
+}
+
+/// The built-in table (otlp_genai.md §5 plus siblings). UNVERIFIED (see the module doc).
+pub const BUILTIN: &[(&str, ModelPrice)] = &[
+    ("gpt-4o", p(2.50, 10.00, Some(1.25), None)),
+    ("gpt-4o-mini", p(0.15, 0.60, Some(0.075), None)),
+    ("gpt-4.1", p(2.00, 8.00, Some(0.50), None)),
+    ("gpt-4.1-mini", p(0.40, 1.60, Some(0.10), None)),
+    ("gpt-4.1-nano", p(0.10, 0.40, Some(0.025), None)),
+    ("gpt-4-turbo", p(10.00, 30.00, None, None)),
+    ("gpt-4", p(30.00, 60.00, None, None)),
+    ("gpt-3.5-turbo", p(0.50, 1.50, None, None)),
+    ("o1", p(15.00, 60.00, Some(7.50), None)),
+    ("o1-mini", p(1.10, 4.40, Some(0.55), None)),
+    ("o3", p(2.00, 8.00, Some(0.50), None)),
+    ("o3-mini", p(1.10, 4.40, Some(0.55), None)),
+    ("o4-mini", p(1.10, 4.40, Some(0.275), None)),
+    ("text-embedding-3-small", p(0.02, 0.0, None, None)),
+    ("text-embedding-3-large", p(0.13, 0.0, None, None)),
+    ("text-embedding-ada-002", p(0.10, 0.0, None, None)),
+    ("claude-opus-4", p(15.00, 75.00, Some(1.50), Some(18.75))),
+    ("claude-sonnet-4", p(3.00, 15.00, Some(0.30), Some(3.75))),
+    ("claude-3-7-sonnet", p(3.00, 15.00, Some(0.30), Some(3.75))),
+    ("claude-3-5-sonnet", p(3.00, 15.00, Some(0.30), Some(3.75))),
+    ("claude-3-5-haiku", p(0.80, 4.00, Some(0.08), Some(1.00))),
+    ("claude-3-haiku", p(0.25, 1.25, Some(0.03), Some(0.30))),
+    ("gemini-2.5-pro", p(1.25, 10.00, None, None)),
+    ("gemini-2.5-flash", p(0.30, 2.50, None, None)),
+];
 
 /// Token usage as normalized; `prompt` includes cached tokens (GenAI semconv).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -25,12 +61,6 @@ pub struct Usage {
     pub cache_read: Option<i64>,
     pub cache_write: Option<i64>,
 }
-
-#[derive(Deserialize)]
-struct PricingFile {
-    models: std::collections::BTreeMap<String, ModelPrice>,
-}
-const PRICING_TOML: &str = include_str!("pricing.toml");
 
 #[derive(Debug, Clone)]
 pub struct Pricing {
@@ -44,11 +74,9 @@ impl Default for Pricing {
 }
 
 impl Pricing {
-    /// The embedded table. Its validity is a unit test, so the expect cannot fire in a released binary.
     pub fn builtin() -> Self {
-        let f: PricingFile = toml::from_str(PRICING_TOML).expect("embedded pricing.toml is valid");
         Self {
-            models: f.models.into_iter().map(|(k, v)| (canonical_model(&k), v)).collect(),
+            models: BUILTIN.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
     }
 
@@ -96,15 +124,16 @@ pub fn canonical_model(m: &str) -> String {
             s = s[i + vendor.len()..].to_string();
         }
     }
-    if let Some(i) = s.rfind(':') {
-        if s[i + 1..].bytes().all(|b| b.is_ascii_digit()) {
-            s.truncate(i);
-        }
+    if let Some(i) = s.rfind(':')
+        && s[i + 1..].bytes().all(|b| b.is_ascii_digit())
+    {
+        s.truncate(i);
     }
-    if let Some(i) = s.rfind("-v") {
-        if i + 2 < s.len() && s[i + 2..].bytes().all(|b| b.is_ascii_digit()) {
-            s.truncate(i);
-        }
+    if let Some(i) = s.rfind("-v")
+        && i + 2 < s.len()
+        && s[i + 2..].bytes().all(|b| b.is_ascii_digit())
+    {
+        s.truncate(i);
     }
     if let Some(x) = s.strip_suffix("-latest") {
         s = x.to_string();
@@ -169,33 +198,8 @@ mod tests {
         assert_eq!(pr.lookup("gpt-4-0613").unwrap().0, "gpt-4");
         assert_eq!(pr.lookup("gpt-4.1-2025-04-14").unwrap().0, "gpt-4.1");
         assert!(pr.lookup("llama-3-70b").is_none());
-        for k in [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "gpt-4.1-nano",
-            "gpt-4-turbo",
-            "gpt-4",
-            "gpt-3.5-turbo",
-            "o1",
-            "o1-mini",
-            "o3",
-            "o3-mini",
-            "o4-mini",
-            "text-embedding-3-small",
-            "text-embedding-3-large",
-            "text-embedding-ada-002",
-            "claude-opus-4",
-            "claude-sonnet-4",
-            "claude-3-7-sonnet",
-            "claude-3-5-sonnet",
-            "claude-3-5-haiku",
-            "claude-3-haiku",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-        ] {
-            assert_eq!(pr.lookup(k).unwrap().0, k);
+        for (k, _) in BUILTIN {
+            assert_eq!(pr.lookup(k).unwrap().0, *k, "every BUILTIN key resolves to itself");
         }
         assert_eq!(pr.models.len(), 24);
     }

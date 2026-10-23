@@ -4,7 +4,7 @@ use crate::flush::{Backoff, FlushCtx, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
 use crate::version::{VersionAllocator, stamp};
 use crate::wal::{self, Wal, WalOptions};
-use crate::{Ingest, IngestAck, IngestError};
+use crate::{Ingest, IngestError};
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
@@ -181,7 +181,7 @@ impl Pipeline {
 
 #[async_trait::async_trait]
 impl Ingest for Pipeline {
-    async fn submit(&self, mut rows: Vec<SpanRow>) -> Result<IngestAck, IngestError> {
+    async fn submit(&self, mut rows: Vec<SpanRow>) -> Result<(), IngestError> {
         if rows.is_empty() {
             return Err(IngestError::Invalid("empty batch".into()));
         }
@@ -192,8 +192,7 @@ impl Ingest for Pipeline {
             .await
             .map_err(StorageError::from)?;
         let versions = self.versions.reserve(rows.len() as u64);
-        stamp(&mut rows, versions.clone());
-        let n = rows.len();
+        stamp(&mut rows, versions);
         let (batch, payload, bytes) = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
             let mut bb = SpanBatchBuilder::with_capacity(rows.len());
             for r in &rows {
@@ -207,12 +206,8 @@ impl Ingest for Pipeline {
         })
         .await
         .map_err(|e| IngestError::Internal(e.to_string()))??;
-        let wal_seq = self.wal.append(payload, (batch, bytes)).await?;
-        Ok(IngestAck {
-            rows: n,
-            versions,
-            wal_seq,
-        })
+        self.wal.append(payload, (batch, bytes)).await?;
+        Ok(())
     }
 }
 

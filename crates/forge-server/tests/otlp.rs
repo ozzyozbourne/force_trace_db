@@ -1,9 +1,10 @@
 //! End to end: tonic + axum receivers on ephemeral ports with a fake Ingest.
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 use async_trait::async_trait;
 use forge_ingest::normalize::NormalizeConfig;
 use forge_ingest::normalize::pricing::Pricing;
 use forge_ingest::wal::WalError;
-use forge_ingest::{Ingest, IngestAck, IngestError};
+use forge_ingest::{Ingest, IngestError};
 use forge_model::ids::ProjectId;
 use forge_model::row::SpanRow;
 use forge_server::otlp::{OtlpReceiver, RpcStatus, grpc_service, http_router};
@@ -23,17 +24,12 @@ struct FakeIngest {
 }
 #[async_trait]
 impl Ingest for FakeIngest {
-    async fn submit(&self, rows: Vec<SpanRow>) -> Result<IngestAck, IngestError> {
+    async fn submit(&self, rows: Vec<SpanRow>) -> Result<(), IngestError> {
         if let Some(f) = *self.fail.lock().unwrap() {
             return Err(f());
         }
-        let n = rows.len();
         self.rows.lock().unwrap().extend(rows);
-        Ok(IngestAck {
-            rows: n,
-            versions: 1..1 + n as u64,
-            wal_seq: 1,
-        })
+        Ok(())
     }
 }
 
@@ -94,10 +90,11 @@ async fn grpc_export() {
         let resp = c.export(req).await.unwrap().into_inner();
         assert_eq!(resp.partial_success, None, "{enc:?}");
     }
-    let rows = h.ingest.rows.lock().unwrap();
-    assert_eq!(rows.len(), 21);
-    assert!(rows.iter().all(|r| r.project_id.as_ref().unwrap().as_str() == "proj-a"));
-    drop(rows);
+    {
+        let rows = h.ingest.rows.lock().unwrap();
+        assert_eq!(rows.len(), 21);
+        assert!(rows.iter().all(|r| r.project_id.as_ref().unwrap().as_str() == "proj-a"));
+    }
 
     // one bad span -> partial success, the rest is ingested
     let mut c = TraceServiceClient::connect(h.grpc.clone()).await.unwrap();

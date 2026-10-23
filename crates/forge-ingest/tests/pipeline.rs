@@ -1,3 +1,4 @@
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 mod common;
 use bytesize::ByteSize;
 use common::*;
@@ -329,13 +330,13 @@ async fn acked_is_queryable() {
     let tmp = tempfile::tempdir().unwrap();
     let s = stack(tmp.path());
     let (ing, _) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
-    let ack = ing
-        .submit(vec![start("alpha", 1, 1), end("alpha", 1, 1)])
+    ing.submit(vec![start("alpha", 1, 1), end("alpha", 1, 1)])
         .await
         .unwrap();
-    assert_eq!((ack.rows, ack.versions.clone()), (2, 1..3));
     let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
     assert_eq!(count(&snap.batches), 2);
+    let versions: Vec<u64> = rows_from_batch(&snap.batches[0]).iter().map(|r| r.version).collect();
+    assert_eq!(versions, [1, 2]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -368,8 +369,9 @@ async fn versions_survive_wiped_wal() {
     std::fs::remove_dir_all(tmp.path().join("wal")).unwrap();
     let (ing, rep) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
     assert!(rep.next_version > mv);
-    let ack = ing.submit(vec![start("alpha", 1, 3)]).await.unwrap();
-    assert!(ack.versions.start > mv);
+    ing.submit(vec![start("alpha", 1, 3)]).await.unwrap();
+    let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
+    assert!(rows_from_batch(&snap.batches[0])[0].version > mv);
 }
 
 #[tokio::test]

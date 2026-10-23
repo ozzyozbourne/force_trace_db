@@ -1,3 +1,4 @@
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 mod common;
 use common::*;
 use forge_ingest::wal::{self, REC_HDR, Wal, WalError, WalOptions, list_segments, lock_dir, replay, truncate};
@@ -245,7 +246,9 @@ async fn child_writer() {
     for t in 0..16u64 {
         let (w, out) = (w.clone(), out.clone());
         tasks.push(tokio::spawn(async move {
-            for i in 0.. {
+            let mut i = 0;
+            loop {
+                i += 1;
                 let seq = w.append(payload(t * 100_000 + i), ()).await.unwrap();
                 let mut o = out.lock().unwrap();
                 writeln!(o, "ACK {seq}").unwrap();

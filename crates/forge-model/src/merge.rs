@@ -173,8 +173,8 @@ pub fn split_by_project(b: &RecordBatch) -> Result<Vec<(ProjectId, RecordBatch)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{SpanBatchBuilder, SpanRow, rows_from_batch};
-    use crate::testing::{Rng, random_row, reference_merge};
+    use crate::row::{SpanBatchBuilder, SpanRow};
+    use crate::testing::{Rng, random_row, reference_merge, rows_from_batch};
     use proptest::prelude::*;
 
     fn batch(rows: &[SpanRow]) -> RecordBatch {

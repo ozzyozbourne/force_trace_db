@@ -24,7 +24,6 @@ hex.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
 opentelemetry-proto.workspace = true
 forge-model.workspace = true
 forge-meta.workspace = true

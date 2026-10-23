@@ -1,5 +1,4 @@
 use crate::listeners::{ShutdownSignals, serve_axum, serve_grpc};
-use crate::tasks::Tasks;
 use crate::{api_router, ops_router, otlp};
 use forge_model::config::ForgeConfig;
 use std::sync::Arc;
@@ -51,36 +50,6 @@ impl Forge {
         let grpc_inc = TcpIncoming::bind(s.otlp_grpc_addr)?;
         let max = self.config.ingest.max_request_bytes.as_u64() as usize;
         let receiver = otlp::OtlpReceiver::new(self.ingest.clone(), &self.config.ingest)?;
-        let (listeners, background) = (Tasks::new(self.shutdown.clone()), Tasks::new(self.shutdown.clone()));
-        let stop_flusher = CancellationToken::new();
-        {
-            let (p, t) = (self.ingest.clone(), stop_flusher.clone());
-            background.spawn("flusher", async move {
-                forge_ingest::run_flusher(p, t).await;
-                Ok(())
-            });
-        }
-        listeners.spawn(
-            "ops",
-            serve_axum("ops", ops_l, ops_router(self.clone()), self.shutdown.clone()),
-        );
-        listeners.spawn(
-            "api",
-            serve_axum("api", api_l, api_router(self.clone()), self.shutdown.clone()),
-        );
-        listeners.spawn(
-            "otlp-http",
-            serve_axum(
-                "otlp-http",
-                http_l,
-                otlp::http_router(receiver.clone(), max),
-                self.shutdown.clone(),
-            ),
-        );
-        listeners.spawn(
-            "otlp-grpc",
-            serve_grpc(grpc_inc, otlp::grpc_service(receiver, max), self.shutdown.clone()),
-        );
         self.ready.store(true, Ordering::Release);
 
         let tok = self.shutdown.clone();
@@ -92,28 +61,53 @@ impl Forge {
             tracing::warn!("second signal; exiting now");
             std::process::exit(130);
         });
+        let stop_flusher = CancellationToken::new();
+        let flusher = tokio::spawn(forge_ingest::run_flusher(self.ingest.clone(), stop_flusher.clone()));
 
-        self.shutdown.cancelled().await;
+        // Any listener failure stops the others; join! (not try_join!) lets every listener drain.
+        let guard = |r: anyhow::Result<()>| {
+            if r.is_err() {
+                self.shutdown.cancel();
+            }
+            r
+        };
+        let http = otlp::http_router(receiver.clone(), max);
+        let grpc = otlp::grpc_service(receiver, max);
+        let all = async {
+            let (a, b, c, d) = tokio::join!(
+                async { guard(serve_axum("ops", ops_l, ops_router(self.clone()), self.shutdown.clone()).await) },
+                async { guard(serve_axum("api", api_l, api_router(self.clone()), self.shutdown.clone()).await) },
+                async { guard(serve_axum("otlp-http", http_l, http, self.shutdown.clone()).await) },
+                async { guard(serve_grpc(grpc_inc, grpc, self.shutdown.clone()).await) },
+            );
+            a.and(b).and(c).and(d)
+        };
+        // Half-open connections (no h2 preface, partial request line) would block the drain forever.
         let grace = s.shutdown_grace;
-        if tokio::time::timeout(grace, listeners.wait()).await.is_err() {
-            tracing::warn!(?grace, "drain deadline exceeded; dropping open connections");
-        }
+        let deadline = async {
+            self.shutdown.cancelled().await;
+            tokio::time::sleep(grace).await;
+        };
+        let res = tokio::select! {
+            r = Box::pin(all) => r,
+            () = deadline => {
+                tracing::warn!(?grace, "drain deadline exceeded; dropping open connections");
+                Ok(())
+            }
+        };
         tracing::info!("all listeners stopped");
+        // Queued appends are fsynced and in the memtable; new appends get 503.
         self.ingest.close_wal().await;
         stop_flusher.cancel();
-        match tokio::time::timeout(grace, async {
-            background.wait().await;
+        let final_flush = async {
+            let _ = flusher.await;
             self.ingest.flush_all().await
-        })
-        .await
-        {
+        };
+        match tokio::time::timeout(grace, final_flush).await {
             Ok(Ok(())) => tracing::info!("final flush done"),
             Ok(Err(e)) => tracing::warn!(error = %e, "final flush failed; rows replay from the WAL on start"),
             Err(_) => tracing::warn!(?grace, "final flush timed out; rows replay from the WAL on start"),
         }
-        listeners
-            .take_error()
-            .or_else(|| background.take_error())
-            .map_or(Ok(()), Err)
+        res
     }
 }

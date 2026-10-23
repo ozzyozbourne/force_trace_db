@@ -54,13 +54,13 @@ pub fn file_url_path(url: &str) -> StorageResult<PathBuf> {
     }
 }
 
-// ---- DurableLocalFs (pasted verbatim from scratch/p2_wal/src/durable.rs) ----
+// ---- DurableLocalFs: fsyncs `put_opts` objects (LocalFileSystem does not) ----
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result, UploadPart,
+    PutPayload, PutResult, Result,
 };
 
 #[derive(Debug)]
@@ -121,13 +121,9 @@ impl ObjectStore for DurableLocalFs {
         Ok(r)
     }
 
+    /// Not durable: M1 writes only via `put_opts`; M5 adds it.
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
-        let inner = self.inner.put_multipart_opts(location, opts).await?;
-        Ok(Box::new(DurableUpload {
-            inner,
-            file: self.inner.path_to_filesystem(location)?,
-            root: self.root.clone(),
-        }))
+        self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -155,37 +151,8 @@ impl ObjectStore for DurableLocalFs {
         self.inner.list_with_delimiter(prefix).await
     }
 
+    /// Not durable: M1 writes only via `put_opts`; M5 adds it.
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.inner.copy_opts(from, to, options).await?;
-        self.sync(to).await
-    }
-}
-
-#[derive(Debug)]
-struct DurableUpload {
-    inner: Box<dyn MultipartUpload>,
-    file: PathBuf,
-    root: PathBuf,
-}
-
-#[async_trait]
-impl MultipartUpload for DurableUpload {
-    fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.inner.put_part(data)
-    }
-    async fn complete(&mut self) -> Result<PutResult> {
-        let r = self.inner.complete().await?;
-        let (file, root) = (self.file.clone(), self.root.clone());
-        tokio::task::spawn_blocking(move || sync_file_and_parents(&file, &root))
-            .await
-            .map_err(|e| object_store::Error::JoinError { source: e })?
-            .map_err(|e| object_store::Error::Generic {
-                store: "DurableLocalFs",
-                source: Box::new(e),
-            })?;
-        Ok(r)
-    }
-    async fn abort(&mut self) -> Result<()> {
-        self.inner.abort().await
+        self.inner.copy_opts(from, to, options).await
     }
 }

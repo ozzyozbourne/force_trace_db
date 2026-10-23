@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports)]
-pub use forge_model::row::rows_from_batch as rfb;
 use forge_model::row::{SpanBatchBuilder, SpanRow};
+pub use forge_model::testing::rows_from_batch as rfb;
 pub use forge_model::testing::{Rng, pid, random_row, reference_merge, sid, tid};
 
 pub fn batch(rows: &[SpanRow]) -> arrow::array::RecordBatch {

@@ -36,10 +36,10 @@ pub fn json_payload(v: AnyValue) -> J {
 
 pub fn parse_json_text(s: String) -> J {
     let t = s.trim_start();
-    if t.starts_with(['{', '[', '"']) {
-        if let Ok(v) = serde_json::from_str(t) {
-            return v;
-        }
+    if t.starts_with(['{', '[', '"'])
+        && let Ok(v) = serde_json::from_str(t)
+    {
+        return v;
     }
     J::String(s)
 }

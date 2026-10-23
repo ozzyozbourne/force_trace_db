@@ -1,4 +1,4 @@
-//! forge-ingest: the write path (M1). M0 defines the error type only.
+//! forge-ingest: the write path (M1): OTLP normalization, WAL, memtable, flush to L0 segments.
 
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
 
@@ -11,17 +11,12 @@ pub mod version;
 pub mod wal;
 pub use pipeline::{OpenReport, Pipeline, run_flusher};
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct IngestAck {
-    pub rows: usize,
-    pub versions: std::ops::Range<u64>,
-    pub wal_seq: u64,
-}
-
 #[async_trait::async_trait]
 pub trait Ingest: Send + Sync + std::fmt::Debug + 'static {
-    /// Rows already normalized (version 0).
-    async fn submit(&self, rows: Vec<forge_model::row::SpanRow>) -> Result<IngestAck, IngestError>;
+    /// Normalized rows (version ignored). Budget check -> blob offload -> WAL (versions assigned there, in seq
+    /// order) -> fsync -> memtable insert -> Ok. Ok = durable AND queryable. Once queued to the WAL thread,
+    /// dropping this future does not undo the write (a client retry adds a newer version).
+    async fn submit(&self, rows: Vec<forge_model::row::SpanRow>) -> Result<(), IngestError>;
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -26,8 +26,13 @@
 //!    below its max. Either insert into the memtable in seq order (for example, the WAL writer thread performs or
 //!    orders the inserts), or track the lowest in-flight seq and flush with `min_inflight − 1`. Otherwise, a crash
 //!    after the flush loses acknowledged writes on replay (`seq > flushed_seq`).
-//! 8. **A flush future is never dropped and then retried in the same process.** A second attempt could commit a
-//!    frozen memtable again under new segment ids, which duplicates `(key, version)`.
+//! 8. **Stale flushes commit nothing.** `commit_flush` skips segment inserts when `flushed_wal_seq` <= the stored
+//!    checkpoint (it still MAXes the checkpoint). Every real flush strictly advances the watermark, so re-flushing
+//!    already-committed rows can never duplicate (key, version).
+//! 9. **Version order = WAL order.** The WAL writer thread assigns versions in seq order, so memtables and L0 flushes
+//!    are version-disjoint and ordered. The per-field merge is associative only across such parts: M2 may merge
+//!    segments + memtable freely; M3 compaction must merge a key's segments as a contiguous run in flush order (or
+//!    include every newer segment holding the key).
 
 pub mod blob;
 pub mod catalog;
