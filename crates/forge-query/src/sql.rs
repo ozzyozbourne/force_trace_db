@@ -19,7 +19,7 @@ pub struct SqlRequest {
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
 pub const MAX_ROWS: usize = 100_000;
-/// Rows per JSON write: the body cap is checked after each slice.
+/// Rows per JSON encode (the body cap is checked per row).
 const SLICE: usize = 64;
 
 /// Timestamp(_, "UTC") -> "+00:00" (metadata only), because arrow_json without chrono-tz rejects "UTC". None when
@@ -90,26 +90,38 @@ impl QueryEngine {
             buf.extend_from_slice(b",\"rows\":");
             let fixed = utc_schema(&stream.schema());
             let (mut n, mut truncated) = (0usize, false);
-            {
-                let mut w = arrow::json::WriterBuilder::new()
-                    .with_explicit_nulls(true)
-                    .build::<_, arrow::json::writer::JsonArray>(&mut buf);
-                'batches: while let Some(b) = stream.next().await {
-                    let b = utc_fix(b?, &fixed)?;
-                    let mut off = 0;
-                    while off < b.num_rows() {
+            // Each slice is written line-delimited into `rows` (JSON escapes newlines inside strings, so `\n` only
+            // ends a row), then appended row by row: the cap is checked before every row, so the body exceeds
+            // `max_response_bytes` by at most one row (plus the envelope tail).
+            let mut rows: Vec<u8> = Vec::new();
+            buf.push(b'[');
+            'batches: while let Some(b) = stream.next().await {
+                let b = utc_fix(b?, &fixed)?;
+                let mut off = 0;
+                while off < b.num_rows() {
+                    let len = SLICE.min(b.num_rows() - off);
+                    rows.clear();
+                    let mut w = arrow::json::WriterBuilder::new()
+                        .with_explicit_nulls(true)
+                        .build::<_, arrow::json::writer::LineDelimited>(&mut rows);
+                    w.write(&b.slice(off, len))?;
+                    drop(w);
+                    for row in rows.split(|&c| c == b'\n').take(len) {
                         // More rows remain: stop here if a limit is reached (dropping the stream cancels DF's tasks).
-                        if n == max_rows || w.get_ref().len() > cap {
+                        if n == max_rows || buf.len() > cap {
                             truncated = true;
                             break 'batches;
                         }
-                        let len = SLICE.min(b.num_rows() - off).min(max_rows - n);
-                        w.write(&b.slice(off, len))?;
-                        (off, n) = (off + len, n + len);
+                        if n > 0 {
+                            buf.push(b',');
+                        }
+                        buf.extend_from_slice(row);
+                        n += 1;
                     }
+                    off += len;
                 }
-                w.finish()?;
             }
+            buf.push(b']');
             let _ = write!(
                 buf,
                 ",\"row_count\":{n},\"truncated\":{truncated},\"elapsed_ms\":{}}}",

@@ -50,6 +50,10 @@ pub struct Traps {
     /// A root reparented in flush 4 / flush 3: never listed.
     pub p: (TraceId, SpanId),
     pub p2: (TraceId, SpanId),
+    /// A root started in flush 2 and reparented in flush 5 (an older segment: lower, non-null max_start).
+    pub p3: (TraceId, SpanId),
+    /// A root started in flush 1 and reparented in the memtable.
+    pub p4: (TraceId, SpanId),
     /// run_type chain at start, `llm` in flush 4.
     pub l: (TraceId, SpanId),
     /// renamed in flush 4.
@@ -127,6 +131,36 @@ impl Fixture {
 
     pub fn reference(&self) -> Vec<SpanRow> {
         reference(&self.all)
+    }
+
+    /// The project-`a` segment layout the runs traps rely on (`random_layout`): newest first, flush 3 (TIE + 5
+    /// STEP), flushes 1 and 2 tied at TIE (read together), flush 5 last (its old root); flush 4 holds only patches
+    /// (no start: never a candidate segment, reached through locate_traces only, e.g. by R).
+    pub async fn assert_runs_layout(&self) {
+        use forge_meta::SegmentFilter;
+        let f = SegmentFilter {
+            project_id: Some(pid("a")),
+            newest_first: true,
+            ..Default::default()
+        };
+        let segs = self.meta.list_segments(&f).await.unwrap();
+        let starts: Vec<Option<i64>> = segs.iter().map(|s| s.max_start_ns).collect();
+        assert_eq!(
+            starts,
+            [
+                None,
+                Some(TIE + 5 * STEP),
+                Some(TIE),
+                Some(TIE),
+                Some(BASE - 1000 * STEP)
+            ],
+            "project a segments, newest first"
+        );
+        let r = self.meta.locate_trace(&pid("a"), self.traps.r.0).await.unwrap();
+        assert!(
+            r.iter().any(|l| l.segment.id == segs[0].id),
+            "R's patch is in the start-less segment"
+        );
     }
 
     /// Every (project, trace) with at least one post.
@@ -390,6 +424,21 @@ fn forced_edges(f: &mut [Vec<SpanRow>], mem: &mut Vec<SpanRow>, traps: &mut Trap
     });
     traps.p2 = key(109, 0);
     f[2].push(root("a", 110, 0, Some(TIE + 5 * STEP), "h-root"));
+    // P3 / P4: the reparent sits in an older segment (flush 5) or in the memtable.
+    f[1].push(root("a", 116, 0, at(53), "p3-root"));
+    f[1].push(root("a", 116, 1, at(53), "p3-new-parent"));
+    f[4].push(SpanRow {
+        parent_span_id: Some(sid(1)),
+        ..post("a", tid(116), sid(0))
+    });
+    traps.p3 = key(116, 0);
+    f[0].push(root("a", 117, 0, at(54), "p4-root"));
+    f[0].push(root("a", 117, 1, at(54), "p4-new-parent"));
+    mem.push(SpanRow {
+        parent_span_id: Some(sid(1)),
+        ..post("a", tid(117), sid(0))
+    });
+    traps.p4 = key(117, 0);
     // A trace whose every span is tombstoned.
     f[0].push(root("a", 115, 0, at(52), "deleted"));
     f[1].push(SpanRow {

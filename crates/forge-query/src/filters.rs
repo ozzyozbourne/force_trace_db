@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KeyFilters {
     /// None = any project. Some(empty) = no row can match.
-    pub projects: Option<BTreeSet<String>>,
+    /// Literals that are not valid project ids match no row and are dropped here (all paths share this set).
+    pub projects: Option<BTreeSet<ProjectId>>,
     pub traces: Option<BTreeSet<TraceId>>,
     /// Exact (trace, span) keys (runs verification; never from SQL).
     pub spans: Option<BTreeSet<(TraceId, SpanId)>>,
@@ -24,7 +25,7 @@ pub struct KeyFilters {
 }
 
 pub(crate) enum Pushed {
-    Projects(BTreeSet<String>),
+    Projects(BTreeSet<ProjectId>),
     Traces(BTreeSet<TraceId>),
     Time { lo: Option<i64>, hi: Option<i64> },
 }
@@ -131,7 +132,12 @@ pub(crate) fn classify(e: &Expr) -> Option<Pushed> {
     // Key sets (an `=` on start_time falls through to the time range below).
     if let Some((name, vals)) = key_set(e) {
         match name.as_str() {
-            c::PROJECT_ID => return vals.iter().map(str_lit).collect::<Option<_>>().map(Pushed::Projects),
+            c::PROJECT_ID => {
+                let names = vals.iter().map(str_lit).collect::<Option<Vec<_>>>()?;
+                return Some(Pushed::Projects(
+                    names.into_iter().filter_map(|n| ProjectId::new(n).ok()).collect(),
+                ));
+            }
             c::TRACE_ID => {
                 let ids = vals.iter().map(trace_lit).collect::<Option<Vec<_>>>()?;
                 return Some(Pushed::Traces(ids.into_iter().flatten().collect()));
@@ -212,7 +218,7 @@ impl KeyFilters {
     /// Every key of project `p`, optionally only of trace `t`.
     pub fn project(p: &ProjectId, t: Option<TraceId>) -> Self {
         Self {
-            projects: Some([p.to_string()].into()),
+            projects: Some([p.clone()].into()),
             traces: t.map(|t| [t].into()),
             ..Self::default()
         }
@@ -231,11 +237,12 @@ impl KeyFilters {
             Some(_) => Some(b.column(s.index_of(c::SPAN_ID)?).as_binary::<i32>()),
             None => None,
         };
+        let names: Option<BTreeSet<&str>> = self.projects.as_ref().map(|s| s.iter().map(|p| p.as_str()).collect());
         let trace = |i: usize| TraceId::from_slice(t.value(i)).ok();
         Ok(Some(
             (0..b.num_rows())
                 .map(|i| {
-                    self.projects.as_ref().is_none_or(|s| s.contains(p.value(i)))
+                    names.as_ref().is_none_or(|s| s.contains(p.value(i)))
                         && self
                             .traces
                             .as_ref()

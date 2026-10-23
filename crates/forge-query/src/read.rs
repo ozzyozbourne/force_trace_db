@@ -8,11 +8,10 @@ use crate::filters::KeyFilters;
 use arrow::array::{AsArray, RecordBatch};
 use arrow::compute::{concat_batches, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
-use arrow::error::ArrowError;
 use forge_meta::{MetaResult, Metastore, SegmentFilter};
 use forge_model::catalog::{SegmentMeta, TraceLocation};
 use forge_model::derived::with_effective_total_tokens;
-use forge_model::ids::{ProjectId, TraceId};
+use forge_model::ids::TraceId;
 use forge_model::merge::{Cancel, MERGE_COLUMNS, Tombstones, merge_projected};
 use forge_model::schema::{ALL_COLUMNS, col, col_idx, project_to};
 use forge_model::{MemtableSnapshot, MemtableView};
@@ -111,7 +110,7 @@ impl ReadView {
         self.meta.list_segments(f).await
     }
 
-    /// Every location of `k`'s traces in each of its valid projects (one `locate_traces` per project, D16), minus
+    /// Every location of `k`'s traces in each of its projects (one `locate_traces` per project, D16), minus
     /// segments outside `k`'s time range, in (segment, row) order. `k.projects` and `k.traces` must be set.
     pub async fn locate_versions(&self, k: &KeyFilters) -> MetaResult<Vec<SegmentPart>> {
         let (Some(ps), Some(ts)) = (&k.projects, &k.traces) else {
@@ -119,8 +118,8 @@ impl ReadView {
         };
         let traces: Vec<TraceId> = ts.iter().copied().collect();
         let mut out = Vec::new();
-        for p in ps.iter().filter_map(|p| ProjectId::new(p.as_str()).ok()) {
-            for loc in self.meta.locate_traces(&p, &traces).await?.into_values().flatten() {
+        for p in ps {
+            for loc in self.meta.locate_traces(p, &traces).await?.into_values().flatten() {
                 if loc.segment.may_overlap_time(k.start_ns, k.end_ns) {
                     out.push(SegmentPart::from(&loc));
                 }
@@ -135,8 +134,8 @@ impl ReadView {
         &self.mem
     }
 
-    pub fn mem_versions(&self, k: &KeyFilters, schema: &SchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
-        mem_versions(&self.mem, k, schema)
+    pub fn mem_versions(&self, k: &KeyFilters, schema: &SchemaRef) -> Result<Vec<RecordBatch>, QueryError> {
+        mem_versions(&self.mem, k, schema, &Cancel::never())
     }
 
     /// Scans `parts`, `SCAN_CONCURRENCY` at a time.
@@ -163,14 +162,19 @@ impl ReadView {
 }
 
 /// The memtable rows that pass `k`'s key filters (mask on the full batch, then project + filter: only the read
-/// columns are copied), projected to `schema`; batches without a match are dropped.
+/// columns are copied), projected to `schema`; batches without a match are dropped. Checks `cancel` every 64
+/// batches.
 pub(crate) fn mem_versions(
     snap: &MemtableSnapshot,
     k: &KeyFilters,
     schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>, ArrowError> {
+    cancel: &Cancel,
+) -> Result<Vec<RecordBatch>, QueryError> {
     let mut out = Vec::new();
-    for b in snap.batches() {
+    for (i, b) in snap.batches().enumerate() {
+        if i % 64 == 0 {
+            cancel.check()?;
+        }
         match k.key_mask(b)? {
             None => out.push(project_to(b, schema)?),
             Some(m) if m.true_count() > 0 => out.push(filter_record_batch(&project_to(b, schema)?, &m)?),
@@ -203,5 +207,29 @@ fn row_start(r: &RowSelection) -> u64 {
     match r {
         RowSelection::All => 0,
         RowSelection::Range(r) => r.start,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_model::schema::spans_schema;
+    use forge_model::testing::{FixedMemtable, Rng, batch_from_rows, random_row};
+
+    /// The memtable mask stops on a cancelled flag (checked every 64 batches).
+    #[test]
+    fn mem_versions_checks_cancel() {
+        let mut r = Rng(5);
+        let batches = (0..200u64)
+            .map(|i| batch_from_rows(&[random_row(&mut r, "p", 1, i, i + 1)]))
+            .collect();
+        let snap = FixedMemtable(batches).snapshot();
+        let k = KeyFilters::default();
+        let run = |c: &Cancel| mem_versions(&snap, &k, &spans_schema(), c);
+        assert!(matches!(
+            run(&Cancel::after(1)),
+            Err(QueryError::Model(forge_model::error::ModelError::Cancelled))
+        ));
+        assert_eq!(run(&Cancel::after(u64::MAX)).unwrap().len(), 200);
     }
 }

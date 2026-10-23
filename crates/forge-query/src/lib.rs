@@ -69,6 +69,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 macro_rules! external_errors {
     ($($v:ident($t:ty)),*) => {
         fn from_external(b: BoxError) -> Result<QueryError, BoxError> {
+            let b = match b.downcast::<QueryError>() {
+                Ok(q) => return Ok(*q),
+                Err(b) => b,
+            };
             $(let b = match b.downcast::<$t>() {
                 Ok(e) => return Ok(QueryError::$v(*e)),
                 Err(b) => b,
@@ -86,7 +90,8 @@ macro_rules! external_errors {
 external_errors!(
     Meta(forge_meta::MetaError),
     Storage(forge_storage::StorageError),
-    Model(forge_model::error::ModelError)
+    Model(forge_model::error::ModelError),
+    Index(forge_index::IndexError)
 );
 
 /// Unwraps `External` errors raised by our own code (metastore, storage, the merge's `Cancelled`).
@@ -134,9 +139,10 @@ impl Classify for QueryError {
     }
 }
 
-/// Test hook: runs on the blocking pool with the call's `Cancel`, before the blocking work.
+/// Test hook: runs on the blocking pool with the task's label and `Cancel`, before the blocking work. Labels:
+/// `trace.mem`, `trace` (merge, tree, finish), `runs.mem`, `runs.candidates`, `runs.verify`, `runs.json`.
 #[cfg(any(test, feature = "test-util"))]
-pub type BlockingHook = Arc<dyn Fn(&Cancel) + Send + Sync>;
+pub type BlockingHook = Arc<dyn Fn(&str, &Cancel) + Send + Sync>;
 
 pub struct QueryEngine {
     pub(crate) meta: Arc<dyn Metastore>,
@@ -187,6 +193,7 @@ impl QueryCtx {
     /// `f` on the blocking pool under a fresh `Cancel` that dropping this future sets.
     pub(crate) async fn blocking<T: Send + 'static>(
         &self,
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))] label: &'static str,
         f: impl FnOnce(&Cancel) -> Result<T, QueryError> + Send + 'static,
     ) -> Result<T, QueryError> {
         let cancel = Cancel::new();
@@ -196,7 +203,7 @@ impl QueryCtx {
         tokio::task::spawn_blocking(move || {
             #[cfg(any(test, feature = "test-util"))]
             if let Some(h) = hook {
-                h(&cancel);
+                h(label, &cancel);
             }
             f(&cancel)
         })
@@ -291,4 +298,22 @@ pub(crate) fn reserve(
 
 pub(crate) fn ext<E: std::error::Error + Send + Sync + 'static>(e: E) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Our crates' errors keep their own kind (and message) across the DataFusion boundary.
+    #[test]
+    fn external_errors_keep_their_kind() {
+        let wrap = |e: BoxError| QueryError::from(DataFusionError::External(e));
+        let q = wrap(Box::new(forge_index::IndexError::Query("bad".into())));
+        assert!(matches!(q, QueryError::Index(_)), "{q:?}");
+        assert_eq!(q.kind(), ErrorKind::InvalidInput);
+        let q = wrap(Box::new(QueryError::NotFound("gone".into())));
+        assert!(matches!(q, QueryError::NotFound(_)), "{q:?}");
+        let df = DataFusionError::External(Box::new(forge_index::IndexError::Query("bad".into())));
+        assert_eq!(session::classify_datafusion(&df), ErrorKind::InvalidInput);
+    }
 }

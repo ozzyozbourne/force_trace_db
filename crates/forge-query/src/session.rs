@@ -60,7 +60,10 @@ pub(crate) fn classify_datafusion(e: &DataFusionError) -> ErrorKind {
         | DataFusionError::Plan(_)
         | DataFusionError::SchemaError(..)
         | DataFusionError::NotImplemented(_)
-        | DataFusionError::ResourcesExhausted(_) => ErrorKind::InvalidInput,
+        | DataFusionError::ResourcesExhausted(_)
+        // Runtime argument checks (e.g. `substr(x, 1, -1)`, `date_trunc('bogus', ..)`). Our own execs report
+        // internal conditions with `internal_err!` (Internal) and our errors travel as `External`.
+        | DataFusionError::Execution(_) => ErrorKind::InvalidInput,
         DataFusionError::ArrowError(a, _) => match a.as_ref() {
             A::CastError(_) | A::ParseError(_) | A::DivideByZero | A::InvalidArgumentError(_) | A::ComputeError(_) => {
                 ErrorKind::InvalidInput

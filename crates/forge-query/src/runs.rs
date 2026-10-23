@@ -9,10 +9,11 @@
 //! (M3's per-hour L1 bounds that).
 use crate::filters::KeyFilters;
 use crate::read::{ReadView, SegmentPart, coalesce, mem_versions, merge_or_filter, needs_merge, read_columns};
-use crate::{QueryCtx, QueryEngine, QueryError, QueryKind, reserve};
+use crate::{QueryCtx, QueryEngine, QueryError, QueryKind};
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use forge_meta::SegmentFilter;
 use forge_model::enums::{RunType, SpanStatus};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
@@ -257,18 +258,22 @@ fn span_filter(spans: &BTreeSet<SpanId>) -> Option<vortex::expr::Expression> {
 impl QueryEngine {
     pub async fn list_runs(&self, r: &RunsRequest) -> Result<RunsPage, QueryError> {
         let q = self.ctx(QueryKind::Fast, self.cfg.timeout);
-        q.run(self.list_runs_inner(&q, r)).await
+        q.run(async { Ok(self.list_runs_inner(&q, r).await?.0) }).await
     }
 
     /// `{"runs":[…],"next_cursor":hex|null}`; spans written like the trace path, plus `trace_id`, no children.
     pub async fn runs_json(&self, r: &RunsRequest) -> Result<Vec<u8>, QueryError> {
         let q = self.ctx(QueryKind::Fast, self.cfg.timeout);
         q.run(async {
-            let page = self.list_runs_inner(&q, r).await?;
+            let (page, res) = self.list_runs_inner(&q, r).await?;
             let cursor = page.next_cursor.map(|c| r.encode_cursor(&c));
-            q.blocking(move |cancel| {
-                let mut out = Vec::new();
+            q.blocking("runs.json", move |cancel| {
+                // The body: reserved up front at the page's size, then at its real capacity.
+                let held = res.size();
+                res.try_grow(page.rows.get_array_memory_size())?;
+                let mut out = Vec::with_capacity(page.rows.get_array_memory_size());
                 crate::json::write_runs(&mut out, &page.rows, cursor.as_deref(), cancel)?;
+                res.try_resize(held + out.capacity())?;
                 Ok(out)
             })
             .await
@@ -276,8 +281,14 @@ impl QueryEngine {
         .await
     }
 
-    async fn list_runs_inner(&self, q: &QueryCtx, r: &RunsRequest) -> Result<RunsPage, QueryError> {
+    /// The page, and the call's reservation (D15), which holds the page's rows.
+    async fn list_runs_inner(
+        &self,
+        q: &QueryCtx,
+        r: &RunsRequest,
+    ) -> Result<(RunsPage, MemoryReservation), QueryError> {
         let k = r.limit.max(1);
+        let mut res = MemoryConsumer::new("runs").register(&q.pool);
         let view = self.read_view(); // FIRST (invariant 1)
         let cols = read_columns(&RUN_COLUMNS);
         let schema = projected_schema(&cols);
@@ -303,10 +314,10 @@ impl QueryEngine {
         let mut cand: BTreeSet<Reverse<Pos>> = BTreeSet::new();
         let (snap, rr) = (view.mem().clone(), r.clone());
         let mem = q
-            .blocking(move |_| {
+            .blocking("runs.mem", move |cancel| {
                 let k = KeyFilters::project(&rr.project, None);
                 let mut v = Vec::new();
-                for b in mem_versions(&snap, &k, &projected_schema(&CANDIDATE_COLUMNS))? {
+                for b in mem_versions(&snap, &k, &projected_schema(&CANDIDATE_COLUMNS), cancel)? {
                     v.extend(candidates(&rr, hi, &b)?);
                 }
                 Ok(v)
@@ -316,8 +327,10 @@ impl QueryEngine {
         // Candidates from `unchecked` on (in `cand`'s order) are not verified yet; None: all are. Segments are
         // read in descending max_start, so every verified candidate starts above every unverified one.
         let mut unchecked = Some(Bound::Unbounded);
+        // The verified rows, trimmed to the top K after each wave (`overflow`: more than K were verified).
         let mut merged: Vec<RecordBatch> = Vec::new();
         let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
+        let mut overflow = false;
         let mut i = 0;
         loop {
             let frontier = segs.get(i).and_then(|s| s.max_start_ns);
@@ -326,13 +339,22 @@ impl QueryEngine {
                 let end = upper.map_or(Bound::Unbounded, Bound::Excluded);
                 let wave: Vec<Pos> = cand.range((lo, end)).map(|p| p.0).collect();
                 if !wave.is_empty() {
-                    let b = self.verify(q, &view, r, hi, &cols, &wave).await?;
+                    let (b, r2) = self.verify(q, &view, r, hi, &cols, &wave, res).await?;
+                    res = r2;
                     let ids = Ids::of(&b)?;
                     for row in 0..b.num_rows() {
                         let p = ids.pos(row).expect("verified rows have a start");
                         verified.insert(Reverse(p), (merged.len(), row));
                     }
                     merged.push(b);
+                    overflow |= verified.len() > k;
+                    if merged.len() > 1 || verified.len() > k {
+                        let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
+                        let top = interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?;
+                        verified = verified.into_keys().take(k).zip((0..).map(|j| (0, j))).collect();
+                        res.resize(top.get_array_memory_size());
+                        merged = vec![top];
+                    }
                 }
             }
             unchecked = upper.map(Bound::Included);
@@ -353,7 +375,7 @@ impl QueryEngine {
             let batches = view.scan(&parts, &CANDIDATE_COLUMNS, Some(roots_filter())).await?;
             let rr = r.clone();
             let found = q
-                .blocking(move |cancel| {
+                .blocking("runs.candidates", move |cancel| {
                     let mut v = Vec::new();
                     for b in &batches {
                         cancel.check()?;
@@ -365,7 +387,7 @@ impl QueryEngine {
             cand.extend(found.into_iter().map(Reverse));
         }
         let unverified = unchecked.is_some_and(|lo| cand.range((lo, Bound::Unbounded)).next().is_some());
-        let more = verified.len() > k || i < segs.len() || unverified;
+        let more = overflow || i < segs.len() || unverified;
         let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
         let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
         let rows = if idx.is_empty() {
@@ -373,11 +395,14 @@ impl QueryEngine {
         } else {
             interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?
         };
-        Ok(RunsPage { rows, next_cursor })
+        res.resize(rows.get_array_memory_size());
+        Ok((RunsPage { rows, next_cursor }, res))
     }
 
     /// Every version of the wave's keys (all `locate_traces` locations, range-scanned, + the memtable), merged;
-    /// the merged rows that pass EVERY filter.
+    /// the merged rows that pass EVERY filter. `res` (holding the rows kept so far) grows by the wave's input and
+    /// merged rows and ends at what was kept plus the returned rows.
+    #[allow(clippy::too_many_arguments)]
     async fn verify(
         &self,
         q: &QueryCtx,
@@ -386,7 +411,8 @@ impl QueryEngine {
         hi: Option<i64>,
         cols: &[&'static str],
         wave: &[Pos],
-    ) -> Result<RecordBatch, QueryError> {
+        res: MemoryReservation,
+    ) -> Result<(RecordBatch, MemoryReservation), QueryError> {
         let keys: BTreeSet<(TraceId, SpanId)> = wave.iter().map(|p| (p.1, p.2)).collect();
         let filter = span_filter(&keys.iter().map(|k| k.1).collect());
         let k = KeyFilters {
@@ -397,8 +423,8 @@ impl QueryEngine {
         let parts = coalesce(view.locate_versions(&k).await?, VERIFY_GAP);
         let scanned = view.scan(&parts, cols, filter).await?;
         let schema: SchemaRef = projected_schema(cols);
-        let (snap, pool, r) = (view.mem().clone(), q.pool.clone(), r.clone());
-        q.blocking(move |cancel| {
+        let (snap, r) = (view.mem().clone(), r.clone());
+        q.blocking("runs.verify", move |cancel| {
             let mut batches = Vec::new();
             for b in scanned {
                 batches.push(match k.key_mask(&b)? {
@@ -406,12 +432,15 @@ impl QueryEngine {
                     None => b,
                 });
             }
-            let mem = mem_versions(&snap, &k, &schema)?;
+            let mem = mem_versions(&snap, &k, &schema, cancel)?;
             let merge = needs_merge(&parts, !mem.is_empty());
             batches.extend(mem);
-            let reservation = reserve(&pool, "runs", &batches)?;
+            let kept = res.size();
+            res.try_grow(batches.iter().map(|b| b.get_array_memory_size()).sum())?;
             let m = merge_or_filter(&schema, &batches, merge, cancel)?;
-            drop((batches, reservation));
+            res.try_grow(m.get_array_memory_size())?;
+            drop(batches);
+            res.resize(kept + m.get_array_memory_size());
             let s = m.schema_ref();
             let par = m.column(s.index_of(col::PARENT_SPAN_ID)?);
             let project = m.column(s.index_of(col::PROJECT_ID)?).as_string::<i32>();
@@ -433,7 +462,11 @@ impl QueryEngine {
                     )
                 })
                 .collect();
-            Ok(filter_record_batch(&m, &mask)?)
+            let out = filter_record_batch(&m, &mask)?;
+            res.try_grow(out.get_array_memory_size())?;
+            drop(m);
+            res.resize(kept + out.get_array_memory_size());
+            Ok((out, res))
         })
         .await
     }

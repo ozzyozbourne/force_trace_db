@@ -5,7 +5,7 @@ use crate::session::QueryPermit;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DataFusionError, Result, exec_err, plan_err};
+use datafusion::common::{DataFusionError, Result, internal_err, plan_err};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PartitioningSatisfaction, PhysicalExpr};
@@ -133,7 +133,7 @@ impl ExecutionPlan for MergeVersionsExec {
         } else if partition == 0 {
             (0..self.input.output_partitioning().partition_count()).collect()
         } else {
-            return exec_err!("MergeVersionsExec has 1 output partition, got {partition}");
+            return internal_err!("MergeVersionsExec has 1 output partition, got {partition}");
         };
         let inputs = parts
             .into_iter()

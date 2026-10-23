@@ -139,8 +139,12 @@ impl<'a> SpanCols<'a> {
                     out.push(b']');
                 }
                 Col::Latency(start, end) => match (start, end) {
+                    // An i64 difference that overflows is written as null.
                     (Some(s), Some(e)) if s.is_valid(row) && e.is_valid(row) => {
-                        float(out, (e.value(row) - s.value(row)) as f64 / 1e6)
+                        match e.value(row).checked_sub(s.value(row)) {
+                            Some(d) => float(out, d as f64 / 1e6),
+                            None => out.extend_from_slice(b"null"),
+                        }
                     }
                     _ => out.extend_from_slice(b"null"),
                 },
@@ -270,4 +274,52 @@ pub fn write_runs(
     }
     out.push(b'}');
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_model::row::SpanRow;
+    use forge_model::schema::{project_to, projected_schema};
+    use forge_model::testing::batch_from_rows;
+
+    /// A latency whose i64 difference overflows is null, not a panic or a wrapped value.
+    #[test]
+    fn latency_overflow_is_null() {
+        let r = SpanRow {
+            project_id: Some(forge_model::testing::pid("p")),
+            start_time_ns: Some(-10),
+            end_time_ns: Some(i64::MAX),
+            ..Default::default()
+        };
+        let s = projected_schema(&[col::SPAN_ID, col::START_TIME, col::END_TIME]);
+        let b = project_to(&batch_from_rows(&[r]), &s).unwrap();
+        let mut out = Vec::new();
+        SpanCols::new(&b, false).write_span(&mut out, 0, false, false);
+        let v: serde_json::Value = serde_json::from_slice(&[b"{", &out[..], b"}"].concat()).unwrap();
+        assert_eq!(v["latency_ms"], serde_json::Value::Null, "{v}");
+    }
+
+    /// Both writers check `cancel` every 1k spans: over 1,500 spans the second check (span 1024) fails.
+    #[test]
+    fn writers_check_cancel() {
+        use forge_model::testing::{pid, sid, tid};
+        let rows: Vec<SpanRow> = (0..1500)
+            .map(|i| SpanRow {
+                project_id: Some(pid("p")),
+                trace_id: tid(1),
+                span_id: sid(i),
+                start_time_ns: Some(i as i64),
+                ..Default::default()
+            })
+            .collect();
+        let b = batch_from_rows(&rows);
+        let tree = TraceTree::build(&b, &Cancel::never()).unwrap();
+        for (k, ok) in [(1, false), (2, true)] {
+            let r = write_trace(&mut Vec::new(), "p", "t", &b, &tree, false, &Cancel::after(k));
+            assert_eq!(r.is_ok(), ok, "write_trace {r:?}");
+            let r = write_runs(&mut Vec::new(), &b, None, &Cancel::after(k));
+            assert_eq!(r.is_ok(), ok, "write_runs {r:?}");
+        }
+    }
 }

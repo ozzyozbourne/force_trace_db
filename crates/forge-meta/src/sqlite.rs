@@ -48,6 +48,43 @@ fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
 #[derive(Debug, Clone)]
 pub struct SqliteMetastore {
     conn: Arc<Mutex<Connection>>,
+    /// `open_read_only` of a read-only dir with an un-checkpointed WAL: the private copy, removed on drop.
+    _copy: Option<Arc<TempCopy>>,
+}
+
+/// A temp directory holding copies of a database and its WAL; removed when dropped.
+#[derive(Debug)]
+struct TempCopy(std::path::PathBuf);
+impl Drop for TempCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `dir` accepts new files (a probe file is created and removed): permission bits alone miss ownership, ACLs and
+/// read-only mounts.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".forge-probe-{}-{}", std::process::id(), probe_nonce()));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn probe_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// `path` + `suffix` (e.g. `meta.db-wal`).
+fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
 }
 
 const PROJECT_COLS: &str = "id, name, api_key_hash, retention_days, created_at_ms";
@@ -361,29 +398,45 @@ impl SqliteMetastore {
 
     /// Read-only (`forge sql --data-dir`): SQLITE_OPEN_READ_ONLY, busy_timeout only (no journal_mode, no
     /// migrations); the schema version must equal this binary's. Writes fail with SQLITE_READONLY (Internal).
-    /// SQLite creates `-wal` / `-shm` beside a WAL database on the first read; when the directory is not writable
-    /// (or that first read fails with CANTOPEN / READONLY) it reopens with `immutable=1`, which assumes nobody
-    /// writes the database: true when nothing can write the directory.
+    /// SQLite creates `-shm` beside a WAL database on the first read, so a directory that does not accept files
+    /// (a probe, or that first read failing with CANTOPEN / READONLY) needs another way in:
+    /// - a non-empty `-wal` (commits not yet checkpointed, e.g. after a crash): `meta.db` and the `-wal` are copied
+    ///   to a private temp dir and opened there, so SQLite replays the WAL (`immutable=1` would ignore it);
+    /// - otherwise `immutable=1`: the main file is the whole database and nothing can write the directory.
     pub fn open_read_only(path: &Path) -> MetaResult<Self> {
         let dir = path
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let ro_dir = std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly());
-        let c = match ro_dir {
-            true => read_only_conn(path, true)?,
-            false => match read_only_conn(path, false) {
+        if dir_writable(dir) {
+            match read_only_conn(path, false) {
                 Err(MetaError::Sqlite(rusqlite::Error::SqliteFailure(f, _)))
-                    if matches!(f.code, rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly) =>
-                {
-                    read_only_conn(path, true)?
-                }
-                r => r?,
-            },
-        };
-        Ok(Self {
+                    if matches!(f.code, rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly) => {}
+                r => return Ok(Self::read_only(r?, None)),
+            }
+        }
+        let wal = sibling(path, "-wal");
+        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+            let tmp = std::env::temp_dir().join(format!("forge-ro-{}-{}", std::process::id(), probe_nonce()));
+            let io = |source| MetaError::CreateDir {
+                path: tmp.clone(),
+                source,
+            };
+            std::fs::create_dir_all(&tmp).map_err(io)?;
+            let copy = Arc::new(TempCopy(tmp.clone()));
+            let db = tmp.join(path.file_name().unwrap_or("meta.db".as_ref()));
+            std::fs::copy(path, &db).map_err(io)?;
+            std::fs::copy(&wal, sibling(&db, "-wal")).map_err(io)?;
+            return Ok(Self::read_only(read_only_conn(&db, false)?, Some(copy)));
+        }
+        Ok(Self::read_only(read_only_conn(path, true)?, None))
+    }
+
+    fn read_only(c: Connection, copy: Option<Arc<TempCopy>>) -> Self {
+        Self {
             conn: Arc::new(Mutex::new(c)),
-        })
+            _copy: copy,
+        }
     }
 
     pub fn open_in_memory() -> MetaResult<Self> {
@@ -395,6 +448,7 @@ impl SqliteMetastore {
         migrations::migrate(&mut c)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(c)),
+            _copy: None,
         })
     }
 

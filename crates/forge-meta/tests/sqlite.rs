@@ -669,6 +669,48 @@ async fn read_only_dir_open() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A read-only dir whose `-wal` still holds a commit (flush 2, never checkpointed): the read-only open sees both
+/// flushes, like a writable dir does, and leaves the dir untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_dir_with_wal() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let w = db(d.path());
+    let t2 = TraceId([2; 16]);
+    w.commit_flush(flush(vec![seg("p", Level::L0, Some((1, 2)), 0, 3)], 1, 3))
+        .await
+        .unwrap();
+    w.pragma("wal_checkpoint(TRUNCATE)").unwrap();
+    w.commit_flush(flush(vec![seg("p", Level::L0, Some((3, 4)), 0, 6)], 2, 6))
+        .await
+        .unwrap();
+    // The writer stays open: flush 2 is only in meta.db-wal.
+    assert!(std::fs::metadata(d.path().join("meta.db-wal")).unwrap().len() > 0);
+    let (rw, ro) = (d.path().join("rw"), d.path().join("ro"));
+    for dir in [&rw, &ro] {
+        std::fs::create_dir(dir).unwrap();
+        for f in ["meta.db", "meta.db-wal"] {
+            std::fs::copy(d.path().join(f), dir.join(f)).unwrap();
+        }
+    }
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    for dir in [&rw, &ro] {
+        let cfg = MetastoreConfig {
+            url: format!("sqlite://{}", dir.join("meta.db").display()),
+        };
+        let r = open_read_only(&cfg).await.unwrap();
+        assert_eq!(
+            r.list_segments(&SegmentFilter::default()).await.unwrap().len(),
+            2,
+            "{dir:?}"
+        );
+        assert_eq!(r.locate_trace(&pid("p"), t2).await.unwrap().len(), 2, "{dir:?}");
+    }
+    assert_eq!(files(&ro), ["meta.db", "meta.db-wal"]);
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(w);
+}
+
 /// 1,200 traces over 3 flushes: the batched call equals `locate_trace` per id; missing ids are absent; deleted
 /// segments are excluded; other projects are invisible.
 #[tokio::test(flavor = "multi_thread")]

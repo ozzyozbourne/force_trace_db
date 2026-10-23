@@ -3,7 +3,7 @@ use crate::ext;
 use crate::read::{SegmentPart, scan_request};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -99,7 +99,7 @@ impl ExecutionPlan for SegmentScanExec {
     }
     fn execute(&self, partition: usize, _ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let Some(part) = self.parts.get(partition).cloned() else {
-            return exec_err!("SegmentScanExec has {} partitions, got {partition}", self.parts.len());
+            return internal_err!("SegmentScanExec has {} partitions, got {partition}", self.parts.len());
         };
         let req = scan_request(&part, &self.cols, self.filter.clone());
         let store = self.store.clone();

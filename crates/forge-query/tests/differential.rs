@@ -251,7 +251,7 @@ async fn check_traps(fx: &Fixture, reference: &[SpanRow], limit_one: bool) {
             q
         };
         let all = page_all(fx, req(&|_| {})).await;
-        for k in [t.p, t.p2, t.null_start] {
+        for k in [t.p, t.p2, t.p3, t.p4, t.null_start] {
             assert!(!listed(&all, k), "{k:?} must not be listed");
         }
         for k in &t.ties {
@@ -326,6 +326,7 @@ async fn check_fixture(seed: u64, full: bool) {
     let limit_one = full && seed <= 2;
     let (layout, traps) = random_layout(seed);
     let fx = Fixture::build(layout, traps, QueryConfig::default()).await;
+    fx.assert_runs_layout().await;
     let reference = fx.reference();
     for (p, t) in fx.traces() {
         check_trace(&fx, &reference, &p, t, full).await;

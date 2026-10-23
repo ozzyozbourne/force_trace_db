@@ -421,6 +421,9 @@ async fn invalid_statements_are_invalid_input() {
         "SET datafusion.execution.batch_size = 0",
         "SELEC 1",
         "SELECT nope FROM spans",
+        // Runtime argument errors (DataFusion `Execution`).
+        "SELECT substr(name, 1, -1) FROM spans",
+        "SELECT date_trunc('bogus', start_time) FROM spans",
     ] {
         let e = fx.engine.sql_batches(q).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{q}: {e}");
@@ -520,28 +523,39 @@ async fn deadlines_cover_planning_and_scans() {
     }
 }
 
-/// Dropping a trace_json future while its blocking work runs sets that work's cancel flag (the blocking hook
-/// holds the work until the flag is set).
+/// Dropping a trace_json / runs_json future while its final blocking task (merge + tree + JSON, or the runs JSON)
+/// runs sets that task's cancel flag. The labelled hook passes every other blocking task through and holds the
+/// final one until its flag is set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_trace_future_cancels() {
     let mut fx = Fixture::build(big_trace(300, 2, 50, 64, 3), Traps::default(), QueryConfig::default()).await;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cancel>();
-    fx.engine.blocking_hook = Some(Arc::new(move |c: &Cancel| {
-        tx.send(c.clone()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Cancel)>();
+    fx.engine.blocking_hook = Some(Arc::new(move |label: &str, c: &Cancel| {
+        if label != "trace" && label != "runs.json" {
+            return;
+        }
+        tx.send((label.to_string(), c.clone())).unwrap();
         let t = Instant::now();
         while !c.is_cancelled() && t.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(1));
         }
     }));
     let req = treq("big", tid(999), true, TraceFormat::Tree);
-    let mut fut = Box::pin(fx.engine.trace_json(&req));
-    let c = tokio::select! {
-        r = &mut fut => panic!("finished before the blocking phase: {:?}", r.map(|b| b.len())),
-        c = rx.recv() => c.unwrap(),
-    };
-    assert!(!c.is_cancelled());
-    drop(fut);
-    assert!(c.is_cancelled());
+    let runs = runs_request("big");
+    let futs: [std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, QueryError>> + Send + '_>>; 2] = [
+        Box::pin(fx.engine.trace_json(&req)),
+        Box::pin(fx.engine.runs_json(&runs)),
+    ];
+    for (want, mut fut) in ["trace", "runs.json"].into_iter().zip(futs) {
+        let (label, c) = tokio::select! {
+            r = &mut fut => panic!("{want}: finished before the blocking phase: {:?}", r.map(|b| b.len())),
+            c = rx.recv() => c.unwrap(),
+        };
+        assert_eq!(label, want);
+        assert!(!c.is_cancelled());
+        drop(fut);
+        assert!(c.is_cancelled(), "{want}");
+    }
 }
 
 /// Unknown and other-project traces are NotFound; runs of an unknown project are empty.
@@ -563,4 +577,144 @@ async fn not_found_and_empty() {
         .await
         .unwrap();
     assert_eq!((page.rows.num_rows(), page.next_cursor.is_none()), (0, true));
+}
+
+/// Project literals that are not valid ids match nothing on every path: even a memtable row holding such a
+/// project (no writer produces one today) is not returned, and the plan is empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_project_literal_matches_nothing() {
+    use arrow::array::{RecordBatch, StringArray};
+    use forge_model::schema::col_idx;
+    use forge_model::testing::{FixedMemtable, batch_from_rows, pid, sid};
+    let fx = Fixture::build(time_layout(), Traps::default(), QueryConfig::default()).await;
+    let row = SpanRow {
+        project_id: Some(pid("t")),
+        trace_id: tid(50),
+        span_id: sid(0),
+        name: Some("bad".into()),
+        version: 99,
+        ..Default::default()
+    };
+    let b = batch_from_rows(&[row]);
+    let mut cols = b.columns().to_vec();
+    cols[col_idx(col::PROJECT_ID)] = Arc::new(StringArray::from(vec![".bad"]));
+    let bad = RecordBatch::try_new(b.schema(), cols).unwrap();
+    let e = QueryEngine::new(
+        fx.meta.clone(),
+        fx.store.clone(),
+        Arc::new(FixedMemtable(vec![bad])),
+        QueryConfig::default(),
+    );
+    for (q, n) in [
+        ("SELECT name FROM spans WHERE project_id = '.bad'", 0),
+        ("SELECT name FROM spans WHERE project_id IN ('t', '.bad')", 6),
+    ] {
+        assert_eq!(sql(&e, q).await.num_rows(), n, "{q}");
+    }
+    let p = physical(&e, "SELECT * FROM spans WHERE project_id = '.bad'").await;
+    assert_eq!(nodes(&p, "EmptyExec"), 1);
+    assert_eq!(nodes(&p, "SegmentScanExec") + nodes(&p, "DataSourceExec"), 0);
+}
+
+/// D15 on the fast paths: one reservation covers the merge input, the merged rows and the JSON. A limit the input
+/// fits under (input + 1 KiB) but input + merged rows do not is a 400 "memory limit" for the trace and the runs
+/// list; the default limit (control) succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_path_memory_covers_merged_output() {
+    use forge_model::schema::{project_to, projected_schema};
+    use forge_model::testing::{FixedMemtable, batch_from_rows, pid, sid};
+    use forge_query::runs::RUN_COLUMNS;
+    // Memtable only: one batch of 300 spans of trace 7 (all roots), each a single version.
+    let rows: Vec<SpanRow> = (0..300)
+        .map(|s| SpanRow {
+            project_id: Some(pid("m")),
+            trace_id: tid(7),
+            span_id: sid(s),
+            name: Some(format!("span-{s}")),
+            start_time_ns: Some(BASE + s as i64),
+            inputs: Some(format!("{{\"x\":\"{}\"}}", "y".repeat(200))),
+            version: s + 1,
+            ..Default::default()
+        })
+        .collect();
+    let b = batch_from_rows(&rows);
+    let input = |cols: &[&'static str]| project_to(&b, &projected_schema(cols)).unwrap().get_array_memory_size();
+    let fx = Fixture::build(Layout::default(), Traps::default(), QueryConfig::default()).await;
+    let engine = |limit: Option<u64>| {
+        let mut cfg = QueryConfig::default();
+        if let Some(l) = limit {
+            cfg.memory_limit = bytesize::ByteSize::b(l);
+        }
+        QueryEngine::new(
+            fx.meta.clone(),
+            fx.store.clone(),
+            Arc::new(FixedMemtable(vec![b.clone()])),
+            cfg,
+        )
+    };
+    let trace = treq("m", tid(7), true, TraceFormat::Tree);
+    let runs = RunsRequest {
+        limit: 300,
+        ..runs_request("m")
+    };
+    let tight = engine(Some(input(&trace_cols(true)) as u64 + 1024));
+    for e in [
+        tight.trace_json(&trace).await.err(),
+        tight.load_trace(&trace).await.err(),
+    ] {
+        let e = e.expect("trace over the limit");
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+        assert!(e.message().contains("memory limit"), "{}", e.message());
+    }
+    let tight = engine(Some(input(&RUN_COLUMNS) as u64 + 1024));
+    for e in [tight.runs_json(&runs).await.err(), tight.list_runs(&runs).await.err()] {
+        let e = e.expect("runs over the limit");
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+        assert!(e.message().contains("memory limit"), "{}", e.message());
+    }
+    let ok = engine(None);
+    assert!(ok.trace_json(&trace).await.unwrap().len() > 60_000);
+    assert_eq!(ok.list_runs(&runs).await.unwrap().rows.num_rows(), 300);
+}
+
+/// `max_response_bytes` with large rows (~4 KB of `inputs` each): the body passes the cap by at most one row
+/// (plus the envelope tail), not by a whole slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_body_cap_overshoot_is_one_row() {
+    use forge_model::testing::{FixedMemtable, batch_from_rows, pid, sid};
+    use forge_query::sql::SqlRequest;
+    let row = 4_000;
+    let rows: Vec<SpanRow> = (0..200)
+        .map(|s| SpanRow {
+            project_id: Some(pid("m")),
+            trace_id: tid(1),
+            span_id: sid(s),
+            inputs: Some(format!("{{\"x\":\"{}\"}}", "y".repeat(row))),
+            version: s + 1,
+            ..Default::default()
+        })
+        .collect();
+    let fx = Fixture::build(Layout::default(), Traps::default(), QueryConfig::default()).await;
+    let cap = 16 << 10;
+    let cfg = QueryConfig {
+        max_response_bytes: bytesize::ByteSize::b(cap as u64),
+        ..QueryConfig::default()
+    };
+    let mem = Arc::new(FixedMemtable(vec![batch_from_rows(&rows)]));
+    let e = QueryEngine::new(fx.meta.clone(), fx.store.clone(), mem, cfg);
+    let r = SqlRequest {
+        query: "SELECT inputs FROM spans".into(),
+        max_rows: None,
+        timeout_ms: None,
+    };
+    let body = e.sql_json(&r).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["truncated"], true);
+    let n = v["row_count"].as_u64().unwrap();
+    assert!(n > 0 && n < 64, "{n} rows");
+    assert!(
+        body.len() < cap + (row + 100) + 200,
+        "{} bytes for a {cap} B cap",
+        body.len()
+    );
 }

@@ -25,7 +25,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::{col, not};
 use forge_meta::{Metastore, SegmentFilter};
 use forge_model::MemtableView;
-use forge_model::ids::{ProjectId, TraceId};
+use forge_model::ids::TraceId;
 use forge_model::schema::{ALL_COLUMNS, col as c, projected_schema, spans_schema};
 use forge_storage::{RowSelection, SegmentStore};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,9 +51,8 @@ async fn plan_segments(view: &ReadView, k: &KeyFilters) -> Result<BTreeMap<Strin
     let filters: Vec<SegmentFilter> = match &k.projects {
         Some(ps) => ps
             .iter()
-            .filter_map(|p| ProjectId::new(p.as_str()).ok())
             .map(|p| SegmentFilter {
-                project_id: Some(p),
+                project_id: Some(p.clone()),
                 ..Default::default()
             })
             .collect(),
@@ -133,7 +132,7 @@ impl TableProvider for SpansTableProvider {
                 groups.entry(p).or_default().0 = parts;
             }
             // Memtable rows: key filters only, split by project.
-            for b in view.mem_versions(&k, &read_schema)? {
+            for b in view.mem_versions(&k, &read_schema).map_err(ext)? {
                 for (p, part) in split_rows_by_project(&b)? {
                     groups.entry(p).or_default().1.push(part);
                 }

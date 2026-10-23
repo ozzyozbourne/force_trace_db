@@ -19,6 +19,11 @@ pub struct TraceTree {
 }
 
 impl TraceTree {
+    /// Heap bytes held by the tree (memory accounting).
+    pub fn memory_size(&self) -> usize {
+        self.preorder.capacity() * 8 + self.orphan.capacity() + self.cycle.capacity()
+    }
+
     /// `rows`: the merged rows of ONE trace (one row per span), with span_id, parent_span_id and start_time.
     ///
     /// 1. null parent = true root; parent == self = extra root (cycle); parent present = child; parent missing =
