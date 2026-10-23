@@ -31,7 +31,6 @@ pub struct AppendLog {
     blocks: Vec<Arc<Block>>,
     /// Filled slots of the last block.
     tail_len: usize,
-    batches: usize,
     rows: usize,
 }
 
@@ -54,16 +53,9 @@ impl AppendLog {
             .set(b)
             .unwrap_or_else(|_| unreachable!("slot written twice"));
         self.tail_len += 1;
-        self.batches += 1;
     }
     pub fn is_empty(&self) -> bool {
-        self.batches == 0
-    }
-    pub fn num_batches(&self) -> usize {
-        self.batches
-    }
-    pub fn num_rows(&self) -> usize {
-        self.rows
+        self.blocks.is_empty()
     }
     /// The batches pushed so far. Later pushes are not visible through it.
     pub fn view(&self) -> LogView {
@@ -112,6 +104,16 @@ pub struct MemtablePart {
     pub frozen: bool,
     /// spans_schema batches, unsorted, may hold several versions per key. Never empty in a snapshot.
     pub batches: LogView,
+}
+
+impl MemtablePart {
+    /// The part for `log`, or None when it is empty (a snapshot never holds an empty part).
+    pub fn of(log: &AppendLog, frozen: bool) -> Option<Self> {
+        (!log.is_empty()).then(|| Self {
+            frozen,
+            batches: log.view(),
+        })
+    }
 }
 
 /// The memtables at one instant, oldest first (frozen, then active). M4 adds seq / version ranges together with

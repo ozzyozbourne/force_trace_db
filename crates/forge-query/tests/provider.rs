@@ -11,10 +11,10 @@ use forge_model::error::{Classify, ErrorKind};
 use forge_model::merge::Cancel;
 use forge_model::row::SpanRow;
 use forge_model::schema::{ALL_COLUMNS, KEY_COLUMNS, PAYLOAD_COLUMNS, col};
-use forge_model::testing::{pid, tid};
+use forge_model::testing::tid;
 use forge_query::runs::RunsRequest;
 use forge_query::testing::{HookedMetastore, RecordingSegmentStore};
-use forge_query::trace::{TraceFormat, TraceRequest};
+use forge_query::trace::TraceFormat;
 use forge_query::{QueryEngine, QueryError};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -251,27 +251,22 @@ async fn time_pruning_and_lossy_cast() {
         let b = sql(&fx.engine, &format!("EXPLAIN {q}")).await;
         arrow::util::pretty::pretty_format_batches(&[b]).unwrap().to_string()
     };
-    let from = T_BASE + 100_000_000_000;
+    let from = BASE + 100_000_000_000;
     let q = format!("SELECT name FROM spans WHERE start_time >= {}", ns(from));
-    assert!(
-        explain(q.clone()).await.contains("segments=2"),
-        "{}",
-        explain(q.clone()).await
-    );
+    let e = explain(q.clone()).await;
+    assert!(e.contains("segments=2"), "{e}");
     assert_eq!(sql(&fx.engine, &q).await.num_rows(), 4);
     let q = format!("SELECT name FROM spans WHERE start_time = {}", ns(from + 500_000_000));
-    assert!(
-        explain(q.clone()).await.contains("segments=1"),
-        "{}",
-        explain(q.clone()).await
-    );
+    let e = explain(q.clone()).await;
+    assert!(e.contains("segments=1"), "{e}");
     assert_eq!(sql(&fx.engine, &q).await.num_rows(), 2);
     let secs = from / 1_000_000_000;
     let q = format!("SELECT name FROM spans WHERE CAST(start_time AS TIMESTAMP(0)) = to_timestamp_seconds({secs})");
     let b = sql(&fx.engine, &q).await;
     let names: Vec<&str> = b.column(0).as_string::<i32>().iter().map(|x| x.unwrap()).collect();
     assert_eq!(names, ["t1", "t1"], "{q}");
-    assert!(explain(q.clone()).await.contains("segments=3"), "{}", explain(q).await);
+    let e = explain(q).await;
+    assert!(e.contains("segments=3"), "{e}");
 }
 
 /// List-style queries never read payload columns; `SELECT inputs` does (the control).
@@ -307,15 +302,6 @@ async fn explain_has_no_payload_columns() {
     assert!(cols.iter().any(|c| c == col::INPUTS), "control: {cols:?}");
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Key {
-    None,
-    Project(usize),
-    Projects,
-    Traces,
-    ProjectTraces(usize),
-}
-
 /// Plan §6.4 query grammar: key sets × time range × one non-key predicate × projection × optional ORDER BY/LIMIT.
 #[test]
 fn query_grammar_matches_reference() {
@@ -337,36 +323,28 @@ fn query_grammar_matches_reference() {
         any::<u32>(),
         any::<bool>(),
         1usize..20,
-        prop_oneof![Just(1usize), Just(2), Just(4), Just(8)],
     );
     runner
-        .run(&strategy, |(key, pi, time, nonkey, mask, order, limit, _tp)| {
+        .run(&strategy, |(key, pi, time, nonkey, mask, order, limit)| {
             let projects = ["a", "b", "e"];
-            let key = match key {
-                0 => Key::None,
-                1 => Key::Project(pi),
-                2 => Key::Projects,
-                3 => Key::Traces,
-                _ => Key::ProjectTraces(pi),
-            };
             let tr = |n: u64| hex_lit(tid(n).as_bytes());
             let (key_sql, key_pred): (String, Box<dyn Fn(&SpanRow) -> bool>) = match key {
-                Key::None => ("true".into(), Box::new(|_| true)),
-                Key::Project(i) => (
-                    format!("project_id = '{}'", projects[i]),
-                    Box::new(move |r| p_is(r, projects[i])),
+                0 => ("true".into(), Box::new(|_| true)),
+                1 => (
+                    format!("project_id = '{}'", projects[pi]),
+                    Box::new(move |r| p_is(r, projects[pi])),
                 ),
-                Key::Projects => (
+                2 => (
                     "project_id IN ('a', 'e')".into(),
                     Box::new(|r| p_is(r, "a") || p_is(r, "e")),
                 ),
-                Key::Traces => (
+                3 => (
                     format!("trace_id IN ({}, {}, {}, {})", tr(0), tr(1), tr(2), tr(9)),
                     Box::new(|r| [0, 1, 2, 9].iter().any(|&n| r.trace_id == tid(n))),
                 ),
-                Key::ProjectTraces(i) => (
-                    format!("project_id = '{}' AND trace_id IN ({}, {})", projects[i], tr(1), tr(3)),
-                    Box::new(move |r| p_is(r, projects[i]) && (r.trace_id == tid(1) || r.trace_id == tid(3))),
+                _ => (
+                    format!("project_id = '{}' AND trace_id IN ({}, {})", projects[pi], tr(1), tr(3)),
+                    Box::new(move |r| p_is(r, projects[pi]) && (r.trace_id == tid(1) || r.trace_id == tid(3))),
                 ),
             };
             let (lo, hi) = (BASE + 5 * STEP, BASE + 25 * STEP);
@@ -515,12 +493,7 @@ async fn deadlines_cover_planning_and_scans() {
             timeout_cfg(200),
         ),
     ];
-    let trace = TraceRequest {
-        project: pid("a"),
-        trace: tid(1),
-        payloads: true,
-        format: TraceFormat::Tree,
-    };
+    let trace = treq("a", tid(1), true, TraceFormat::Tree);
     let runs = runs_request("a");
     for (i, e) in engines.iter().chain([&fx.engine]).enumerate() {
         let control = i == 2;
@@ -560,12 +533,7 @@ async fn dropped_trace_future_cancels() {
             std::thread::sleep(Duration::from_millis(1));
         }
     }));
-    let req = TraceRequest {
-        project: pid("big"),
-        trace: tid(999),
-        payloads: true,
-        format: TraceFormat::Tree,
-    };
+    let req = treq("big", tid(999), true, TraceFormat::Tree);
     let mut fut = Box::pin(fx.engine.trace_json(&req));
     let c = tokio::select! {
         r = &mut fut => panic!("finished before the blocking phase: {:?}", r.map(|b| b.len())),
@@ -580,12 +548,7 @@ async fn dropped_trace_future_cancels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_found_and_empty() {
     let fx = Fixture::build(time_layout(), Traps::default(), QueryConfig::default()).await;
-    let req = |p: &str, t: u64| TraceRequest {
-        project: pid(p),
-        trace: tid(t),
-        payloads: true,
-        format: TraceFormat::Flat,
-    };
+    let req = |p: &str, t: u64| treq(p, tid(t), true, TraceFormat::Flat);
     assert!(fx.engine.trace_json(&req("t", 0)).await.is_ok());
     for (p, t) in [("t", 9), ("u", 0)] {
         let e = fx.engine.trace_json(&req(p, t)).await.unwrap_err();

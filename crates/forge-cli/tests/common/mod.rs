@@ -5,7 +5,7 @@
 use forge_ingest::normalize::{NormalizeConfig, PROJECT_HEADER, normalize_request};
 use forge_meta::{Metastore, SegmentFilter, SqliteMetastore};
 use forge_model::catalog::SegmentMeta;
-use forge_model::config::StorageConfig;
+use forge_model::config::{DATA_DIR, META_DB, StorageConfig, WAL_DIR};
 use forge_model::ids::{ProjectId, TraceId};
 use forge_model::merge::{Tombstones, merge_versions};
 use forge_model::row::SpanRow;
@@ -23,6 +23,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// The `forge` binary with every inherited `FORGE_*` variable removed, so the caller's env never leaks in.
+/// `forge args…`, run to completion.
+pub fn forge_output(args: &[&str]) -> std::process::Output {
+    forge_cmd().args(args).output().expect("run forge")
+}
+
+/// `n` of a successful `forge sql --format json "SELECT count(*) AS n …"`.
+pub fn sql_count(o: &std::process::Output) -> u64 {
+    assert!(o.status.success(), "{o:?}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("json envelope");
+    v["rows"][0]["n"].as_u64().expect("n")
+}
+
+/// Env for `spawn_ready`: no timer flush during the test.
+pub const NO_TIMER_FLUSH: [(&str, &str); 1] = [("FORGE_MEMTABLE__FLUSH_INTERVAL", "1h")];
+
 pub fn forge_cmd() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
     for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("FORGE_")) {
@@ -264,13 +279,13 @@ pub fn write_config(dir: &Path, grace: &str) -> PathBuf {
     let d = dir.display();
     let s = format!(
         r#"[storage]
-url = "file://{d}/data"
+url = "file://{d}/{DATA_DIR}"
 
 [metastore]
-url = "sqlite://{d}/meta.db"
+url = "sqlite://{d}/{META_DB}"
 
 [wal]
-dir = "{d}/wal"
+dir = "{d}/{WAL_DIR}"
 
 [cache]
 disk_dir = "{d}/cache"
@@ -314,7 +329,7 @@ pub fn log_field(logs: &str, message: &str, key: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------------------------------------------
 
 pub fn segment_store(dir: &Path) -> VortexSegmentStore {
-    let url = format!("file://{}", dir.join("data").display());
+    let url = format!("file://{}", dir.join(DATA_DIR).display());
     VortexSegmentStore::new(build_object_store(&StorageConfig { url }).expect("object store"))
 }
 
@@ -339,7 +354,7 @@ async fn scan(store: &VortexSegmentStore, seg: &SegmentMeta, rows: RowSelection)
 /// - T: for every (project, trace) present, `locate_trace` returns ranges that each scan to rows of exactly that
 ///   trace, and together cover all of that trace's rows in all segments.
 pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
-    let meta = SqliteMetastore::open_path(&dir.join("meta.db")).expect("open meta.db");
+    let meta = SqliteMetastore::open_path(&dir.join(META_DB)).expect("open meta.db");
     let store = segment_store(dir);
     let segs = meta
         .list_segments(&SegmentFilter::default())
@@ -349,7 +364,7 @@ pub async fn visible(dir: &Path) -> (Vec<SegmentMeta>, Vec<SpanRow>) {
     let mut by_seg: HashMap<String, Vec<SpanRow>> = HashMap::new();
     let mut per_trace: BTreeMap<(String, TraceId), u64> = BTreeMap::new();
     for s in &segs {
-        let len = std::fs::metadata(dir.join("data").join(&s.path))
+        let len = std::fs::metadata(dir.join(DATA_DIR).join(&s.path))
             .unwrap_or_else(|e| panic!("E: segment object {} missing: {e}", s.path))
             .len();
         assert_eq!(len, s.byte_size, "E: {} size", s.path);
@@ -439,7 +454,7 @@ pub async fn inspect(dir: &Path, seg: &SegmentMeta) -> String {
         layout: false,
         verify: true,
     };
-    inspect_segment(&dir.join("data").join(&seg.path), &opts)
+    inspect_segment(&dir.join(DATA_DIR).join(&seg.path), &opts)
         .await
         .expect("inspect")
 }

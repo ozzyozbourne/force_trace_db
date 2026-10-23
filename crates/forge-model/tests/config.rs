@@ -22,6 +22,12 @@ fn empty_jail_is_default() {
         assert_eq!(c, ForgeConfig::default());
         assert_eq!(c.storage.url, "file://./forge-data/data");
         assert_eq!(c.metastore.url, "sqlite://./forge-data/meta.db");
+        assert_eq!(c.wal.dir, Path::new("./forge-data/wal"));
+        assert_eq!(
+            c,
+            ForgeConfig::rooted_at(Path::new("./forge-data")),
+            "the default layout"
+        );
         assert_eq!(c.server.shutdown_grace, Duration::from_secs(10));
         Ok(())
     });

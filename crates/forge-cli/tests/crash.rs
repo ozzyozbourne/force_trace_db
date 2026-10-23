@@ -459,20 +459,16 @@ async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
 /// posts included.
 async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
     let n = verify(dir, ledger, orphans, ctx).await;
-    let o = common::forge_cmd()
-        .args([
-            "sql",
-            "--data-dir",
-            dir.to_str().unwrap(),
-            "--format",
-            "json",
-            "SELECT count(*) AS n FROM spans",
-        ])
-        .output()
-        .expect("forge sql");
+    let o = common::forge_output(&[
+        "sql",
+        "--data-dir",
+        dir.to_str().unwrap(),
+        "--format",
+        "json",
+        "SELECT count(*) AS n FROM spans",
+    ]);
     assert!(o.status.success(), "{ctx}: {o:?}");
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("json");
-    assert_eq!(v["rows"][0]["n"].as_u64(), Some(n as u64), "{ctx}: forge sql count");
+    assert_eq!(common::sql_count(&o), n as u64, "{ctx}: forge sql count");
 }
 
 async fn timed<T>(f: impl Future<Output = T>) -> T {

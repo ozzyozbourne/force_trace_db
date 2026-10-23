@@ -18,9 +18,7 @@ async fn forge() -> Arc<Forge> {
 }
 
 async fn call(r: &Router, req: Request<Body>) -> (StatusCode, Value) {
-    let resp = r.clone().oneshot(req).await.unwrap();
-    let st = resp.status();
-    let b = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let (st, _, b) = body(r, req).await;
     (
         st,
         serde_json::from_slice(&b).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&b).into())),
@@ -28,7 +26,7 @@ async fn call(r: &Router, req: Request<Body>) -> (StatusCode, Value) {
 }
 
 fn get(uri: &str) -> Request<Body> {
-    Request::get(uri).body(Body::empty()).unwrap()
+    get_h(uri, &[])
 }
 
 fn post(uri: &str, body: Value) -> Request<Body> {

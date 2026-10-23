@@ -51,7 +51,7 @@ pub const MERGE_COLUMNS: [&str; 5] = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_
 pub struct Cancel(Option<Arc<CancelState>>);
 
 #[derive(Debug)]
-pub struct CancelState {
+struct CancelState {
     cancelled: AtomicBool,
     checks: AtomicU64,
     /// `check()` fails from this call on (test-util `after`); u64::MAX otherwise.
@@ -127,9 +127,7 @@ const ASC_NULLS_LAST: SortOptions = SortOptions {
 /// `merge_versions_chunked` as ONE batch: for bounded inputs (tests, queries over small ranges). A column whose
 /// merged values exceed 2 GiB fails with an offset overflow; the flush uses the chunked form.
 pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result<RecordBatch> {
-    Ok(merge_versions_chunked(batches, tombstones, usize::MAX)?
-        .pop()
-        .unwrap_or_else(|| RecordBatch::new_empty(spans_schema())))
+    merge_projected(&spans_schema(), batches, tombstones, &Cancel::never())
 }
 
 /// The merged rows in physical order, as consecutive batches. A batch ends before the variable-length bytes of
@@ -398,7 +396,9 @@ pub fn split_by_project(b: &RecordBatch) -> Result<Vec<(ProjectId, RecordBatch)>
 mod tests {
     use super::*;
     use crate::row::SpanRow;
-    use crate::testing::{Rng, batch_from_rows, physical_key, random_row, reference_merge, rows_from_batch};
+    use crate::testing::{
+        Rng, batch_from_rows, physical_key, random_row, reference_merge, rows_from_batch, sort_by_key,
+    };
     use proptest::prelude::*;
 
     fn row(project: &str, span: u64, version: u64) -> SpanRow {
@@ -584,8 +584,7 @@ mod tests {
     }
 
     fn proj(b: &RecordBatch, schema: &SchemaRef) -> RecordBatch {
-        let idx: Vec<usize> = schema.fields().iter().map(|f| col_idx(f.name())).collect();
-        b.project(&idx).unwrap()
+        crate::schema::project_to(b, schema).unwrap()
     }
 
     #[test]
@@ -662,18 +661,10 @@ mod tests {
             let got = merge_versions_projected(&schema, &pin, t, max, &Cancel::never()).unwrap();
             let got = arrow::compute::concat_batches(&schema, &got).unwrap();
             let want = proj(&merge_versions(&chunked(&rows, chunk), t).unwrap(), &schema);
-            let sort = |b: &RecordBatch| -> RecordBatch {
-                let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID].iter().map(|c| b.column(b.schema().index_of(c).unwrap()).clone()).collect();
-                let conv = RowConverter::new(cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()).unwrap();
-                let r = conv.convert_columns(&cols).unwrap();
-                let mut idx: Vec<u32> = (0..b.num_rows() as u32).collect();
-                idx.sort_by(|&x, &y| r.row(x as usize).cmp(&r.row(y as usize)));
-                take_record_batch(b, &UInt32Array::from(idx)).unwrap()
-            };
             if names.contains(&col::DOTTED_ORDER) {
                 prop_assert_eq!(got, want);
             } else {
-                prop_assert_eq!(sort(&got), sort(&want));
+                prop_assert_eq!(sort_by_key(&got), sort_by_key(&want));
             }
         }
         #[test]

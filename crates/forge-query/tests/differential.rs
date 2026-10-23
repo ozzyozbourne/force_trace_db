@@ -13,17 +13,10 @@ use forge_model::row::SpanRow;
 use forge_model::schema::{PAYLOAD_COLUMNS, col};
 use forge_model::testing::{RefNode, Rng, pid, ref_tree, sid, tid};
 use forge_query::QueryError;
-use forge_query::runs::{Cursor, RUN_COLUMNS, RunsParams, RunsRequest};
-use forge_query::trace::{TraceFormat, TraceRequest};
+use forge_query::runs::{Cursor, Pos, RUN_COLUMNS, RunsParams, RunsRequest};
+use forge_query::trace::TraceFormat;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-
-type Pos = (i64, TraceId, SpanId);
-
-fn span_at(b: &RecordBatch, row: usize) -> SpanId {
-    let c = b.column(b.schema().index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
-    SpanId::from_slice(c.value(row)).unwrap()
-}
 
 fn positions(b: &RecordBatch) -> Vec<Pos> {
     let s = b.schema();
@@ -53,15 +46,6 @@ fn no_payload_or_dotted(projections: &[Vec<&str>], what: &str) {
     }
 }
 
-fn treq(project: &str, trace: TraceId, payloads: bool, format: TraceFormat) -> TraceRequest {
-    TraceRequest {
-        project: pid(project),
-        trace,
-        payloads,
-        format,
-    }
-}
-
 /// One (project, trace): load_trace == SQL == reference (with and without payloads), the tree == ref_tree, the
 /// JSON == the independently built value (tree and flat, with and without payloads).
 async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: TraceId) {
@@ -75,6 +59,7 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
         assert!(matches!(e, Err(QueryError::NotFound(_))), "{ctx}: {:?}", e.err());
         return;
     }
+    let tree = ref_tree(&rows);
     for payloads in [true, false] {
         fx.store.take_projections();
         let lt = fx
@@ -83,15 +68,13 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
             .await
             .unwrap();
         let proj = fx.store.take_projections();
-        assert!(
-            proj.iter().all(|p| !p.contains(&col::DOTTED_ORDER)),
-            "{ctx}: dotted_order read"
-        );
-        if !payloads {
+        if payloads {
             assert!(
-                proj.iter().all(|p| PAYLOAD_COLUMNS.iter().all(|c| !p.contains(c))),
-                "{ctx}: payload read"
+                proj.iter().all(|p| !p.contains(&col::DOTTED_ORDER)),
+                "{ctx}: dotted_order read"
             );
+        } else if !proj.is_empty() {
+            no_payload_or_dotted(&proj, &ctx);
         }
         let cols = trace_cols(payloads);
         assert_eq!(names_of(&lt.rows), cols, "{ctx}");
@@ -112,7 +95,7 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
                 want.columns(),
                 "{ctx}: SQL"
             );
-            let tree = ref_tree(&rows);
+            let ids = keys_of(&lt.rows);
             let got: Vec<RefNode> = lt
                 .tree
                 .preorder
@@ -120,7 +103,7 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
                 .map(|&(row, depth)| {
                     let r = row as usize;
                     RefNode {
-                        span: span_at(&lt.rows, r),
+                        span: ids[r].1,
                         depth,
                         orphan: lt.tree.orphan[r],
                         cycle: lt.tree.cycle[r],
@@ -142,7 +125,6 @@ async fn check_trace(fx: &Fixture, reference: &[SpanRow], project: &str, trace: 
                 );
             }
         }
-        let tree = ref_tree(&rows);
         let refs: Vec<&SpanRow> = rows.iter().collect();
         for format in [TraceFormat::Tree, TraceFormat::Flat] {
             let body = fx
@@ -228,19 +210,12 @@ async fn check_runs(fx: &Fixture, reference: &[SpanRow], seed: u64, limit_one: b
             let want = ref_runs(reference, &req);
             for &limit in limits {
                 fx.store.take_projections();
-                let got = page_all(
-                    fx,
-                    RunsRequest {
-                        limit,
-                        ..clone_req(&req)
-                    },
-                )
-                .await;
+                let got = page_all(fx, RunsRequest { limit, ..req.clone() }).await;
                 let proj = fx.store.take_projections();
                 if !proj.is_empty() {
                     no_payload_or_dotted(&proj, "list_runs");
                 }
-                assert_eq!(got, want, "seed {seed} {project} limit {limit} {:?}", debug_req(&req));
+                assert_eq!(got, want, "seed {seed} {project} limit {limit} {req:?}");
             }
         }
         // Row contents of one full page == the reference rows.
@@ -257,26 +232,6 @@ async fn check_runs(fx: &Fixture, reference: &[SpanRow], seed: u64, limit_one: b
             "{project}: rows"
         );
     }
-}
-
-fn clone_req(r: &RunsRequest) -> RunsRequest {
-    RunsRequest {
-        project: r.project.clone(),
-        start_ns: r.start_ns,
-        end_ns: r.end_ns,
-        run_types: r.run_types.clone(),
-        statuses: r.statuses.clone(),
-        q: r.q.clone(),
-        limit: r.limit,
-        cursor: r.cursor.as_ref().map(|c| Cursor(c.0)),
-    }
-}
-
-fn debug_req(r: &RunsRequest) -> String {
-    format!(
-        "start={:?} end={:?} rt={:?} st={:?} q={:?}",
-        r.start_ns, r.end_ns, r.run_types, r.statuses, r.q
-    )
 }
 
 /// The forced traps (plan §6.4 "explicit traps") at limit 50, and at limit 1 (+ exact tie order at 1, 2, 3) when
@@ -360,7 +315,7 @@ async fn check_cursor(fx: &Fixture, reference: &[SpanRow]) {
     }
     let mut q = runs_request("a");
     q.cursor = Some(Cursor((i64::MAX, TraceId([0xff; 16]), SpanId([0xff; 8]))));
-    assert_eq!(page_all(fx, clone_req(&q)).await, ref_runs(reference, &q));
+    assert_eq!(page_all(fx, q.clone()).await, ref_runs(reference, &q));
 }
 
 async fn check_fixture(seed: u64, limit_one: bool) {

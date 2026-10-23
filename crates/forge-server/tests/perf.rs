@@ -6,15 +6,15 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use forge_ingest::Ingest;
-use forge_meta::{FlushCommit, Metastore, NewSegment};
-use forge_model::catalog::{HourBucket, Level, SegmentId};
-use forge_model::config::ForgeConfig;
+use forge_meta::Metastore;
+use forge_model::catalog::HourBucket;
+use forge_model::config::{DATA_DIR, ForgeConfig, META_DB};
 use forge_model::enums::{RunType, SpanStatus};
-use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
 use forge_model::row::SpanRow;
 use forge_model::testing::{Rng, batch_from_rows, pid, sid, tid};
+use forge_query::testing::write_flush;
 use forge_server::{Forge, api_router};
-use forge_storage::{SegmentSpec, SegmentStore, VortexSegmentStore, build_object_store};
+use forge_storage::{SegmentStore, VortexSegmentStore, build_object_store};
 use futures::StreamExt;
 use http::Request;
 use std::time::{Duration, Instant};
@@ -90,7 +90,8 @@ fn posts(trace: u64, kind: u8, payload: usize) -> Vec<SpanRow> {
     out
 }
 
-async fn write_flush(meta: &dyn Metastore, store: &dyn SegmentStore, rows: Vec<SpanRow>, seq: u64, max_version: u64) {
+/// One flush of `rows`, versions restamped to end below `max_version`.
+async fn flush(meta: &dyn Metastore, store: &dyn SegmentStore, rows: Vec<SpanRow>, seq: u64, max_version: u64) {
     let rows: Vec<SpanRow> = rows
         .into_iter()
         .enumerate()
@@ -99,32 +100,8 @@ async fn write_flush(meta: &dyn Metastore, store: &dyn SegmentStore, rows: Vec<S
             ..r
         })
         .collect();
-    let merged = merge_versions_chunked(&[batch_from_rows(&rows)], Tombstones::Keep, 64 << 20).unwrap();
-    let mut segments = Vec::new();
-    for (p, batches) in split_chunks_by_project(&merged).unwrap() {
-        let spec = SegmentSpec {
-            id: SegmentId::new(),
-            project_id: p,
-            level: Level::L0,
-            partition_hour: HourBucket::from_nanos(BASE),
-        };
-        let w = store
-            .write_segment(spec, futures::stream::iter(batches.into_iter().map(Ok)).boxed())
-            .await
-            .unwrap();
-        segments.push(NewSegment {
-            meta: w.meta,
-            traces: w.traces,
-        });
-    }
-    meta.commit_flush(FlushCommit {
-        node_id: "perf".into(),
-        segments,
-        flushed_wal_seq: seq,
-        max_version,
-    })
-    .await
-    .unwrap();
+    let hour = HourBucket::from_nanos(BASE);
+    write_flush(meta, store, &batch_from_rows(&rows), hour, 64 << 20, seq, max_version).await;
 }
 
 async fn timed(api: &Router, uri: &str, gzip: bool) -> (Duration, usize) {
@@ -175,10 +152,7 @@ async fn measure(api: &Router, label: &str, uri: &str, gzip: bool, n: usize) -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn trace_2000_spans_p50_under_100ms() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = ForgeConfig::default();
-    cfg.metastore.url = format!("sqlite://{}", dir.path().join("meta.db").display());
-    cfg.storage.url = format!("file://{}", dir.path().join("data").display());
-    cfg.wal.dir = dir.path().join("wal");
+    let mut cfg = ForgeConfig::rooted_at(dir.path());
     cfg.memtable.flush_bytes = bytesize::ByteSize::gib(2);
     cfg.memtable.memory_budget = bytesize::ByteSize::gib(4);
     cfg.memtable.flush_interval = Duration::from_secs(3600);
@@ -187,15 +161,15 @@ async fn trace_2000_spans_p50_under_100ms() {
     // 1. Three L0 flushes, written directly: the start / end / patch posts of 16 filler traces and the target.
     let t0 = Instant::now();
     {
-        std::fs::create_dir_all(dir.path().join("data")).unwrap();
-        let meta = forge_meta::SqliteMetastore::open_path(&dir.path().join("meta.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join(DATA_DIR)).unwrap();
+        let meta = forge_meta::SqliteMetastore::open_path(&dir.path().join(META_DB)).unwrap();
         let store = VortexSegmentStore::new(build_object_store(&cfg.storage).unwrap());
         for f in 0..3u64 {
             let mut rows = posts(TARGET, f as u8, 1600);
             for filler in 0..16 {
                 rows.extend(posts(filler, f as u8, 1600));
             }
-            write_flush(&meta, &store, rows, f + 1, (f + 1) * 1_000_000).await;
+            flush(&meta, &store, rows, f + 1, (f + 1) * 1_000_000).await;
         }
     }
     println!("setup: 3 flushes written in {:.1} s", t0.elapsed().as_secs_f64());

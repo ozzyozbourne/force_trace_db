@@ -2,18 +2,18 @@
 //! flush between the memtable snapshot and the metastore call (invariant 1).
 mod common;
 
-use arrow::array::{AsArray, RecordBatch};
-use common::{ref_batch, runs_request, sort_by_key, trace_cols};
+use arrow::array::RecordBatch;
+use common::{keys_of, ref_batch, runs_request, sort_by_key, trace_cols, treq};
 use forge_ingest::{Ingest, Pipeline};
 use forge_meta::{Metastore, SegmentFilter, SqliteMetastore};
-use forge_model::config::{ForgeConfig, QueryConfig, StorageConfig};
+use forge_model::config::{DATA_DIR, ForgeConfig, META_DB, QueryConfig, StorageConfig, WAL_DIR};
 use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::SpanRow;
-use forge_model::schema::col;
+use forge_model::schema::{col, project_to, projected_schema};
 use forge_model::testing::{pid, reference, sid, tid};
 use forge_query::QueryEngine;
 use forge_query::testing::HookedMetastore;
-use forge_query::trace::{TraceFormat, TraceRequest};
+use forge_query::trace::TraceFormat;
 use forge_storage::{SegmentStore, VortexSegmentStore, build_object_store};
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,7 +24,7 @@ const SPANS: u64 = 8;
 
 fn config(root: &Path, flush_bytes: u64) -> ForgeConfig {
     let mut c = ForgeConfig::default();
-    c.wal.dir = root.join("wal");
+    c.wal.dir = root.join(WAL_DIR);
     c.memtable.flush_bytes = bytesize::ByteSize::b(flush_bytes);
     c.memtable.flush_interval = Duration::from_secs(3600);
     c
@@ -37,8 +37,8 @@ struct Stack {
 }
 
 async fn stack(root: &Path, flush_bytes: u64) -> Stack {
-    let meta: Arc<dyn Metastore> = Arc::new(SqliteMetastore::open_path(&root.join("meta.db")).unwrap());
-    let url = format!("file://{}", root.join("data").display());
+    let meta: Arc<dyn Metastore> = Arc::new(SqliteMetastore::open_path(&root.join(META_DB)).unwrap());
+    let url = format!("file://{}", root.join(DATA_DIR).display());
     let store: Arc<dyn SegmentStore> = Arc::new(VortexSegmentStore::new(
         build_object_store(&StorageConfig { url }).unwrap(),
     ));
@@ -83,33 +83,13 @@ fn posts(t: u64, end: bool) -> Vec<SpanRow> {
 type Key = (TraceId, SpanId);
 
 fn keys(b: &[RecordBatch]) -> Vec<Key> {
-    b.iter()
-        .flat_map(|b| {
-            let (t, s) = (b.column(1).as_binary::<i32>(), b.column(2).as_binary::<i32>());
-            (0..b.num_rows())
-                .map(|i| {
-                    (
-                        TraceId::from_slice(t.value(i)).unwrap(),
-                        SpanId::from_slice(s.value(i)).unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    b.iter().flat_map(keys_of).collect()
 }
 
 /// `load_trace` == the reference merge of the trace's posts, ignoring the WAL-assigned versions.
 fn assert_trace(rows: &RecordBatch, all: &[SpanRow], ctx: &str) {
     let cols: Vec<&str> = trace_cols(true).into_iter().filter(|c| *c != col::VERSION).collect();
-    let got = sort_by_key(rows);
-    let got = got
-        .project(
-            &cols
-                .iter()
-                .map(|c| got.schema().index_of(c).unwrap())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    let got = project_to(&sort_by_key(rows), &projected_schema(&cols)).unwrap();
     assert_eq!(got.columns(), ref_batch(&reference(all), &cols).columns(), "{ctx}");
 }
 
@@ -173,12 +153,7 @@ async fn concurrent_ingest_and_reads() {
         both |= mem_rows > 0 && segs > 0;
         if i % 10 == 0 {
             let t = *closed.lock().unwrap().last().unwrap();
-            let req = TraceRequest {
-                project: pid("live"),
-                trace: tid(t),
-                payloads: true,
-                format: TraceFormat::Tree,
-            };
+            let req = treq("live", tid(t), true, TraceFormat::Tree);
             let lt = engine.load_trace(&req).await.unwrap();
             let all: Vec<SpanRow> = posts(t, false).into_iter().chain(posts(t, true)).collect();
             assert_trace(&lt.rows, &all, &format!("iteration {i} trace {t}"));
@@ -230,12 +205,7 @@ async fn flush_between_snapshot_and_listing() {
             s.pipeline.memtable_view(),
             QueryConfig::default(),
         );
-        let req = TraceRequest {
-            project: pid("live"),
-            trace: tid(1),
-            payloads: true,
-            format: TraceFormat::Tree,
-        };
+        let req = treq("live", tid(1), true, TraceFormat::Tree);
         match path {
             "trace" => assert_trace(&engine.load_trace(&req).await.unwrap().rows, &all, path),
             "runs" => {

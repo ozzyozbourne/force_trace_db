@@ -1,13 +1,54 @@
-//! Test wrappers around the metastore and the segment store (used by forge-query and forge-server tests).
+//! Test wrappers around the metastore and the segment store, and a hand-made L0 flush (used by forge-query and
+//! forge-server tests; feature `test-util`).
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use forge_meta::{FlushCommit, MetaResult, Metastore, Project, SegmentFilter, WalCheckpoint};
-use forge_model::catalog::{SegmentId, SegmentMeta, TraceLocation};
+use forge_meta::{FlushCommit, MetaResult, Metastore, NewSegment, Project, SegmentFilter, WalCheckpoint};
+use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, TraceLocation};
 use forge_model::ids::{ProjectId, TraceId};
+use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
 use forge_storage::{BatchStream, ScanRequest, SegmentSpec, SegmentStore, StorageResult, WrittenSegment};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// One L0 flush of `batch` (spans_schema rows, versions already assigned): merge (Keep) -> one segment per project
+/// (chunks of at most `max_chunk` bytes) -> one metastore commit.
+pub async fn write_flush(
+    meta: &dyn Metastore,
+    store: &dyn SegmentStore,
+    batch: &RecordBatch,
+    hour: HourBucket,
+    max_chunk: usize,
+    seq: u64,
+    max_version: u64,
+) {
+    let mut segments = Vec::new();
+    if batch.num_rows() > 0 {
+        let merged = merge_versions_chunked(std::slice::from_ref(batch), Tombstones::Keep, max_chunk).unwrap();
+        for (p, batches) in split_chunks_by_project(&merged).unwrap() {
+            let spec = SegmentSpec {
+                id: SegmentId::new(),
+                project_id: p,
+                level: Level::L0,
+                partition_hour: hour,
+            };
+            let s = futures::stream::iter(batches.into_iter().map(Ok));
+            let w = store.write_segment(spec, Box::pin(s)).await.unwrap();
+            segments.push(NewSegment {
+                meta: w.meta,
+                traces: w.traces,
+            });
+        }
+    }
+    let c = FlushCommit {
+        node_id: "test".into(),
+        segments,
+        flushed_wal_seq: seq,
+        max_version,
+    };
+    meta.commit_flush(c).await.unwrap();
+}
 
 type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 

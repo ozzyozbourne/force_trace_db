@@ -14,6 +14,7 @@ pub mod runs;
 mod scan;
 mod session;
 pub mod sql;
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub mod testing;
 pub mod trace;

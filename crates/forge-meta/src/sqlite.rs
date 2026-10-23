@@ -12,8 +12,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
+/// Settings shared by the read-write and read-only connections: busy timeout, and a statement cache of 64
+/// (sqlite.rs has 16 cached statements, rusqlite's default capacity).
+fn base_setup(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "busy_timeout", 5000)?;
+    c.set_prepared_statement_cache_capacity(64);
+    Ok(())
+}
+
+fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
+    base_setup(c)?;
     // Switching a new file to WAL needs an exclusive lock and SQLite returns BUSY without calling the busy
     // handler when a concurrent opener holds it, so retry for up to the busy timeout.
     // `:memory:` answers "memory"; nothing to assert.
@@ -82,8 +90,7 @@ fn read_only_conn(path: &Path, immutable: bool) -> MetaResult<Connection> {
     } else {
         Connection::open_with_flags(path, flags)?
     };
-    c.pragma_update(None, "busy_timeout", 5000)?;
-    c.set_prepared_statement_cache_capacity(64);
+    base_setup(&c)?;
     let latest = migrations::LATEST;
     let has: bool = c.query_row(
         "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'schema_versions'",
@@ -385,8 +392,6 @@ impl SqliteMetastore {
 
     fn init(mut c: Connection) -> MetaResult<Self> {
         set_pragmas(&c)?;
-        // sqlite.rs has 16 cached statements, rusqlite's default capacity.
-        c.set_prepared_statement_cache_capacity(64);
         migrations::migrate(&mut c)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(c)),

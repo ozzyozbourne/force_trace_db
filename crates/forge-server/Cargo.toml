@@ -39,6 +39,7 @@ reqwest.workspace = true
 flate2.workspace = true
 zstd.workspace = true
 forge-model = { workspace = true, features = ["test-util"] }
+forge-query = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 http.workspace = true
 arrow.workspace = true

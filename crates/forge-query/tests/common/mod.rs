@@ -2,23 +2,22 @@
 //! reference helpers that do not use the code under test.
 #![allow(dead_code)]
 
-use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
-use arrow::compute::take_record_batch;
-use arrow::row::{RowConverter, SortField};
-use forge_meta::{FlushCommit, Metastore, NewSegment};
+use arrow::array::{AsArray, RecordBatch};
+use forge_meta::Metastore;
 use forge_model::MemtableView;
-use forge_model::catalog::{HourBucket, Level, SegmentId};
+use forge_model::catalog::HourBucket;
 use forge_model::config::{QueryConfig, StorageConfig};
 use forge_model::enums::{RunType, SpanStatus};
-use forge_model::ids::{ProjectId, SpanId, TraceId};
-use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
+use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::SpanRow;
-use forge_model::schema::{ALL_COLUMNS, JSON_COLUMNS, PAYLOAD_COLUMNS, col};
+use forge_model::schema::{ALL_COLUMNS, JSON_COLUMNS, PAYLOAD_COLUMNS, col, project_to, projected_schema};
+pub use forge_model::testing::sort_by_key;
 use forge_model::testing::{FixedMemtable, RefNode, Rng, batch_from_rows, pid, reference, sid, tid, tree_parents};
 use forge_query::QueryEngine;
-use forge_query::runs::{Cursor, RunsRequest};
-use forge_query::testing::RecordingSegmentStore;
-use forge_storage::{SegmentSpec, SegmentStore, VortexSegmentStore, build_object_store};
+use forge_query::runs::{Cursor, RunsParams, RunsRequest};
+use forge_query::testing::{RecordingSegmentStore, write_flush};
+use forge_query::trace::{TraceFormat, TraceRequest};
+use forge_storage::{SegmentStore, VortexSegmentStore, build_object_store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -94,7 +93,9 @@ impl Fixture {
         let mut max_version = 0;
         for (i, f) in layout.flushes.iter().enumerate() {
             max_version += f.len() as u64;
-            write_flush(&meta, &*store, f, i as u64 + 1, max_version).await;
+            let b = batch_from_rows(f);
+            let hour = HourBucket::from_nanos(BASE);
+            write_flush(&*meta, &*store, &b, hour, 64 << 10, i as u64 + 1, max_version).await;
         }
         let mut mem: Vec<RecordBatch> = layout
             .mem
@@ -135,41 +136,6 @@ impl Fixture {
             .map(|r| (r.project_id.as_ref().unwrap().to_string(), r.trace_id))
             .collect()
     }
-}
-
-/// One L0 flush: merge (Keep) -> one segment per project -> one metastore commit.
-pub async fn write_flush(
-    meta: &Arc<dyn Metastore>,
-    store: &dyn SegmentStore,
-    rows: &[SpanRow],
-    seq: u64,
-    max_version: u64,
-) {
-    let mut segments = Vec::new();
-    if !rows.is_empty() {
-        let merged = merge_versions_chunked(&[batch_from_rows(rows)], Tombstones::Keep, 64 << 10).unwrap();
-        for (p, batches) in split_chunks_by_project(&merged).unwrap() {
-            let spec = SegmentSpec {
-                id: SegmentId::new(),
-                project_id: p,
-                level: Level::L0,
-                partition_hour: HourBucket::from_nanos(BASE),
-            };
-            let s = futures::stream::iter(batches.into_iter().map(Ok));
-            let w = store.write_segment(spec, Box::pin(s)).await.unwrap();
-            segments.push(NewSegment {
-                meta: w.meta,
-                traces: w.traces,
-            });
-        }
-    }
-    let c = FlushCommit {
-        node_id: "n".into(),
-        segments,
-        flushed_wal_seq: seq,
-        max_version,
-    };
-    meta.commit_flush(c).await.unwrap();
 }
 
 fn post(project: &str, trace: TraceId, span: SpanId) -> SpanRow {
@@ -590,25 +556,24 @@ pub async fn sql(e: &QueryEngine, q: &str) -> RecordBatch {
 
 // ---------------------------------------------------------------- reference helpers
 
-/// Sorts by (project_id, trace_id, span_id).
-pub fn sort_by_key(b: &RecordBatch) -> RecordBatch {
-    let s = b.schema();
-    let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID]
-        .iter()
-        .map(|c| b.column(s.index_of(c).unwrap()).clone())
-        .collect();
-    let conv = RowConverter::new(cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()).unwrap();
-    let rows = conv.convert_columns(&cols).unwrap();
-    let mut idx: Vec<u32> = (0..b.num_rows() as u32).collect();
-    idx.sort_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
-    take_record_batch(b, &UInt32Array::from(idx)).unwrap()
-}
-
 /// Reference rows as a batch with exactly `b`'s columns, in key order.
 pub fn ref_batch(rows: &[SpanRow], cols: &[&str]) -> RecordBatch {
-    let full = sort_by_key(&batch_from_rows(rows));
-    let idx: Vec<usize> = cols.iter().map(|c| full.schema().index_of(c).unwrap()).collect();
-    full.project(&idx).unwrap()
+    project_to(&sort_by_key(&batch_from_rows(rows)), &projected_schema(cols)).unwrap()
+}
+
+/// (trace, span) of every row, by column name.
+pub fn keys_of(b: &RecordBatch) -> Vec<(TraceId, SpanId)> {
+    let s = b.schema();
+    let t = b.column(s.index_of(col::TRACE_ID).unwrap()).as_binary::<i32>();
+    let sp = b.column(s.index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
+    (0..b.num_rows())
+        .map(|i| {
+            (
+                TraceId::from_slice(t.value(i)).unwrap(),
+                SpanId::from_slice(sp.value(i)).unwrap(),
+            )
+        })
+        .collect()
 }
 
 pub fn names_of(b: &RecordBatch) -> Vec<&str> {
@@ -759,16 +724,17 @@ pub fn ref_runs(reference: &[SpanRow], req: &RunsRequest) -> Vec<(i64, TraceId, 
     out
 }
 
+/// The default listing of `project` (limit 50).
 pub fn runs_request(project: &str) -> RunsRequest {
-    RunsRequest {
-        project: ProjectId::new(project).unwrap(),
-        start_ns: None,
-        end_ns: None,
-        run_types: BTreeSet::new(),
-        statuses: BTreeSet::new(),
-        q: None,
-        limit: 50,
-        cursor: None,
+    RunsRequest::parse(RunsParams::default(), pid(project)).unwrap()
+}
+
+pub fn treq(project: &str, trace: TraceId, payloads: bool, format: TraceFormat) -> TraceRequest {
+    TraceRequest {
+        project: pid(project),
+        trace,
+        payloads,
+        format,
     }
 }
 
@@ -776,8 +742,7 @@ pub fn hex_lit(b: &[u8]) -> String {
     format!("X'{}'", hex::encode(b))
 }
 
-/// Project `t`: 3 flushes, trace k with 2 roots starting at `T_BASE + k * 100 s + 0.5 s` (one segment each).
-pub const T_BASE: i64 = 1_700_000_000_000_000_000;
+/// Project `t`: 3 flushes, trace k with 2 roots starting at `BASE + k * 100 s + 0.5 s` (one segment each).
 pub fn time_layout() -> Layout {
     let flushes = (0..3)
         .map(|k| {
@@ -785,7 +750,7 @@ pub fn time_layout() -> Layout {
                 .map(|s| SpanRow {
                     name: Some(format!("t{k}")),
                     status: Some(SpanStatus::Ok),
-                    start_time_ns: Some(T_BASE + k as i64 * 100_000_000_000 + 500_000_000),
+                    start_time_ns: Some(BASE + k as i64 * 100_000_000_000 + 500_000_000),
                     ..post("t", tid(k), sid(s))
                 })
                 .collect()

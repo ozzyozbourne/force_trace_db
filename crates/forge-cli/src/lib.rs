@@ -1,5 +1,5 @@
 //! The `forge` command line: `serve`, `sql`, `inspect`, plus stubs for the later subcommands.
-pub mod table;
+mod table;
 
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -145,63 +145,9 @@ const OFFLINE_NOTE: &str = "note: offline mode reads flushed segments only; unfl
 /// read-only metastore and no memtable. Both print the same envelope.
 async fn sql(a: SqlArgs, config: Option<&std::path::Path>) -> anyhow::Result<()> {
     use std::io::Write;
-    let body: Vec<u8> = match &a.server {
-        Some(url) => {
-            let resp = reqwest::Client::new()
-                .post(format!("{}/v1/sql", url.trim_end_matches('/')))
-                .json(&serde_json::json!({ "query": a.query }))
-                .send()
-                .await
-                .with_context(|| format!("connecting to {url}"))?;
-            let status = resp.status();
-            let body = resp.bytes().await.context("reading the response")?;
-            if !status.is_success() {
-                let msg = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v["error"].as_str().map(String::from))
-                    .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-                anyhow::bail!("{msg} (HTTP {status})");
-            }
-            body.to_vec()
-        }
-        None => {
-            let (meta_url, storage_url, query_cfg) = match &a.data_dir {
-                Some(d) => {
-                    if !d.join("meta.db").is_file() || !d.join("data").is_dir() {
-                        anyhow::bail!("no Forge data at {}", d.display());
-                    }
-                    let q = forge_model::config::QueryConfig::default();
-                    (
-                        format!("sqlite://{}/meta.db", d.display()),
-                        format!("file://{}/data", d.display()),
-                        q,
-                    )
-                }
-                None => {
-                    let cfg = ForgeConfig::load(config).context("loading config")?;
-                    // build_object_store creates a missing file:// root: refuse instead.
-                    if let Ok(root) = forge_storage::file_url_path(&cfg.storage.url)
-                        && !root.is_dir()
-                    {
-                        anyhow::bail!("no Forge data at {} (storage.url {})", root.display(), cfg.storage.url);
-                    }
-                    (cfg.metastore.url, cfg.storage.url, cfg.query)
-                }
-            };
-            let meta = forge_meta::open_read_only(&forge_model::config::MetastoreConfig { url: meta_url }).await?;
-            let built = forge_storage::build_object_store(&forge_model::config::StorageConfig { url: storage_url })?;
-            let store = std::sync::Arc::new(forge_storage::VortexSegmentStore::new(built));
-            let engine =
-                forge_query::QueryEngine::new(meta, store, std::sync::Arc::new(forge_model::EmptyMemtable), query_cfg);
-            writeln!(std::io::stderr().lock(), "{OFFLINE_NOTE}")?;
-            let req = forge_query::sql::SqlRequest {
-                query: a.query,
-                max_rows: None,
-                timeout_ms: None,
-            };
-            use forge_model::error::Classify;
-            engine.sql_json(&req).await.map_err(|e| anyhow::anyhow!(e.message()))?
-        }
+    let body = match &a.server {
+        Some(url) => remote_sql(url, &a.query).await?,
+        None => offline_sql(&a, config).await?,
     };
     let env: serde_json::Value = serde_json::from_slice(&body).context("parsing the response")?;
     let out = match a.format {
@@ -210,6 +156,63 @@ async fn sql(a: SqlArgs, config: Option<&std::path::Path>) -> anyhow::Result<()>
     };
     std::io::stdout().lock().write_all(out.as_bytes())?;
     Ok(())
+}
+
+/// The `/v1/sql` envelope from a running server; a non-2xx answer is an error with the server's message.
+async fn remote_sql(url: &str, query: &str) -> anyhow::Result<Vec<u8>> {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/sql", url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+        .with_context(|| format!("connecting to {url}"))?;
+    let status = resp.status();
+    let body = resp.bytes().await.context("reading the response")?;
+    if !status.is_success() {
+        let msg = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(String::from))
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+        anyhow::bail!("{msg} (HTTP {status})");
+    }
+    Ok(body.to_vec())
+}
+
+/// The same envelope, computed in process over the flushed segments of `--data-dir` (or the config's URLs).
+async fn offline_sql(a: &SqlArgs, config: Option<&std::path::Path>) -> anyhow::Result<Vec<u8>> {
+    use forge_model::config::{DATA_DIR, META_DB};
+    use std::io::Write;
+    let cfg = match &a.data_dir {
+        Some(d) => {
+            if !d.join(META_DB).is_file() || !d.join(DATA_DIR).is_dir() {
+                anyhow::bail!("no Forge data at {}", d.display());
+            }
+            ForgeConfig::rooted_at(d)
+        }
+        None => {
+            let cfg = ForgeConfig::load(config).context("loading config")?;
+            // build_object_store creates a missing file:// root: refuse instead.
+            if let Ok(root) = forge_storage::file_url_path(&cfg.storage.url)
+                && !root.is_dir()
+            {
+                anyhow::bail!("no Forge data at {} (storage.url {})", root.display(), cfg.storage.url);
+            }
+            cfg
+        }
+    };
+    let meta = forge_meta::open_read_only(&cfg.metastore).await?;
+    let store = std::sync::Arc::new(forge_storage::VortexSegmentStore::new(
+        forge_storage::build_object_store(&cfg.storage)?,
+    ));
+    let engine = forge_query::QueryEngine::new(meta, store, std::sync::Arc::new(forge_model::EmptyMemtable), cfg.query);
+    writeln!(std::io::stderr().lock(), "{OFFLINE_NOTE}")?;
+    let req = forge_query::sql::SqlRequest {
+        query: a.query.clone(),
+        max_rows: None,
+        timeout_ms: None,
+    };
+    use forge_model::error::Classify;
+    engine.sql_json(&req).await.map_err(|e| anyhow::anyhow!(e.message()))
 }
 
 fn not_yet(cmd: &str, Unimplemented(m): Unimplemented) -> anyhow::Result<()> {

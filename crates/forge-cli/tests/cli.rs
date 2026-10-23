@@ -1,10 +1,6 @@
 mod common;
 
-use std::process::Output;
-
-fn forge(args: &[&str]) -> Output {
-    common::forge_cmd().args(args).output().expect("run forge")
-}
+use common::forge_output as forge;
 
 #[test]
 fn help_lists_subcommands() {

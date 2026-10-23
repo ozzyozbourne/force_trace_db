@@ -138,14 +138,8 @@ mod tests {
     use proptest::prelude::*;
 
     fn tree_batch(rows: &[SpanRow]) -> RecordBatch {
-        let b = batch_from_rows(rows);
         let s = projected_schema(&[col::SPAN_ID, col::PARENT_SPAN_ID, col::START_TIME]);
-        let idx: Vec<usize> = s
-            .fields()
-            .iter()
-            .map(|f| b.schema().index_of(f.name()).unwrap())
-            .collect();
-        b.project(&idx).unwrap()
+        forge_model::schema::project_to(&batch_from_rows(rows), &s).unwrap()
     }
 
     fn got(rows: &[SpanRow]) -> Vec<RefNode> {

@@ -8,10 +8,9 @@
 //! after the next unread segment's `max_start`. No budget: a deep page costs O(segments overlapping the window)
 //! (M3's per-hour L1 bounds that).
 use crate::filters::KeyFilters;
-use crate::json::SpanCols;
 use crate::read::{ReadView, SegmentPart, merge_or_filter, needs_merge, read_columns};
 use crate::{QueryCtx, QueryEngine, QueryError, QueryKind};
-use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
+use arrow::array::{Array, AsArray, BooleanArray, RecordBatch, StringArray};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::{SchemaRef, TimestampNanosecondType};
 use forge_meta::SegmentFilter;
@@ -57,6 +56,7 @@ pub type Pos = (i64, TraceId, SpanId);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor(pub Pos);
 
+#[derive(Clone, Debug)]
 pub struct RunsRequest {
     pub project: ProjectId,
     /// `[start_ns, end_ns)` on start_time.
@@ -135,7 +135,7 @@ impl RunsRequest {
     }
 
     /// crc32 of the normalized filters: a cursor only continues the listing it came from.
-    pub fn filter_hash(&self) -> u32 {
+    fn filter_hash(&self) -> u32 {
         let rt: Vec<&str> = self.run_types.iter().map(|r| r.as_str()).collect();
         let st: Vec<&str> = self.statuses.iter().map(|r| r.as_str()).collect();
         let norm = format!(
@@ -146,7 +146,7 @@ impl RunsRequest {
     }
 
     /// hex(`[1][start_ns BE][trace 16][span 8][filter_hash BE]`): 74 hex digits.
-    pub fn encode_cursor(&self, c: &Cursor) -> String {
+    fn encode_cursor(&self, c: &Cursor) -> String {
         let (start, trace, span) = c.0;
         let mut b = vec![1u8];
         b.extend_from_slice(&start.to_be_bytes());
@@ -156,7 +156,7 @@ impl RunsRequest {
         hex::encode(b)
     }
 
-    pub fn decode_cursor(&self, s: &str) -> Result<Cursor, QueryError> {
+    fn decode_cursor(&self, s: &str) -> Result<Cursor, QueryError> {
         let b = hex::decode(s).map_err(|_| bad("bad cursor"))?;
         if b.len() != 37 || b[0] != 1 {
             return Err(bad("bad cursor"));
@@ -215,25 +215,8 @@ impl QueryEngine {
             let page = self.list_runs_inner(&q, r).await?;
             let cursor = page.next_cursor.map(|c| r.encode_cursor(&c));
             q.blocking(move |cancel| {
-                let cols = SpanCols::new(&page.rows, true);
-                let mut out = b"{\"runs\":[".to_vec();
-                for i in 0..page.rows.num_rows() {
-                    if i % 1024 == 0 {
-                        cancel.check()?;
-                    }
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    out.push(b'{');
-                    cols.write_span(&mut out, i, false, false);
-                    out.push(b'}');
-                }
-                out.extend_from_slice(b"],\"next_cursor\":");
-                match cursor {
-                    Some(c) => out.extend_from_slice(format!("\"{c}\"").as_bytes()),
-                    None => out.extend_from_slice(b"null"),
-                }
-                out.push(b'}');
+                let mut out = Vec::new();
+                crate::json::write_runs(&mut out, &page.rows, cursor.as_deref(), cancel)?;
                 Ok(out)
             })
             .await
@@ -357,9 +340,6 @@ impl QueryEngine {
         let rt = m.column(s.index_of(col::RUN_TYPE)?).as_string::<i32>();
         let st = m.column(s.index_of(col::STATUS)?).as_string::<i32>();
         let name = m.column(s.index_of(col::NAME)?).as_string::<i32>();
-        let one_of = |set_empty: bool, a: &arrow::array::StringArray, i: usize, f: &dyn Fn(&str) -> bool| {
-            set_empty || a.is_valid(i) && f(a.value(i))
-        };
         let mask: BooleanArray = positions(&m)
             .into_iter()
             .enumerate()
@@ -369,12 +349,8 @@ impl QueryEngine {
                     project.value(i) == r.project.as_str()
                         && par.is_null(i)
                         && in_window(r, hi, &p)
-                        && one_of(r.run_types.is_empty(), rt, i, &|v| {
-                            v.parse().is_ok_and(|x| r.run_types.contains(&x))
-                        })
-                        && one_of(r.statuses.is_empty(), st, i, &|v| {
-                            v.parse().is_ok_and(|x| r.statuses.contains(&x))
-                        })
+                        && in_set(&r.run_types, rt, i)
+                        && in_set(&r.statuses, st, i)
                         && r.q
                             .as_ref()
                             .is_none_or(|q| name.is_valid(i) && name.value(i).to_lowercase().contains(q.as_str())),
@@ -383,6 +359,11 @@ impl QueryEngine {
             .collect();
         Ok(filter_record_batch(&m, &mask)?)
     }
+}
+
+/// Row `i` of `a` parses to a member of `set` (an empty set matches anything).
+fn in_set<T: Ord + std::str::FromStr>(set: &BTreeSet<T>, a: &StringArray, i: usize) -> bool {
+    set.is_empty() || a.is_valid(i) && a.value(i).parse().is_ok_and(|x| set.contains(&x))
 }
 
 /// start in `[start_ns, hi)` and strictly after the cursor.

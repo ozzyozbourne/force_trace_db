@@ -15,10 +15,8 @@ use std::io::Write;
 type Ts = PrimitiveArray<TimestampNanosecondType>;
 
 /// Typed column refs of the projected fields, in output order.
-pub struct SpanCols<'a> {
+pub(crate) struct SpanCols<'a> {
     fields: Vec<(&'static str, Col<'a>)>,
-    start: Option<&'a Ts>,
-    end: Option<&'a Ts>,
     /// One debug log per response for invalid JSON text.
     logged: Cell<bool>,
 }
@@ -31,7 +29,8 @@ enum Col<'a> {
     I64(&'a Int64Array),
     F64(&'a Float64Array),
     List(&'a ListArray),
-    Latency,
+    /// end_time - start_time (both projected, else null).
+    Latency(Option<&'a Ts>, Option<&'a Ts>),
 }
 
 const LATENCY: &str = "latency_ms";
@@ -72,7 +71,7 @@ impl<'a> SpanCols<'a> {
         let mut fields = Vec::new();
         for n in ORDER {
             if n == LATENCY {
-                fields.push((n, Col::Latency));
+                fields.push((n, Col::Latency(ts(col::START_TIME), ts(col::END_TIME))));
                 continue;
             }
             if n == col::TRACE_ID && !trace_id {
@@ -93,8 +92,6 @@ impl<'a> SpanCols<'a> {
         }
         Self {
             fields,
-            start: ts(col::START_TIME),
-            end: ts(col::END_TIME),
             logged: Cell::new(false),
         }
     }
@@ -137,7 +134,7 @@ impl<'a> SpanCols<'a> {
                     let items: Vec<Option<&str>> = v.iter().collect();
                     serde_json::to_writer(&mut *out, &items).expect("strings serialize");
                 }
-                Col::Latency => match (self.start, self.end) {
+                Col::Latency(start, end) => match (start, end) {
                     (Some(s), Some(e)) if s.is_valid(row) && e.is_valid(row) => {
                         float(out, (e.value(row) - s.value(row)) as f64 / 1e6)
                     }
@@ -220,5 +217,35 @@ pub fn write_trace(
         }
     }
     out.extend_from_slice(b"]}");
+    Ok(())
+}
+
+/// `{"runs":[…],"next_cursor":hex|null}`: each run like a trace span plus `trace_id`, no children. Checks `cancel`
+/// every 1k runs.
+pub fn write_runs(
+    out: &mut Vec<u8>,
+    rows: &RecordBatch,
+    cursor: Option<&str>,
+    cancel: &Cancel,
+) -> Result<(), QueryError> {
+    let cols = SpanCols::new(rows, true);
+    out.extend_from_slice(b"{\"runs\":[");
+    for i in 0..rows.num_rows() {
+        if i % 1024 == 0 {
+            cancel.check()?;
+        }
+        if i > 0 {
+            out.push(b',');
+        }
+        out.push(b'{');
+        cols.write_span(out, i, false, false);
+        out.push(b'}');
+    }
+    out.extend_from_slice(b"],\"next_cursor\":");
+    match cursor {
+        Some(c) => json_str(out, c),
+        None => out.extend_from_slice(b"null"),
+    }
+    out.push(b'}');
     Ok(())
 }

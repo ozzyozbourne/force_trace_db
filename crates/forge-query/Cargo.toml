@@ -7,8 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# Test hooks (the blocking-phase hook) for this crate's and forge-server's tests.
-test-util = []
+# Test hooks and wrappers (`testing`, the blocking-phase hook) for this crate's and forge-server's tests.
+test-util = ["dep:object_store"]
 
 [lints]
 workspace = true
@@ -31,7 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 crc32fast.workspace = true
-object_store.workspace = true
+object_store = { workspace = true, optional = true }
 
 [dev-dependencies]
 forge-query = { workspace = true, features = ["test-util"] }

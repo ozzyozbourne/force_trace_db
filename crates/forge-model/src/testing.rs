@@ -302,16 +302,26 @@ impl crate::memtable::MemtableView for FixedMemtable {
         use crate::memtable::{AppendLog, MemtablePart, MemtableSnapshot};
         let mut log = AppendLog::default();
         self.0.iter().cloned().for_each(|b| log.push(b));
-        if log.is_empty() {
-            return MemtableSnapshot::default();
-        }
         MemtableSnapshot {
-            parts: vec![MemtablePart {
-                frozen: false,
-                batches: log.view(),
-            }],
+            parts: MemtablePart::of(&log, false).into_iter().collect(),
         }
     }
+}
+
+/// Sorts a (projected) spans batch by (project_id, trace_id, span_id).
+pub fn sort_by_key(b: &RecordBatch) -> RecordBatch {
+    use arrow::array::{ArrayRef, UInt32Array};
+    use arrow::row::{RowConverter, SortField};
+    let s = b.schema();
+    let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID]
+        .iter()
+        .map(|c| b.column(s.index_of(c).unwrap()).clone())
+        .collect();
+    let conv = RowConverter::new(cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()).unwrap();
+    let rows = conv.convert_columns(&cols).unwrap();
+    let mut idx: Vec<u32> = (0..b.num_rows() as u32).collect();
+    idx.sort_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
+    arrow::compute::take_record_batch(b, &UInt32Array::from(idx)).unwrap()
 }
 
 /// Parent of a generated span; spans are numbered `0..n` (ids `sid(n)`).

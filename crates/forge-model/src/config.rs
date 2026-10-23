@@ -157,7 +157,21 @@ pub fn split_scheme(url: &str) -> Option<(&str, &str)> {
     url.split_once("://")
 }
 
+/// The data-directory layout (the defaults root it at `./forge-data`; `forge sql --data-dir` relies on it).
+pub const META_DB: &str = "meta.db";
+pub const DATA_DIR: &str = "data";
+pub const WAL_DIR: &str = "wal";
+
 impl ForgeConfig {
+    /// Defaults with the metastore, storage and WAL under `dir` ([`META_DB`], [`DATA_DIR`], [`WAL_DIR`]).
+    pub fn rooted_at(dir: &Path) -> Self {
+        let mut c = Self::default();
+        c.metastore.url = format!("sqlite://{}/{META_DB}", dir.display());
+        c.storage.url = format!("file://{}/{DATA_DIR}", dir.display());
+        c.wal.dir = dir.join(WAL_DIR);
+        c
+    }
+
     /// defaults <- `path` (must exist) | `./forge.toml` if it is a file (cwd only) <- `FORGE_<SECTION>__<KEY>` env.
     pub fn load(path: Option<&Path>) -> Result<Self, figment::Error> {
         use figment::{

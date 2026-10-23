@@ -75,8 +75,7 @@ async fn run() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let cfg = write_config(dir, "5s");
-    let env = [("FORGE_MEMTABLE__FLUSH_INTERVAL", "1h")];
-    let (mut s, p) = spawn_ready(dir, Some(&cfg), &env).await;
+    let (mut s, p) = spawn_ready(dir, Some(&cfg), &NO_TIMER_FLUSH).await;
     let http = http_client();
 
     let (langgraph, oi, genai, legacy) = (
@@ -199,7 +198,7 @@ async fn run() {
     );
 
     // Restart: nothing to replay, nothing new committed.
-    let (mut s, _) = spawn_ready(dir, Some(&cfg), &env).await;
+    let (mut s, _) = spawn_ready(dir, Some(&cfg), &NO_TIMER_FLUSH).await;
     let logs = s.stop_ok(Duration::from_secs(20)).await;
     assert_eq!(
         log_field(&logs, "wal replay done", "applied").as_u64(),
@@ -211,13 +210,7 @@ async fn run() {
 }
 
 fn forge_sql(args: &[&str]) -> std::process::Output {
-    forge_cmd().arg("sql").args(args).output().expect("run forge sql")
-}
-
-fn count_of(o: &std::process::Output) -> u64 {
-    assert!(o.status.success(), "{o:?}");
-    let v: Value = serde_json::from_slice(&o.stdout).expect("json envelope");
-    v["rows"][0]["n"].as_u64().expect("n")
+    forge_output(&[&["sql"], args].concat())
 }
 
 /// `forge sql` against a running server (memtable rows visible) and offline (`--data-dir`, config mode: flushed
@@ -227,8 +220,7 @@ async fn forge_sql_server_and_offline() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let cfg = write_config(dir, "5s");
-    let env = [("FORGE_MEMTABLE__FLUSH_INTERVAL", "1h")];
-    let (mut s, p) = spawn_ready(dir, Some(&cfg), &env).await;
+    let (mut s, p) = spawn_ready(dir, Some(&cfg), &NO_TIMER_FLUSH).await;
     let r = post_otlp(
         &http_client(),
         &p,
@@ -255,7 +247,7 @@ async fn forge_sql_server_and_offline() {
         "json",
         "SELECT count(*) AS n FROM spans",
     ]);
-    let live = count_of(&o);
+    let live = sql_count(&o);
     assert!(live > 0);
     let o = forge_sql(&["--server", &server, "DROP TABLE spans"]);
     assert_eq!(o.status.code(), Some(1), "{o:?}");
@@ -265,7 +257,7 @@ async fn forge_sql_server_and_offline() {
     let d = dir.to_str().unwrap();
     let q = ["--data-dir", d, "--format", "json", "SELECT count(*) AS n FROM spans"];
     let o = forge_sql(&q);
-    assert_eq!(count_of(&o), 0);
+    assert_eq!(sql_count(&o), 0);
     assert!(String::from_utf8_lossy(&o.stderr).contains(note), "{o:?}");
 
     s.stop_ok(Duration::from_secs(20)).await;
@@ -273,23 +265,20 @@ async fn forge_sql_server_and_offline() {
     let (_, rows) = visible(dir).await;
     let committed = merged(&rows).len() as u64;
     assert_eq!(committed, live);
-    assert_eq!(count_of(&forge_sql(&q)), committed);
+    assert_eq!(sql_count(&forge_sql(&q)), committed);
     // Config mode (no flag).
-    let o = forge_cmd()
-        .args([
-            "-c",
-            cfg.to_str().unwrap(),
-            "sql",
-            "--format",
-            "json",
-            "SELECT count(*) AS n FROM spans",
-        ])
-        .output()
-        .expect("run");
-    assert_eq!(count_of(&o), committed);
+    let o = forge_output(&[
+        "-c",
+        cfg.to_str().unwrap(),
+        "sql",
+        "--format",
+        "json",
+        "SELECT count(*) AS n FROM spans",
+    ]);
+    assert_eq!(sql_count(&o), committed);
     assert!(String::from_utf8_lossy(&o.stderr).contains(note), "{o:?}");
 
     // The offline reads left the server's data usable.
-    let (mut s, _) = spawn_ready(dir, Some(&cfg), &env).await;
+    let (mut s, _) = spawn_ready(dir, Some(&cfg), &NO_TIMER_FLUSH).await;
     s.stop_ok(Duration::from_secs(20)).await;
 }

@@ -87,16 +87,6 @@ fn ts_ns(v: &ScalarValue) -> Option<i64> {
         _ => None,
     }
 }
-fn flip(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::Gt => Operator::Lt,
-        Operator::GtEq => Operator::LtEq,
-        o => o,
-    }
-}
-
 /// `col = lit`, `lit = col`, a non-negated IN list, or an OR chain of those on one key column
 /// (DataFusion turns IN lists of <= 3 items into OR chains).
 fn key_set(e: &Expr) -> Option<(String, Vec<ScalarValue>)> {
@@ -153,7 +143,7 @@ pub(crate) fn classify(e: &Expr) -> Option<Pushed> {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             let (op, v) = match (key_column(left), literal(right), key_column(right), literal(left)) {
                 (Some(c::START_TIME), Some(v), _, _) => (*op, v),
-                (_, _, Some(c::START_TIME), Some(v)) => (flip(*op), v),
+                (_, _, Some(c::START_TIME), Some(v)) => (op.swap()?, v),
                 _ => return None,
             };
             let ns = ts_ns(v)?;

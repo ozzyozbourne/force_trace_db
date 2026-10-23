@@ -56,10 +56,7 @@ impl Active {
         }
     }
     fn part(&self, frozen: bool) -> Option<MemtablePart> {
-        (!self.log.is_empty()).then(|| MemtablePart {
-            frozen,
-            batches: self.log.view(),
-        })
+        MemtablePart::of(&self.log, frozen)
     }
 }
 
