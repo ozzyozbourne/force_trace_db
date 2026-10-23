@@ -76,7 +76,7 @@ impl Forge {
             std::process::exit(130);
         });
         let tasks = self.ingest.start_background();
-        let lifecycle = crate::lifecycle::start(self.clone()).await?;
+        let lifecycle = crate::lifecycle::start(self.clone());
 
         // Any listener failure stops the others; join! (not try_join!) lets every listener drain.
         let guard = |r: anyhow::Result<()>| {

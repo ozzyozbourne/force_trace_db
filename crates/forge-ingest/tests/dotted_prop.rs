@@ -1,29 +1,8 @@
-//! dotted_order resolution against an oracle computed from the generator's own tree.
-use forge_model::dotted::dotted_order;
+//! dotted_order resolution against the naive oracle (`ref_dotted`) over the generator's own tree.
 use forge_model::dotted::resolve_dotted_orders;
-use forge_model::ids::SpanId;
 use forge_model::row::SpanRow;
-use forge_model::testing::{Rng, RowKey as Key, pid, row_key as key, sid, tid};
+use forge_model::testing::{Rng, pid, ref_dotted, row_key as key, sid, tid};
 use proptest::prelude::*;
-use std::collections::HashMap;
-
-type Node = (Option<SpanId>, Option<i64>); // (parent, start)
-
-/// Some(d) iff the whole chain is present, ends at a root and has start times; cycles are None.
-fn oracle(k: &Key, nodes: &HashMap<Key, Node>, path: &mut Vec<Key>) -> Option<String> {
-    if path.contains(k) {
-        return None; // cycle
-    }
-    let &(parent, start) = nodes.get(k)?;
-    let start = start?;
-    path.push(k.clone());
-    let d = match parent {
-        None => Some(dotted_order(None, start, k.2)),
-        Some(p) => oracle(&(k.0.clone(), k.1, p), nodes, path).map(|pd| dotted_order(Some(&pd), start, k.2)),
-    };
-    path.pop();
-    d
-}
 
 /// Span ids 1..=8 reused across 2 projects x 2 traces with different parents: self-parents, cycles, parents
 /// missing from the batch, null starts, duplicates with other starts, and sometimes one 40-deep chain.
@@ -87,12 +66,11 @@ proptest! {
     #[test]
     fn dotted_order_matches_tree_oracle(seed in 1u64..) {
         let mut rows = generate(seed);
-        // The last occurrence of a key defines its node.
-        let nodes: HashMap<Key, Node> = rows.iter().map(|r| (key(r), (r.parent_span_id, r.start_time_ns))).collect();
+        // No row carries a dotted_order; the last occurrence of a key defines its node.
+        let want = ref_dotted(&rows);
         resolve_dotted_orders(&mut rows);
         for r in &rows {
-            let want = oracle(&key(r), &nodes, &mut Vec::new());
-            prop_assert_eq!(&r.dotted_order, &want, "{:?}", key(r));
+            prop_assert_eq!(&r.dotted_order, &want[&key(r)], "{:?}", key(r));
         }
     }
 }
@@ -115,7 +93,7 @@ fn producer_dotted_order_is_kept() {
 /// `tree_parents` trees (cycles, missing parents) with producer values on about 10 % of nodes and some null starts.
 #[test]
 fn resolve_equals_ref_dotted_with_producer_values() {
-    use forge_model::testing::{ref_dotted, tree_parents};
+    use forge_model::testing::tree_parents;
     let mut seeded_children = 0;
     for seed in 1..=300u64 {
         let mut r = Rng(seed);

@@ -138,8 +138,6 @@ pub struct CompactionJob {
     pub kind: JobKind,
     /// state = Compacting, ordered by min_version.
     pub inputs: Vec<SegmentMeta>,
-    /// Wall clock (the job-age guard, D15).
-    pub created_at_ms: i64,
 }
 
 /// Outputs: L1, same project, any hours.
@@ -241,8 +239,8 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     ) -> MetaResult<Vec<SegmentMeta>>;
     /// Deleted segments with `deleted_at_ms < deleted_before_ms`, oldest deletion first, at most `limit`.
     async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>>;
-    /// Removes the rows of DELETED segments (others in `ids` are ignored): their trace_index rows in short txns of
-    /// at most `TRACE_INDEX_PURGE_CHUNK` rows, then the segments rows. Call only after their objects are gone.
+    /// Removes the rows of DELETED segments (others in `ids` are ignored): their trace_index rows in short chunked
+    /// txns, then the segments rows. Call only after their objects are gone.
     /// Returns the number of segments rows removed.
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize>;
     /// Object paths (`.vortex`) of every segments row of `project`, any state: the orphan GC's "known" set.
@@ -273,10 +271,6 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
 
 /// Most inputs `begin_compaction` accepts. The picker's own caps (forge-ingest `MAX_INPUTS`) must stay within it.
 pub const MAX_JOB_INPUTS: usize = 64;
-
-/// `forget_segments` deletes trace_index rows in txns of this many rows, so a flush commit never waits behind
-/// one huge delete (an hour's L1 segment holds ~720k trace rows at 200 traces/s).
-pub const TRACE_INDEX_PURGE_CHUNK: usize = 20_000;
 
 /// Read-only open (`sqlite://path` only): no create, no migrations, no journal_mode change. A missing file is a
 /// `Config` error and nothing is created.

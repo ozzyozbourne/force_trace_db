@@ -75,14 +75,7 @@ impl W {
         self.segs().await.into_iter().filter(|s| s.level == Level::L1).collect()
     }
     async fn rows(&self, s: &SegmentMeta) -> Vec<SpanRow> {
-        let b: Vec<_> = self
-            .store
-            .scan(s, ScanRequest::default())
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let b = self.store.scan_all(s, ScanRequest::default()).await.unwrap();
         b.iter().flat_map(|b| rows_from_batch(b).unwrap()).collect()
     }
     async fn begin(&self, kind: JobKind, inputs: Vec<SegmentId>) -> forge_meta::CompactionJob {
@@ -385,14 +378,7 @@ async fn upload_failure_deletes_uploads() {
     let rep = w.compact_l0(cfg).await;
     assert!(rep.outputs.len() > 1);
     for s in w.l1().await {
-        let b: Vec<_> = w
-            .store
-            .scan(&s, ScanRequest::default())
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let b = w.store.scan_all(&s, ScanRequest::default()).await.unwrap();
         let mut refs: Vec<String> = w.meta.blob_refs(&pid("p")).await.unwrap().into_iter().collect();
         refs.sort();
         for path in blob_refs_in(&b) {

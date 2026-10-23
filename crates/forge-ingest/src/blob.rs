@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 /// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. Far below the
 /// 24 h orphan grace.
-pub const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
 /// `threshold` bytes with a blob reference and returns the blobs to write (`put_blobs`), keyed by path.
@@ -82,23 +82,23 @@ pub async fn put_blobs(
             let path = Path::from(path);
             let create = || PutOptions::from(PutMode::Create);
             match store.put_opts(&path, bytes.clone().into(), create()).await {
+                Err(object_store::Error::AlreadyExists { .. }) => {}
+                r => return r.map(drop),
+            }
+            // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - 24 h and no blob_refs
+            // row) cannot take it before this row is flushed (lifecycle.md §1.4). Gone since the put (RD #13):
+            // write it again.
+            match store.head(&path).await {
+                Ok(m) if chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH => {
+                    store.put(&path, bytes.into()).await.map(drop)
+                }
                 Ok(_) => Ok(()),
-                // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - 24 h and no
-                // blob_refs row) cannot take it before this row is flushed (lifecycle.md §1.4). Gone since the
-                // put (RD #13): write it again.
-                Err(object_store::Error::AlreadyExists { .. }) => match store.head(&path).await {
-                    Ok(m) if chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH => {
-                        store.put(&path, bytes.into()).await.map(|_| ())
+                Err(object_store::Error::NotFound { .. }) => {
+                    match store.put_opts(&path, bytes.into(), create()).await {
+                        Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                        Err(e) => Err(e),
                     }
-                    Ok(_) => Ok(()),
-                    Err(object_store::Error::NotFound { .. }) => {
-                        match store.put_opts(&path, bytes.into(), create()).await {
-                            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) => Err(e),
-                },
+                }
                 Err(e) => Err(e),
             }
         })

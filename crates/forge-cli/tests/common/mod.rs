@@ -12,7 +12,6 @@ use forge_model::row::SpanRow;
 use forge_model::testing::{RowKey, batch_from_rows, reference_merge, row_key, rows_from_batch};
 use forge_storage::inspect::{InspectOptions, inspect_segment};
 use forge_storage::{RowSelection, ScanRequest, SegmentStore, VortexSegmentStore, build_object_store};
-use futures::TryStreamExt;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader};
@@ -356,13 +355,7 @@ async fn scan(store: &VortexSegmentStore, seg: &SegmentMeta, rows: RowSelection)
         rows,
         ..Default::default()
     };
-    let batches: Vec<_> = store
-        .scan(seg, req)
-        .await
-        .expect("scan")
-        .try_collect()
-        .await
-        .expect("scan stream");
+    let batches = store.scan_all(seg, req).await.expect("scan");
     batches.iter().flat_map(|b| rows_from_batch(b).expect("rows")).collect()
 }
 

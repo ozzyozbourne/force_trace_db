@@ -15,6 +15,34 @@ fn age(root: &std::path::Path, key: &str, hours: u64) {
         .unwrap();
 }
 
+/// One L0 of project p (hour 100) with one row started at `start_ns`.
+fn l0(start_ns: i64, created_at_ms: i64, blobs: Vec<String>) -> NewSegment {
+    NewSegment {
+        meta: SegmentMeta {
+            min_start_ns: Some(start_ns),
+            max_start_ns: Some(start_ns),
+            start_time_nulls: 0,
+            created_at_ms,
+            ..segment_meta("p", Level::L0, HourBucket(100))
+        },
+        traces: vec![TraceRange {
+            trace_id: TraceId([1; 16]),
+            row_start: 0,
+            row_count: 1,
+        }],
+        blobs,
+    }
+}
+
+fn flush(segments: Vec<NewSegment>) -> FlushCommit {
+    FlushCommit {
+        node_id: "n".into(),
+        segments,
+        flushed_wal_seq: 1,
+        max_version: 1,
+    }
+}
+
 #[tokio::test]
 async fn gc_end_to_end_on_local_fs() {
     let d = tempfile::tempdir().unwrap();
@@ -25,23 +53,9 @@ async fn gc_end_to_end_on_local_fs() {
     let h = 3_600_000_000_000i64;
     let now_ns = forge_model::time::now_ms() * 1_000_000;
     let mk = |max_start: i64, blob: &str| {
-        let meta = SegmentMeta {
-            min_start_ns: Some(max_start),
-            max_start_ns: Some(max_start),
-            start_time_nulls: 0,
-            fts_byte_size: Some(1),
-            created_at_ms: 1,
-            ..segment_meta("p", Level::L0, HourBucket(100))
-        };
-        NewSegment {
-            traces: vec![TraceRange {
-                trace_id: TraceId([1; 16]),
-                row_start: 0,
-                row_count: 1,
-            }],
-            meta,
-            blobs: vec![format!("blobs/p/{blob}")],
-        }
+        let mut s = l0(max_start, 1, vec![format!("blobs/p/{blob}")]);
+        s.meta.fts_byte_size = Some(1);
+        s
     };
     let old = mk(now_ns - 72 * h, "b_old"); // 3 days old, retention 1 day
     let live = mk(now_ns, "b_live");
@@ -67,14 +81,7 @@ async fn gc_end_to_end_on_local_fs() {
     }
     age(&root, orphan_seg, 30);
     age(&root, stray, 30);
-    m.commit_flush(FlushCommit {
-        node_id: "n".into(),
-        segments: vec![old.clone(), live.clone()],
-        flushed_wal_seq: 1,
-        max_version: 1,
-    })
-    .await
-    .unwrap();
+    m.commit_flush(flush(vec![old.clone(), live.clone()])).await.unwrap();
     m.set_retention_days(&pid("p"), Some(1)).await.unwrap();
 
     let mut o = GcOptions {
@@ -166,30 +173,9 @@ async fn data_clock_expires_wall_clock_purges() {
     let store = DurableLocalFs::new(d.path().join("data")).unwrap();
     let m = SqliteMetastore::open_path(&d.path().join("meta.db")).unwrap();
     let now = forge_model::time::now_ms();
-    let s = NewSegment {
-        meta: SegmentMeta {
-            min_start_ns: Some(now * 1_000_000),
-            max_start_ns: Some(now * 1_000_000),
-            start_time_nulls: 0,
-            created_at_ms: now,
-            ..segment_meta("p", Level::L0, HourBucket(100))
-        },
-        traces: vec![TraceRange {
-            trace_id: TraceId([1; 16]),
-            row_start: 0,
-            row_count: 1,
-        }],
-        blobs: vec![],
-    };
+    let s = l0(now * 1_000_000, now, vec![]);
     store.put(&Path::from(s.meta.path.as_str()), "x".into()).await.unwrap();
-    m.commit_flush(FlushCommit {
-        node_id: "n".into(),
-        segments: vec![s.clone()],
-        flushed_wal_seq: 1,
-        max_version: 1,
-    })
-    .await
-    .unwrap();
+    m.commit_flush(flush(vec![s.clone()])).await.unwrap();
     m.set_retention_days(&pid("p"), Some(1)).await.unwrap();
     let o = GcOptions {
         gc_grace: Duration::from_secs(3600),

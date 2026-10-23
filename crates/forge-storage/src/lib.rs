@@ -107,6 +107,20 @@ pub enum RowSelection {
     Range(std::ops::Range<u64>),
 }
 
+/// `rs` sorted by start, with ranges whose gap is at most `max_gap` rows merged (0: overlapping or adjacent only,
+/// i.e. exactly the same rows).
+pub fn coalesce_ranges(mut rs: Vec<std::ops::Range<u64>>, max_gap: u64) -> Vec<std::ops::Range<u64>> {
+    rs.sort_by_key(|r| r.start);
+    let mut out: Vec<std::ops::Range<u64>> = Vec::with_capacity(rs.len());
+    for r in rs {
+        match out.last_mut() {
+            Some(l) if r.start <= l.end.saturating_add(max_gap) => l.end = l.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScanRequest {
     /// `forge_model::schema::col` names; None = all. Output uses spans_schema types (Utf8, not Utf8View).
@@ -129,4 +143,9 @@ pub trait SegmentStore: Send + Sync + std::fmt::Debug + 'static {
     async fn scan(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<BatchStream>;
     /// The full store stack (later: prefix + fault injection + caching); forge-index reads .fts through it.
     fn object_store(&self) -> Arc<dyn ObjectStore>;
+    /// `scan`, collected.
+    async fn scan_all(&self, seg: &SegmentMeta, req: ScanRequest) -> StorageResult<Vec<RecordBatch>> {
+        use futures::TryStreamExt;
+        self.scan(seg, req).await?.try_collect().await
+    }
 }

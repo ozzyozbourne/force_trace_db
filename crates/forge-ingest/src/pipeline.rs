@@ -106,7 +106,7 @@ pub struct Pipeline {
     flush: FlushCtx,
     flush_lock: tokio::sync::Mutex<()>,
     /// Blob sweep vs `put_blobs` (plans/phase-4 §2.9).
-    blob_guard: Arc<BlobGuard>,
+    blob_guard: BlobGuard,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -120,8 +120,8 @@ impl std::fmt::Debug for Pipeline {
 
 impl Pipeline {
     /// The guard the blob sweep uses (`lifecycle::run_gc`).
-    pub fn blob_guard(&self) -> Arc<BlobGuard> {
-        self.blob_guard.clone()
+    pub fn blob_guard(&self) -> &BlobGuard {
+        &self.blob_guard
     }
 
     pub async fn open(
@@ -244,7 +244,7 @@ impl Pipeline {
                 inflight: Arc::default(),
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
-                blob_guard: Arc::default(),
+                blob_guard: BlobGuard::default(),
             }),
             OpenReport {
                 replay,

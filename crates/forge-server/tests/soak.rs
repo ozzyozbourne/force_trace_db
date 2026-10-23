@@ -69,7 +69,6 @@ impl DataClock {
 struct Logs {
     problems: Mutex<Vec<String>>,
     gc_passes: AtomicU64,
-    compactions: AtomicU64,
 }
 
 struct Capture(Arc<Logs>);
@@ -88,8 +87,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
         e.record(&mut m);
         if m.0.contains("message=gc pass done") {
             self.0.gc_passes.fetch_add(1, Ordering::Relaxed);
-        } else if m.0.contains("message=compaction done") {
-            self.0.compactions.fetch_add(1, Ordering::Relaxed);
         }
         if *e.metadata().level() <= tracing::Level::WARN {
             let line = format!("{} {}:{}", e.metadata().level(), e.metadata().target(), m.0);
@@ -510,7 +507,6 @@ async fn soak_scaled_48_data_hours() {
     c.gc_interval = Duration::from_secs(15);
     c.gc_grace = Duration::from_secs(120);
     c.orphan_grace = Duration::from_secs(600);
-    let gc_grace = c.gc_grace;
 
     let f = forge_server::Forge::open(cfg.clone()).await.expect("open");
     for (p, days) in [("soak", Some(1)), ("ctl", None)] {
@@ -568,21 +564,19 @@ async fn soak_scaled_48_data_hours() {
         "baseline (60 s load, no compaction): RSS median {:.1} MiB",
         baseline_rss / MIB
     );
-    let lc = forge_server::lifecycle::start_with(f.clone(), data_clock.clone())
-        .await
-        .expect("lifecycle");
+    let lc = forge_server::lifecycle::start_with(f.clone(), data_clock.clone());
 
     // The timed run: a sample every 10 s.
     let csv_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/soak");
     std::fs::create_dir_all(&csv_dir).expect("csv dir");
     let csv_path = csv_dir.join(format!("{}.csv", now_ms() / 1000));
     let mut csv = vec![CSV_HEADER.to_string()];
-    let mut probe = Some(Probe {
+    let mut probe = Probe {
         dir: dir.clone(),
         cfg: cfg.clone(),
         seen: HashMap::new(),
         kind_b: HashMap::new(),
-    });
+    };
     let mut rows: Vec<Row> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut last = (0.0f64, load.acked_spans.load(Ordering::Relaxed));
@@ -599,15 +593,7 @@ async fn soak_scaled_48_data_hours() {
         row.spans_per_s = (acked - last.1) as f64 / (row.t - last.0);
         last = (row.t, acked);
         let data_now = clock.now();
-        let mut p = probe.take().expect("probe");
-        let (p, row, bad) = tokio::task::spawn_blocking(move || {
-            let bad = p.sample(&mut row, data_now);
-            (p, row, bad)
-        })
-        .await
-        .expect("sample");
-        probe = Some(p);
-        failures.extend(bad);
+        failures.extend(tokio::task::block_in_place(|| probe.sample(&mut row, data_now)));
         if row.soak_l0 > 16 || row.ctl_l0 > 16 {
             failures.push(format!(
                 "t={:.0}s live L0 soak {} ctl {} > 16",
@@ -658,17 +644,14 @@ async fn soak_scaled_48_data_hours() {
             }
         }
     }
-    let o = GcOptions {
-        gc_grace,
-        ..GcOptions::from_config(&cfg.compaction)
-    };
+    let o = GcOptions::from_config(&cfg.compaction);
     let store = f.segments.object_store();
     let gc = run_gc(
         f.meta.as_ref(),
         store.as_ref(),
         &Clocks::at(frozen, now_ms()),
         &o,
-        &f.ingest.blob_guard(),
+        f.ingest.blob_guard(),
     )
     .await
     .expect("final gc");
@@ -771,7 +754,7 @@ async fn soak_scaled_48_data_hours() {
 
     // Objects and jobs at the end.
     let end = {
-        let c = probe.as_ref().expect("probe").conn();
+        let c = probe.conn();
         let q = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).expect(sql) };
         (
             q("SELECT count(*) FROM segments"),
@@ -783,7 +766,7 @@ async fn soak_scaled_48_data_hours() {
     if objects as i64 > 2 * end.0 + 4 {
         failures.push(format!("objects {objects} > 2 x {} segment rows + 4", end.0));
     }
-    if end.1 >= gc_grace.as_millis() as i64 {
+    if end.1 >= cfg.compaction.gc_grace.as_millis() as i64 {
         failures.push(format!("longest job {} ms >= gc_grace", end.1));
     }
     if failed_running != 0 {
@@ -799,7 +782,6 @@ async fn soak_scaled_48_data_hours() {
 
     // Windowed medians (scaled to FORGE_SOAK_SECS; 900 s: warm-up 3 min, minutes 5-7.5 vs the last 2.5 min).
     let s = secs as f64;
-    let series = |f: &dyn Fn(&Row) -> f64| rows.iter().map(|r| (r.t, f(r))).collect::<Vec<_>>();
     let rss_all = rss.lock().unwrap().clone();
     let (mid_lo, mid_hi, last_lo) = (s / 3.0, s / 2.0, s * 5.0 / 6.0);
     let rss_mid = median(&window(&rss_all, mid_lo, mid_hi));
@@ -822,12 +804,20 @@ async fn soak_scaled_48_data_hours() {
         ));
     }
     let mut medians = Vec::new();
-    for (name, f) in [
-        ("soak live L1", &(|r: &Row| r.soak_l1 as f64) as &dyn Fn(&Row) -> f64),
-        ("soak trace_index rows", &|r: &Row| r.trace_index_soak as f64),
-        ("meta.db + -wal bytes", &|r: &Row| r.meta_bytes as f64),
+    for (name, v) in [
+        (
+            "soak live L1",
+            rows.iter().map(|r| (r.t, r.soak_l1 as f64)).collect::<Vec<_>>(),
+        ),
+        (
+            "soak trace_index rows",
+            rows.iter().map(|r| (r.t, r.trace_index_soak as f64)).collect(),
+        ),
+        (
+            "meta.db + -wal bytes",
+            rows.iter().map(|r| (r.t, r.meta_bytes as f64)).collect(),
+        ),
     ] {
-        let v = series(f);
         let (mid, last) = (
             median(&window(&v, mid_lo, mid_hi)),
             median(&window(&v, last_lo, s + 60.0)),

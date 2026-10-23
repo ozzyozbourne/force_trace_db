@@ -24,7 +24,6 @@ use forge_model::testing::{
 use forge_model::time::Clocks;
 use forge_storage::testing::{HookedSegmentStore, memory_store};
 use forge_storage::{ScanRequest, SegmentSpec, SegmentStore};
-use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +62,7 @@ fn delay_store(inner: Arc<dyn SegmentStore>, delay: Delay) -> Arc<dyn SegmentSto
 // ---------------------------------------------------------------------------------------------------------------
 // Coverage (printed always, asserted when >= 8 seeds ran in total).
 
-const COV: [&str; 21] = [
+const COV: &[&str] = &[
     "picker_suffix",
     "jobs_a",
     "jobs_b",
@@ -86,12 +85,13 @@ const COV: [&str; 21] = [
     "b_committed_first",
     "gc_passes",
 ];
-static TOTALS: [AtomicU64; 21] = [const { AtomicU64::new(0) }; 21];
+const N: usize = COV.len();
+static TOTALS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static SEEDS_RUN: AtomicU64 = AtomicU64::new(0);
 static SHARDS_DONE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
-struct Cov([u64; 21]);
+struct Cov([u64; N]);
 impl Cov {
     fn bump(&mut self, name: &str, n: u64) {
         self.0[COV.iter().position(|c| *c == name).expect("counter")] += n;
@@ -179,13 +179,7 @@ struct World {
 }
 
 async fn scan(store: &dyn SegmentStore, s: &SegmentMeta) -> Vec<RecordBatch> {
-    store
-        .scan(s, ScanRequest::default())
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap()
+    store.scan_all(s, ScanRequest::default()).await.unwrap()
 }
 
 fn key_of(k: &RowKey) -> String {
@@ -601,11 +595,12 @@ impl World {
                 inputs,
             };
             if kind == JobKind::L1 {
-                let in_hour: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L1).collect();
                 let hour = segs.iter().find(|s| s.id == req.inputs[0]).unwrap().partition_hour;
-                let in_hour: Vec<&SegmentMeta> = in_hour.into_iter().filter(|s| s.partition_hour == hour).collect();
-                self.cov
-                    .bump("picker_suffix", u64::from(req.inputs.len() < in_hour.len()));
+                let in_hour = segs
+                    .iter()
+                    .filter(|s| s.level == Level::L1 && s.partition_hour == hour)
+                    .count();
+                self.cov.bump("picker_suffix", u64::from(req.inputs.len() < in_hour));
             }
             self.run(req, cfg).await;
         }
@@ -616,12 +611,8 @@ impl World {
         let seed = self.seed;
         let p = PROJECTS[r.below(2) as usize];
         let segs = self.visible(Some(p)).await;
-        let mut l0: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L0).collect();
-        l0.sort_by_key(|s| s.min_version);
-        let mut hours: BTreeMap<HourBucket, Vec<&SegmentMeta>> = BTreeMap::new();
-        for s in segs.iter().filter(|s| s.level == Level::L1) {
-            hours.entry(s.partition_hour).or_default().push(s);
-        }
+        let refs: Vec<&SegmentMeta> = segs.iter().collect();
+        let (l0, hours) = pick::layout(&refs);
         let req = |kind, inputs: Vec<SegmentId>| JobRequest {
             project_id: forge_model::testing::pid(p),
             kind,
@@ -741,12 +732,8 @@ impl World {
         let seed = self.seed;
         let p = PROJECTS[r.below(2) as usize];
         let segs = self.visible(Some(p)).await;
-        let mut l0: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L0).collect();
-        l0.sort_by_key(|s| s.min_version);
-        let mut hours: BTreeMap<HourBucket, Vec<&SegmentMeta>> = BTreeMap::new();
-        for s in segs.iter().filter(|s| s.level == Level::L1) {
-            hours.entry(s.partition_hour).or_default().push(s);
-        }
+        let refs: Vec<&SegmentMeta> = segs.iter().collect();
+        let (l0, hours) = pick::layout(&refs);
         if l0.is_empty() || hours.is_empty() {
             return;
         }

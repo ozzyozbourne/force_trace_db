@@ -150,7 +150,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             project,
             data_dir,
             format,
-        } => compact(&project, data_dir.as_deref(), format, cli.config.as_deref()).await,
+        } => {
+            compact(
+                &Offline::open(data_dir.as_deref(), cli.config.as_deref()).await?,
+                &project,
+                format,
+            )
+            .await
+        }
         Cmd::Gc {
             dry_run,
             data_dir,
@@ -159,14 +166,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             format,
         } => {
             let o = Offline::open(data_dir.as_deref(), cli.config.as_deref()).await?;
-            let c = &o.cfg.compaction;
-            let opts = forge_ingest::lifecycle::GcOptions {
-                gc_grace: gc_grace.unwrap_or(c.gc_grace),
-                orphan_grace: orphan_grace.unwrap_or(c.orphan_grace),
-                dry_run,
-                ..forge_ingest::lifecycle::GcOptions::from_config(c)
-            };
-            gc(&o, opts, format).await
+            gc(&o, dry_run, gc_grace, orphan_grace, format).await
         }
         Cmd::Bench(_) => not_yet("bench", Unimplemented("M6")),
     }
@@ -212,15 +212,9 @@ async fn remote_sql(url: &str, query: &str) -> anyhow::Result<Vec<u8>> {
 
 /// The same envelope, computed in process over the flushed segments of `--data-dir` (or the config's URLs).
 async fn offline_sql(a: &SqlArgs, config: Option<&std::path::Path>) -> anyhow::Result<Vec<u8>> {
-    use forge_model::config::{DATA_DIR, META_DB};
     use std::io::Write;
     let cfg = match &a.data_dir {
-        Some(d) => {
-            if !d.join(META_DB).is_file() || !d.join(DATA_DIR).is_dir() {
-                anyhow::bail!("no Forge data at {}", d.display());
-            }
-            ForgeConfig::rooted_at(d)
-        }
+        Some(d) => data_dir_config(d)?,
         None => {
             let cfg = ForgeConfig::load(config).context("loading config")?;
             // build_object_store creates a missing file:// root: refuse instead.
@@ -233,9 +227,7 @@ async fn offline_sql(a: &SqlArgs, config: Option<&std::path::Path>) -> anyhow::R
         }
     };
     let meta = forge_meta::open_read_only(&cfg.metastore).await?;
-    let store = std::sync::Arc::new(forge_storage::VortexSegmentStore::new(
-        forge_storage::build_object_store(&cfg.storage)?,
-    ));
+    let store = segment_store(&cfg)?;
     let engine = forge_query::QueryEngine::new(meta, store, std::sync::Arc::new(forge_model::EmptyMemtable), cfg.query);
     writeln!(std::io::stderr().lock(), "{OFFLINE_NOTE}")?;
     let req = forge_query::sql::SqlRequest {
@@ -245,6 +237,20 @@ async fn offline_sql(a: &SqlArgs, config: Option<&std::path::Path>) -> anyhow::R
     };
     use forge_model::error::Classify;
     engine.sql_json(&req).await.map_err(|e| anyhow::anyhow!(e.message()))
+}
+
+/// `--data-dir d`: the config rooted at `d`, which must hold Forge data.
+fn data_dir_config(d: &std::path::Path) -> anyhow::Result<ForgeConfig> {
+    use forge_model::config::{DATA_DIR, META_DB};
+    if !d.join(META_DB).is_file() || !d.join(DATA_DIR).is_dir() {
+        anyhow::bail!("no Forge data at {}", d.display());
+    }
+    Ok(ForgeConfig::rooted_at(d))
+}
+
+fn segment_store(cfg: &ForgeConfig) -> anyhow::Result<std::sync::Arc<dyn forge_storage::SegmentStore>> {
+    let built = forge_storage::build_object_store(&cfg.storage)?;
+    Ok(std::sync::Arc::new(forge_storage::VortexSegmentStore::new(built)))
 }
 
 /// `forge compact`/`forge gc` refuse to run next to a server (exit code 3; plans/phase-4 D12).
@@ -274,14 +280,8 @@ struct Offline {
 
 impl Offline {
     async fn open(data_dir: Option<&std::path::Path>, config: Option<&std::path::Path>) -> anyhow::Result<Self> {
-        use forge_model::config::{DATA_DIR, META_DB};
         let cfg = match data_dir {
-            Some(d) => {
-                if !d.join(META_DB).is_file() || !d.join(DATA_DIR).is_dir() {
-                    anyhow::bail!("no Forge data at {}", d.display());
-                }
-                ForgeConfig::rooted_at(d)
-            }
+            Some(d) => data_dir_config(d)?,
             None => {
                 let cfg = ForgeConfig::load(config).context("loading config")?;
                 // build_object_store and the metastore open create missing data: refuse instead.
@@ -325,9 +325,7 @@ impl Offline {
             }
         }
         let meta = forge_meta::open(&cfg.metastore).await?;
-        let segments: std::sync::Arc<dyn forge_storage::SegmentStore> = std::sync::Arc::new(
-            forge_storage::VortexSegmentStore::new(forge_storage::build_object_store(&cfg.storage)?),
-        );
+        let segments = segment_store(&cfg)?;
         let mut wal = Vec::new();
         for d in &dirs {
             let node = d
@@ -335,11 +333,7 @@ impl Offline {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let flushed = meta.wal_checkpoint(&node).await?.map_or(0, |c| c.flushed_seq);
-            let mut n = 0u64;
-            forge_ingest::wal::replay(d, flushed, |_, _| {
-                n += 1;
-                Ok::<_, String>(())
-            })?;
+            let n = forge_ingest::wal::replay(d, flushed, |_, _| Ok::<_, String>(()))?.applied;
             wal.push((node, n));
         }
         meta.reset_compactions().await?;
@@ -353,14 +347,8 @@ impl Offline {
     }
 }
 
-async fn compact(
-    project: &str,
-    data_dir: Option<&std::path::Path>,
-    format: Format,
-    config: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+async fn compact(o: &Offline, project: &str, format: Format) -> anyhow::Result<()> {
     use std::io::Write;
-    let o = Offline::open(data_dir, config).await?;
     let p = forge_model::ids::ProjectId::new(project)?;
     if o.meta.get_project(&p).await?.is_none() {
         anyhow::bail!("no project {project:?}");
@@ -416,7 +404,13 @@ async fn compact(
 }
 
 /// `forge gc`: blobs only when no node directory has WAL records past its own checkpoint (lifecycle.md §4).
-async fn gc(o: &Offline, mut opts: forge_ingest::lifecycle::GcOptions, format: Format) -> anyhow::Result<()> {
+async fn gc(
+    o: &Offline,
+    dry_run: bool,
+    gc_grace: Option<std::time::Duration>,
+    orphan_grace: Option<std::time::Duration>,
+    format: Format,
+) -> anyhow::Result<()> {
     use std::io::Write;
     let unflushed: Vec<String> = o
         .wal
@@ -424,7 +418,13 @@ async fn gc(o: &Offline, mut opts: forge_ingest::lifecycle::GcOptions, format: F
         .filter(|(_, n)| *n > 0)
         .map(|(node, n)| format!("WAL of {node} has {n} unflushed records"))
         .collect();
-    opts.sweep_blobs = unflushed.is_empty();
+    let c = &o.cfg.compaction;
+    let opts = forge_ingest::lifecycle::GcOptions {
+        gc_grace: gc_grace.unwrap_or(c.gc_grace),
+        orphan_grace: orphan_grace.unwrap_or(c.orphan_grace),
+        sweep_blobs: unflushed.is_empty(),
+        dry_run,
+    };
     let now = forge_model::time::now_ms();
     let store = o.segments.object_store();
     // `Offline::open` holds every node's WAL lock: no other writer can put blobs, so an empty guard is exact.

@@ -125,19 +125,12 @@ async fn assert_reference(fx: &Fixture, ctx: &str) {
 async fn dotted_by_key(engine: &QueryEngine) -> BTreeMap<RowKey, Option<String>> {
     use arrow::array::{Array, AsArray};
     let b = sql(engine, "SELECT project_id, trace_id, span_id, dotted_order FROM spans").await;
-    let (p, t, s, d) = (
-        b.column(0).as_string::<i32>(),
-        b.column(1).as_binary::<i32>(),
-        b.column(2).as_binary::<i32>(),
-        b.column(3).as_string::<i32>(),
-    );
-    (0..b.num_rows())
-        .map(|i| {
-            let k = (
-                p.value(i).to_string(),
-                TraceId::from_slice(t.value(i)).unwrap(),
-                forge_model::ids::SpanId::from_slice(s.value(i)).unwrap(),
-            );
+    let (p, d) = (b.column(0).as_string::<i32>(), b.column(3).as_string::<i32>());
+    let keys = forge_model::row::span_keys(&b).unwrap();
+    keys.into_iter()
+        .enumerate()
+        .map(|(i, (t, s))| {
+            let k = (p.value(i).to_string(), t, s);
             (k, d.is_valid(i).then(|| d.value(i).to_string()))
         })
         .collect()

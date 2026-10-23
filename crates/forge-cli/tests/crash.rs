@@ -465,12 +465,20 @@ impl Case {
     }
 }
 
-/// Load until the failpoint SIGKILLs the server, restart, verify.
-async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
+/// Load until the failpoint SIGKILLs the server, restart, verify (A–O). A compaction/GC failpoint passes
+/// `Some(after_restart)`: the load runs with compaction on, then `after_restart` (before S, whose `forge compact`
+/// adds jobs), then P, R, S.
+async fn crash_case(fp: &str, interval: &str, orphans: Orphans, compaction: Option<fn(&Path)>) -> Replay {
     let c = Case::new("5s");
-    c.kill_under_load(fp, interval, &[]).await;
+    let extra: &[_] = if compaction.is_some() { &COMPACTION_ON } else { &[] };
+    c.kill_under_load(fp, interval, extra).await;
     let replay = restart_and_post(c.dir(), &c.ledger).await;
-    verify_with_sql(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
+    let ctx = format!("{fp} {replay:?}");
+    verify_with_sql(c.dir(), &c.ledger, orphans, &ctx).await;
+    if let Some(after_restart) = compaction {
+        after_restart(c.dir());
+        check_prs(c.dir(), &ctx).await;
+    }
     replay
 }
 
@@ -502,14 +510,9 @@ fn segment_paths(dir: &Path, cond: &str) -> Vec<String> {
 }
 
 /// P: no `compacting` segment and no `running` job.
-fn check_p(dir: &Path, ctx: &str) {
-    let compacting = common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'");
-    let running = common::meta_count(dir, "SELECT count(*) FROM compaction_jobs WHERE status = 'running'");
-    assert_eq!(
-        (compacting, running),
-        (0, 0),
-        "{ctx} P: compacting segments, running jobs"
-    );
+fn p_holds(dir: &Path) -> bool {
+    common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'") == 0
+        && common::meta_count(dir, "SELECT count(*) FROM compaction_jobs WHERE status = 'running'") == 0
 }
 
 /// R (sticky): every key of the visible L1 segments lies in one hour. Returns the number of L1 segments.
@@ -567,7 +570,7 @@ fn answers(dir: &Path) -> Vec<String> {
 /// P, R, then S: offline `forge compact` + `forge gc` (zero graces) leave every answer byte-identical, purge
 /// every deleted row and leave no object without a visible row.
 async fn check_prs(dir: &Path, ctx: &str) {
-    check_p(dir, ctx);
+    assert!(p_holds(dir), "{ctx} P: compacting segments or running jobs");
     check_r(dir, ctx).await;
     let before = answers(dir);
     let d = dir.to_str().unwrap();
@@ -593,18 +596,6 @@ async fn check_prs(dir: &Path, ctx: &str) {
     assert!(check_r(dir, ctx).await > 0, "{ctx} R: no L1 after forge compact");
 }
 
-/// A compaction/GC failpoint: load with compaction on until the kill, restart with it off, then A–O, P, R, S.
-/// `after_restart` runs before S (whose `forge compact` adds jobs).
-async fn compaction_case(fp: &str, orphans: Orphans, after_restart: impl FnOnce(&Path)) {
-    let c = Case::new("5s");
-    c.kill_under_load(fp, "300ms", &COMPACTION_ON).await;
-    let replay = restart_and_post(c.dir(), &c.ledger).await;
-    let ctx = format!("{fp} {replay:?}");
-    verify_with_sql(c.dir(), &c.ledger, orphans, &ctx).await;
-    after_restart(c.dir());
-    check_prs(c.dir(), &ctx).await;
-}
-
 async fn timed<T>(f: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(120), f)
         .await
@@ -613,55 +604,55 @@ async fn timed<T>(f: impl Future<Output = T>) -> T {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_wal_torn_write() {
-    let r = timed(crash_case("wal_torn_write@20", "1h", Orphans::Zero)).await;
+    let r = timed(crash_case("wal_torn_write@20", "1h", Orphans::Zero, None)).await;
     assert!(r.truncated, "{r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_wal_lose_unsynced() {
-    timed(crash_case("wal_lose_unsynced@20", "1h", Orphans::Zero)).await;
+    timed(crash_case("wal_lose_unsynced@20", "1h", Orphans::Zero, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_wal_before_fsync() {
-    timed(crash_case("wal_before_fsync@20", "1h", Orphans::Zero)).await;
+    timed(crash_case("wal_before_fsync@20", "1h", Orphans::Zero, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_wal_after_fsync() {
-    let r = timed(crash_case("wal_after_fsync@20", "1h", Orphans::Zero)).await;
+    let r = timed(crash_case("wal_after_fsync@20", "1h", Orphans::Zero, None)).await;
     assert!(r.applied > 0, "{r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_flush_before_upload() {
-    timed(crash_case("flush_before_upload@1", "300ms", Orphans::Zero)).await;
+    timed(crash_case("flush_before_upload@1", "300ms", Orphans::Zero, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_upload_before_fsync() {
-    timed(crash_case("upload_before_fsync@1", "300ms", Orphans::AtLeastOne)).await;
+    timed(crash_case("upload_before_fsync@1", "300ms", Orphans::AtLeastOne, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_upload_lose_unsynced() {
-    timed(crash_case("upload_lose_unsynced@1", "300ms", Orphans::Zero)).await;
+    timed(crash_case("upload_lose_unsynced@1", "300ms", Orphans::Zero, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_after_upload() {
-    timed(crash_case("flush_after_upload@1", "300ms", Orphans::AtLeastOne)).await;
+    timed(crash_case("flush_after_upload@1", "300ms", Orphans::AtLeastOne, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_in_commit_txn() {
-    let r = timed(crash_case("meta_commit_in_txn@1", "300ms", Orphans::AtLeastOne)).await;
+    let r = timed(crash_case("meta_commit_in_txn@1", "300ms", Orphans::AtLeastOne, None)).await;
     assert_eq!(r.skipped, 0, "the first commit rolled back: {r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_after_commit() {
-    let r = timed(crash_case("flush_after_commit@1", "300ms", Orphans::Zero)).await;
+    let r = timed(crash_case("flush_after_commit@1", "300ms", Orphans::Zero, None)).await;
     assert!(r.skipped > 0, "{r:?}");
 }
 
@@ -758,45 +749,73 @@ async fn crash_random_sigkill() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_meta_lease_in_txn() {
-    timed(compaction_case("meta_lease_in_txn@1", Orphans::Any, |d| {
-        assert_eq!(
-            common::meta_count(d, "SELECT count(*) FROM compaction_jobs"),
-            0,
-            "the begin txn rolled back"
-        );
-    }))
+    timed(crash_case(
+        "meta_lease_in_txn@1",
+        "300ms",
+        Orphans::Any,
+        Some(|d| {
+            assert_eq!(
+                common::meta_count(d, "SELECT count(*) FROM compaction_jobs"),
+                0,
+                "the begin txn rolled back"
+            );
+        }),
+    ))
     .await;
 }
 
 /// The restart runs with `interval = 0`: P proves the reset at open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_compact_after_lease() {
-    timed(compaction_case("compact_after_lease@1", Orphans::Any, |d| {
-        let failed = common::meta_count(d, "SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
-        assert!(failed >= 1, "the killed job was reset to failed");
-    }))
+    timed(crash_case(
+        "compact_after_lease@1",
+        "300ms",
+        Orphans::Any,
+        Some(|d| {
+            let failed = common::meta_count(d, "SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
+            assert!(failed >= 1, "the killed job was reset to failed");
+        }),
+    ))
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_compact_after_upload() {
-    timed(compaction_case("compact_after_upload@1", Orphans::AtLeastOne, |_| {})).await;
+    timed(crash_case(
+        "compact_after_upload@1",
+        "300ms",
+        Orphans::AtLeastOne,
+        Some(|_| {}),
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_meta_compact_in_txn() {
-    timed(compaction_case("meta_compact_in_txn@1", Orphans::AtLeastOne, |_| {})).await;
+    timed(crash_case(
+        "meta_compact_in_txn@1",
+        "300ms",
+        Orphans::AtLeastOne,
+        Some(|_| {}),
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_compact_after_swap() {
-    timed(compaction_case("compact_after_swap@1", Orphans::Any, |_| {})).await;
+    timed(crash_case("compact_after_swap@1", "300ms", Orphans::Any, Some(|_| {}))).await;
 }
 
 /// S4 proves the next GC forgets the row whose object is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_gc_after_object_delete() {
-    timed(compaction_case("gc_after_object_delete@1", Orphans::Any, |_| {})).await;
+    timed(crash_case(
+        "gc_after_object_delete@1",
+        "300ms",
+        Orphans::Any,
+        Some(|_| {}),
+    ))
+    .await;
 }
 
 /// Not a kill: the merge task panics, the job fails before any commit attempt, later jobs succeed, and P holds
@@ -830,12 +849,8 @@ async fn crash_compact_merge_panic() {
         for t in tasks {
             let _ = t.await;
         }
-        let quiet = || {
-            common::meta_count(dir, "SELECT count(*) FROM segments WHERE state = 'compacting'") == 0
-                && jobs("running") == 0
-        };
         until(
-            &quiet,
+            &|| p_holds(dir),
             "P: no compacting segment and no running job once the load stops",
         );
         assert!(jobs("failed") >= 1, "{}", s.logs());

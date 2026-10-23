@@ -70,19 +70,26 @@ fn rewrite(segs: &[&SegmentMeta], closed: bool, force: bool, max_bytes: u64) -> 
     trigger.then(|| suffix.iter().map(|s| s.id).collect())
 }
 
-pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<SegmentId>)> {
-    let segs: Vec<&SegmentMeta> = i.segs.iter().filter(|s| s.state.is_visible()).collect();
-    let expired = |h: HourBucket| i.expired_before_ns.is_some_and(|c| h.expired_by(c));
+/// Segments split into the L0s, oldest first, and the L1s by hour.
+#[allow(clippy::type_complexity)]
+pub fn layout<'a>(segs: &[&'a SegmentMeta]) -> (Vec<&'a SegmentMeta>, BTreeMap<HourBucket, Vec<&'a SegmentMeta>>) {
+    let mut l0: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L0).copied().collect();
+    l0.sort_by_key(|s| s.min_version);
     let mut hours: BTreeMap<HourBucket, Vec<&SegmentMeta>> = BTreeMap::new();
     for s in segs.iter().filter(|s| s.level == Level::L1) {
         hours.entry(s.partition_hour).or_default().push(s);
     }
+    (l0, hours)
+}
+
+pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<SegmentId>)> {
+    let segs: Vec<&SegmentMeta> = i.segs.iter().filter(|s| s.state.is_visible()).collect();
+    let expired = |h: HourBucket| i.expired_before_ns.is_some_and(|c| h.expired_by(c));
+    let (l0, hours) = layout(&segs);
     let all_live = |runs: &[&SegmentMeta]| runs.iter().all(|s| s.state == SegmentState::Live);
     let max_bytes = cfg.max_job_bytes.as_u64();
 
     // Kind A: the oldest-first L0 prefix, plus whole small hours it touches.
-    let mut l0: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L0).copied().collect();
-    l0.sort_by_key(|s| s.min_version);
     if !l0.is_empty() && all_live(&l0) {
         let oldest = l0.iter().map(|s| s.created_at_ms).min().unwrap_or(i64::MAX);
         let max_age = i64::try_from(cfg.l0_max_age.as_millis()).unwrap_or(i64::MAX);

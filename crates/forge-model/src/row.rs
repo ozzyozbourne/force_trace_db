@@ -263,6 +263,16 @@ pub fn validate_projected(schema: &SchemaRef, b: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+/// The (trace_id, span_id) of every row of `b` (any projection holding both columns).
+pub fn span_keys(b: &RecordBatch) -> Result<Vec<(TraceId, SpanId)>> {
+    let s = b.schema();
+    let t = b.column(s.index_of(col::TRACE_ID)?).as_binary::<i32>();
+    let sp = b.column(s.index_of(col::SPAN_ID)?).as_binary::<i32>();
+    (0..b.num_rows())
+        .map(|i| Ok((TraceId::from_slice(t.value(i))?, SpanId::from_slice(sp.value(i))?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

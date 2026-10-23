@@ -2,7 +2,7 @@
 //! reference helpers that do not use the code under test.
 #![allow(dead_code)]
 
-use arrow::array::{AsArray, RecordBatch};
+use arrow::array::RecordBatch;
 use forge_meta::Metastore;
 use forge_model::MemtableView;
 use forge_model::catalog::HourBucket;
@@ -622,17 +622,7 @@ pub fn ref_batch(rows: &[SpanRow], cols: &[&str]) -> RecordBatch {
 
 /// (trace, span) of every row, by column name.
 pub fn keys_of(b: &RecordBatch) -> Vec<(TraceId, SpanId)> {
-    let s = b.schema();
-    let t = b.column(s.index_of(col::TRACE_ID).unwrap()).as_binary::<i32>();
-    let sp = b.column(s.index_of(col::SPAN_ID).unwrap()).as_binary::<i32>();
-    (0..b.num_rows())
-        .map(|i| {
-            (
-                TraceId::from_slice(t.value(i)).unwrap(),
-                SpanId::from_slice(sp.value(i)).unwrap(),
-            )
-        })
-        .collect()
+    forge_model::row::span_keys(b).unwrap()
 }
 
 pub fn names_of(b: &RecordBatch) -> Vec<&str> {

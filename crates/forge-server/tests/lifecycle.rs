@@ -60,7 +60,7 @@ async fn lifecycle_compacts_and_purges() {
         .map(|s| s.path)
         .collect();
     assert_eq!(l0_paths.len(), 6);
-    let lc = forge_server::lifecycle::start(f.clone()).await.unwrap();
+    let lc = forge_server::lifecycle::start(f.clone());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
@@ -89,7 +89,7 @@ async fn zero_intervals_start_no_ticker() {
     let f = forge_server::Forge::open(cfg(d.path(), Duration::ZERO, Duration::ZERO))
         .await
         .unwrap();
-    let lc = forge_server::lifecycle::start(f.clone()).await.unwrap();
+    let lc = forge_server::lifecycle::start(f.clone());
     six_flushes(&f).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();

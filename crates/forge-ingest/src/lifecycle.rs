@@ -20,9 +20,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 /// Rows per purge batch, L1 hours per retention txn.
-pub const BATCH: usize = 1000;
+const BATCH: usize = 1000;
 /// Blobs deleted per write-lock hold of the `BlobGuard` (no HEAD under the lock; RA m11).
-pub const BLOB_CHUNK: usize = 64;
+const BLOB_CHUNK: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
@@ -38,8 +38,8 @@ pub struct GcOptions {
     pub gc_grace: Duration,
     /// Objects unknown to the metastore are kept this long after last_modified (uploads not committed yet).
     pub orphan_grace: Duration,
-    /// Sweep `blobs/` too. False when a referencing row might be unflushed for longer than `orphan_grace`
-    /// (`forge gc` while a server runs, or with WAL records past the checkpoint; lifecycle.md §4).
+    /// Sweep `blobs/` too. `forge gc` sets it false when a WAL has records past its checkpoint: their blob refs
+    /// are not in `blob_refs` yet (lifecycle.md §4). The server always sweeps (its `BlobGuard` covers new puts).
     pub sweep_blobs: bool,
     /// Report only; change nothing.
     pub dry_run: bool,
@@ -71,7 +71,7 @@ pub struct GcReport {
 /// Retention (data clock): marks expired segments of every project with `retention_days` deleted
 /// (`Metastore::expire_segments`). Returns the count. Dry run: counts the same candidates
 /// (`Metastore::expire_candidates`) without marking.
-pub async fn expire(meta: &dyn Metastore, data_now_ms: i64, dry_run: bool) -> Result<usize, GcError> {
+async fn expire(meta: &dyn Metastore, data_now_ms: i64, dry_run: bool) -> Result<usize, GcError> {
     let mut n = 0;
     for p in meta.list_projects().await? {
         let Some(days) = p.retention_days else { continue };
@@ -100,7 +100,7 @@ fn segment_objects(s: &SegmentMeta) -> impl Iterator<Item = Path> {
 }
 
 /// Purge: objects of segments deleted before `now - gc_grace`, then their rows.
-pub async fn purge(
+async fn purge(
     meta: &dyn Metastore,
     store: &dyn ObjectStore,
     now_ms: i64,
@@ -110,12 +110,12 @@ pub async fn purge(
     let before = now_ms.saturating_sub(o.gc_grace.as_millis() as i64);
     loop {
         let segs = meta.purge_candidates(before, BATCH).await?;
+        r.freed_bytes += segs
+            .iter()
+            .map(|s| s.byte_size + s.fts_byte_size.unwrap_or(0))
+            .sum::<u64>();
         if o.dry_run {
             r.purged_segments += segs.len();
-            r.freed_bytes += segs
-                .iter()
-                .map(|s| s.byte_size + s.fts_byte_size.unwrap_or(0))
-                .sum::<u64>();
             return Ok(());
         }
         let objects = segs.iter().flat_map(segment_objects).collect();
@@ -123,10 +123,6 @@ pub async fn purge(
         forge_model::failpoint::hit("gc_after_object_delete");
         let ids: Vec<_> = segs.iter().map(|s| s.id).collect();
         r.purged_segments += meta.forget_segments(&ids).await?;
-        r.freed_bytes += segs
-            .iter()
-            .map(|s| s.byte_size + s.fts_byte_size.unwrap_or(0))
-            .sum::<u64>();
         if segs.len() < BATCH {
             return Ok(());
         }
@@ -158,7 +154,7 @@ async fn old_objects(
 
 /// Orphan sweep. The listing comes first and the metastore read second: an object committed in between is in
 /// the known set; one committed later is younger than `orphan_grace` and was never a candidate.
-pub async fn sweep_orphans(
+async fn sweep_orphans(
     meta: &dyn Metastore,
     store: &dyn ObjectStore,
     now_ms: i64,

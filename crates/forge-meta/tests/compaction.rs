@@ -105,14 +105,8 @@ async fn begin_rules_kind_a() {
     assert!(d.begin(JobKind::L0, &[&a, &r1]).await.is_none(), "partial fold");
     assert!(d.begin(JobKind::L1, &[&a]).await.is_none(), "kind B over L0");
     assert!(d.begin(JobKind::L0, &[&r1, &r2]).await.is_none(), "kind A without L0");
-    let q = SegmentMeta {
-        project_id: pid("q"),
-        ..seg(Level::L0, 1, (16, 17), 9).meta
-    };
-    let q = NewSegment {
-        meta: q,
-        ..seg(Level::L0, 1, (16, 17), 9)
-    };
+    let mut q = seg(Level::L0, 1, (16, 17), 9);
+    q.meta.project_id = pid("q");
     d.flush(&[&q], 5).await;
     assert!(d.begin(JobKind::L0, &[&a, &q]).await.is_none(), "other project");
     assert_eq!(d.snapshot(), before, "every rejection writes nothing");
@@ -268,13 +262,8 @@ async fn swap_is_atomic() {
     d.flush(&[&b], 2).await;
     let j = d.begin(JobKind::L0, &[&a]).await.unwrap();
     let o0 = seg(Level::L1, 1, (10, 11), 1);
-    let dup = NewSegment {
-        meta: SegmentMeta {
-            id: b.meta.id, // already exists
-            ..seg(Level::L1, 1, (10, 11), 7).meta
-        },
-        ..seg(Level::L1, 1, (10, 11), 7)
-    };
+    let mut dup = seg(Level::L1, 1, (10, 11), 7);
+    dup.meta.id = b.meta.id; // already exists
     assert!(d.m.commit_compaction(commit(&j, vec![o0.clone(), dup])).await.is_err());
     assert_eq!(d.state(&a).await, SegmentState::Compacting);
     assert_eq!(

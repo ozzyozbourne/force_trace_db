@@ -2,6 +2,7 @@
 use crate::app::Forge;
 use forge_ingest::compact::{CompactCtx, run_next};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
+use forge_model::merge::Cancel;
 use forge_model::time::{Clock, Clocks, wall_clock};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 pub struct LifecycleTasks {
     stop: CancellationToken,
-    cx: Arc<CompactCtx>,
+    /// The running jobs' cancel flag (`CompactCtx::cancel`).
+    cancel: Cancel,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -20,7 +22,7 @@ impl LifecycleTasks {
     /// outputs become orphans, and the next start resets the job (`Forge::open`).
     pub async fn shutdown(self, grace: Duration) {
         self.stop.cancel();
-        self.cx.cancel.cancel();
+        self.cancel.cancel();
         let abort = self.handle.abort_handle();
         if tokio::time::timeout(grace, self.handle).await.is_err() {
             tracing::warn!(?grace, "lifecycle: running compactions abandoned at shutdown");
@@ -30,12 +32,12 @@ impl LifecycleTasks {
 }
 
 /// Call after `Forge::open` (WAL replay done) and before the listeners.
-pub async fn start(f: Arc<Forge>) -> anyhow::Result<LifecycleTasks> {
-    start_with(f, wall_clock()).await
+pub fn start(f: Arc<Forge>) -> LifecycleTasks {
+    start_with(f, wall_clock())
 }
 
 /// `data_clock`: retention cutoff and "hour closed/expired" (D10); everything else is the wall clock.
-pub async fn start_with(f: Arc<Forge>, data_clock: Clock) -> anyhow::Result<LifecycleTasks> {
+pub fn start_with(f: Arc<Forge>, data_clock: Clock) -> LifecycleTasks {
     let clocks = Clocks {
         data: data_clock,
         wall: wall_clock(),
@@ -47,8 +49,9 @@ pub async fn start_with(f: Arc<Forge>, data_clock: Clock) -> anyhow::Result<Life
         clocks,
     ));
     let stop = CancellationToken::new();
-    let handle = tokio::spawn(run(f, cx.clone(), stop.clone()));
-    Ok(LifecycleTasks { stop, cx, handle })
+    let cancel = cx.cancel.clone();
+    let handle = tokio::spawn(run(f, cx, stop.clone()));
+    LifecycleTasks { stop, cancel, handle }
 }
 
 /// A period of zero disables the tick (tokio's `interval` panics on zero).
@@ -94,7 +97,7 @@ async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, stop: CancellationToken) {
             }
             _ = tick(&mut gc_tick) => {
                 let store = f.segments.object_store();
-                match run_gc(f.meta.as_ref(), store.as_ref(), &cx.clocks, &GcOptions::from_config(&c), &blobs).await {
+                match run_gc(f.meta.as_ref(), store.as_ref(), &cx.clocks, &GcOptions::from_config(&c), blobs).await {
                     Ok(r) => tracing::info!(?r, "gc pass done"),
                     Err(e) => tracing::warn!(error = %e, "gc pass failed; retried next interval"),
                 }

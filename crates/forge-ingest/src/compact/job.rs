@@ -14,9 +14,9 @@ use forge_model::failpoint;
 use forge_model::ids::{ProjectId, SpanId, TraceId};
 use forge_model::merge::{Tombstones, merge_versions_projected, sort_physical};
 use forge_model::retry::{Backoff, retry_bounded};
+use forge_model::row::span_keys;
 use forge_model::schema::{TIMEZONE, col, col_idx, projected_schema, spans_schema};
-use forge_storage::{RowSelection, ScanRequest, SegmentSpec, SegmentStore};
-use futures::TryStreamExt;
+use forge_storage::{RowSelection, ScanRequest, SegmentSpec, SegmentStore, coalesce_ranges};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,8 +186,6 @@ struct Writers {
     done: Vec<NewSegment>,
     /// Every object of every output started (deleted when the job fails before its commit).
     objects: Vec<object_store::path::Path>,
-    rotated: u32,
-    capped: u32,
     tick: u64,
 }
 
@@ -199,8 +197,6 @@ impl Writers {
             open: BTreeMap::new(),
             done: Vec::new(),
             objects: Vec::new(),
-            rotated: 0,
-            capped: 0,
             tick: 0,
         }
     }
@@ -220,7 +216,7 @@ impl Writers {
     /// Sends one routed, sorted batch (whole traces). Rotates at this trace boundary once the output holds
     /// `limit` decoded bytes; finishes the least recently fed writer when `MAX_OPEN_WRITERS` are open. A later
     /// file of the same run holds higher trace ids, so the files stay key-disjoint.
-    async fn send(&mut self, run: Run, b: RecordBatch, limit: u64) -> Result<(), IngestError> {
+    async fn send(&mut self, run: Run, b: RecordBatch, limit: u64, stats: &mut JobStats) -> Result<(), IngestError> {
         let size = b.get_array_memory_size() as u64;
         if self
             .open
@@ -229,14 +225,14 @@ impl Writers {
         {
             let w = self.open.remove(&run).expect("present");
             self.done.push(w.sink.finish().await?);
-            self.rotated += 1;
+            stats.rotated += 1;
         }
         if !self.open.contains_key(&run) {
             if self.open.len() >= MAX_OPEN_WRITERS {
                 let lru = *self.open.iter().min_by_key(|(_, w)| w.fed).expect("open").0;
                 let w = self.open.remove(&lru).expect("present");
                 self.done.push(w.sink.finish().await?);
-                self.capped += 1;
+                stats.writer_cap += 1;
             }
             let w = self.start(run)?;
             self.open.insert(run, w);
@@ -301,34 +297,6 @@ async fn commit_job(cx: &CompactCtx, commit: CompactionCommit) -> Result<(), Ing
     Ok(())
 }
 
-async fn scan_all(
-    store: &dyn SegmentStore,
-    seg: &SegmentMeta,
-    req: ScanRequest,
-) -> Result<Vec<RecordBatch>, IngestError> {
-    Ok(store.scan(seg, req).await?.try_collect().await?)
-}
-
-fn keys(b: &RecordBatch) -> Result<Vec<Key>, IngestError> {
-    let t = b.column_by_name(col::TRACE_ID).unwrap().as_binary::<i32>();
-    let s = b.column_by_name(col::SPAN_ID).unwrap().as_binary::<i32>();
-    (0..b.num_rows())
-        .map(|i| Ok((TraceId::from_slice(t.value(i))?, SpanId::from_slice(s.value(i))?)))
-        .collect()
-}
-
-fn coalesce(mut rs: Vec<std::ops::Range<u64>>) -> Vec<std::ops::Range<u64>> {
-    rs.sort_by_key(|r| r.start);
-    let mut out: Vec<std::ops::Range<u64>> = Vec::new();
-    for r in rs {
-        match out.last_mut() {
-            Some(l) if r.start <= l.end => l.end = l.end.max(r.end),
-            _ => out.push(r),
-        }
-    }
-    out
-}
-
 /// Everything before the commit: slices -> outputs uploaded. Returns the report and the commit.
 async fn build(
     cx: &CompactCtx,
@@ -362,9 +330,9 @@ async fn build(
                 rows: RowSelection::Range(rows.clone()),
                 ..Default::default()
             };
-            for b in scan_all(cx.segments.as_ref(), seg, req).await? {
+            for b in cx.segments.scan_all(seg, req).await? {
                 if seg.level == Level::L1 {
-                    for k in keys(&b)? {
+                    for k in span_keys(&b)? {
                         sticky.insert(k, seg.partition_hour);
                     }
                 }
@@ -390,14 +358,14 @@ async fn build(
         }
         let (mut ctx_all, mut ctx_old) = (Vec::new(), Vec::new());
         for (seg, rs) in per_seg.into_values() {
-            for r in coalesce(rs) {
+            for r in coalesce_ranges(rs, 0) {
                 let req = ScanRequest {
                     projection: Some(CONTEXT_COLUMNS.to_vec()),
                     rows: RowSelection::Range(r),
                     ..Default::default()
                 };
-                for b in scan_all(cx.segments.as_ref(), &seg, req).await? {
-                    for k in keys(&b)? {
+                for b in cx.segments.scan_all(&seg, req).await? {
+                    for k in span_keys(&b)? {
                         sticky.insert(k, seg.partition_hour);
                     }
                     if seg.max_version < plan.older_than {
@@ -451,7 +419,7 @@ async fn build(
         }
         let limit = (cx.cfg.target_segment.as_u64() as f64 * ratio) as u64;
         for slice in chunks {
-            let ks = keys(&slice)?;
+            let ks = span_keys(&slice)?;
             let start = slice
                 .column(col_idx(col::START_TIME))
                 .as_primitive::<TimestampNanosecondType>();
@@ -472,13 +440,11 @@ async fn build(
             }
             for (run, idx) in groups {
                 let b = take_record_batch(&slice, &UInt32Array::from(idx))?;
-                w.send(run, b, limit).await?;
+                w.send(run, b, limit, &mut stats).await?;
             }
         }
     }
     let outputs = w.finish().await?;
-    stats.rotated = w.rotated;
-    stats.writer_cap = w.capped;
     stats.orphan_outputs = outputs.iter().filter(|o| o.meta.is_orphan_run()).count() as u32;
     // The last cancellation point: the commit is never interrupted (D7).
     cancel.check()?;
@@ -553,7 +519,7 @@ fn context(chunks: &[RecordBatch]) -> Result<Context, IngestError> {
         let start = m
             .column(s.index_of(col::START_TIME)?)
             .as_primitive::<TimestampNanosecondType>();
-        for (i, k) in keys(m)?.into_iter().enumerate() {
+        for (i, k) in span_keys(m)?.into_iter().enumerate() {
             let p = if parent.is_valid(i) {
                 Some((k.0, SpanId::from_slice(parent.value(i))?))
             } else {
@@ -570,7 +536,7 @@ fn context(chunks: &[RecordBatch]) -> Result<Context, IngestError> {
 /// context rows (`old`); then the remaining nulls are backfilled by the one walk over the merged rows plus every
 /// context node (`all`; an ancestor's existing value is the prefix). Returns the new batch, #fills, #backfills.
 fn fill(m: &RecordBatch, old: &Context, all: &Context) -> Result<(RecordBatch, u64, u64), IngestError> {
-    let ks = keys(m)?;
+    let ks = span_keys(m)?;
     let start = m
         .column(col_idx(col::START_TIME))
         .as_primitive::<TimestampNanosecondType>();

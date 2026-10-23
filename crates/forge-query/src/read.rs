@@ -15,7 +15,7 @@ use forge_model::ids::TraceId;
 use forge_model::merge::{Cancel, MERGE_COLUMNS, Tombstones, merge_projected};
 use forge_model::schema::{ALL_COLUMNS, col, col_idx, project_to};
 use forge_model::{MemtableSnapshot, MemtableView};
-use forge_storage::{RowSelection, ScanRequest, SegmentStore};
+use forge_storage::{RowSelection, ScanRequest, SegmentStore, coalesce_ranges};
 use futures::{StreamExt, TryStreamExt};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -168,7 +168,7 @@ impl ReadView {
         let out: Vec<Vec<RecordBatch>> = futures::stream::iter(reqs)
             .map(|(seg, req)| {
                 let store = self.store.clone();
-                async move { store.scan(&seg, req).await?.try_collect::<Vec<_>>().await }
+                async move { store.scan_all(&seg, req).await }
             })
             .buffer_unordered(SCAN_CONCURRENCY)
             .try_collect()
@@ -204,17 +204,21 @@ pub(crate) fn mem_versions(
 /// at most `max_gap` rows (0: contiguous or overlapping only, i.e. exactly the same rows). The extra rows of a
 /// gap must be dropped by the caller's key mask.
 pub(crate) fn coalesce(parts: Vec<SegmentPart>, max_gap: u64) -> Vec<SegmentPart> {
+    let range = |p: &SegmentPart| match &p.rows {
+        RowSelection::Range(r) => Some(r.clone()),
+        RowSelection::All => None,
+    };
     let mut out: Vec<SegmentPart> = Vec::with_capacity(parts.len());
-    for p in parts {
-        if let (Some(last), RowSelection::Range(r)) = (out.last_mut(), &p.rows)
-            && last.seg.id == p.seg.id
-            && let RowSelection::Range(l) = &mut last.rows
-            && r.start <= l.end.saturating_add(max_gap)
-        {
-            l.end = l.end.max(r.end);
-            continue;
+    // Runs of consecutive ranges of one segment; an `All` part stays alone.
+    let is_range = |p: &SegmentPart| matches!(p.rows, RowSelection::Range(_));
+    for run in parts.chunk_by(|a, b| a.seg.id == b.seg.id && is_range(a) && is_range(b)) {
+        match run.iter().map(range).collect::<Option<Vec<_>>>() {
+            Some(rs) => out.extend(coalesce_ranges(rs, max_gap).into_iter().map(|r| SegmentPart {
+                seg: run[0].seg.clone(),
+                rows: RowSelection::Range(r),
+            })),
+            None => out.extend_from_slice(run),
         }
-        out.push(p);
     }
     out
 }

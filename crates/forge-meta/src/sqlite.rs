@@ -540,14 +540,39 @@ fn placeholders(n: usize) -> String {
 
 /// `count(*)` of a dynamic statement: `head` params, then the input ids (`prepare`, not cached: the IN-list length
 /// varies, RA m6).
+/// `forget_segments` deletes trace_index rows in txns of this many rows, so a flush commit never waits behind
+/// one huge delete (an hour's L1 segment holds ~720k trace rows at 200 traces/s).
+const TRACE_INDEX_PURGE_CHUNK: usize = 20_000;
+
+/// The first column of `sql` (one `?1` = project id) as a set.
+fn string_set(c: &Connection, sql: &str, project: &ProjectId) -> MetaResult<HashSet<String>> {
+    let mut st = c.prepare_cached(sql)?;
+    let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// A commit lists each segment once.
+fn unique_segments(segs: &[NewSegment]) -> MetaResult<()> {
+    let mut ids = HashSet::new();
+    match segs.iter().find(|s| !ids.insert(s.meta.id)) {
+        Some(s) => Err(MetaError::InvalidInput(format!(
+            "segment {} is listed twice in one commit",
+            s.meta.id
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn count_with_ids(
     tx: &Transaction<'_>,
     sql: &str,
     head: Vec<rusqlite::types::Value>,
     ids: &[String],
+    tail: Vec<rusqlite::types::Value>,
 ) -> MetaResult<i64> {
     let mut p = head;
     p.extend(ids.iter().cloned().map(Into::into));
+    p.extend(tail);
     Ok(tx
         .prepare(sql)?
         .query_row(rusqlite::params_from_iter(p), |x| x.get(0))?)
@@ -577,15 +602,13 @@ fn begin_in_txn(tx: &Transaction<'_>, r: &JobRequest, now: i64) -> MetaResult<Op
         .filter(|s| s.level == Level::L1)
         .map(|s| s.partition_hour.0)
         .collect();
-    // 2. Kind A has an L0 input; kind B has none and exactly one hour.
-    match r.kind {
-        JobKind::L0 if l0.is_empty() => return Ok(None),
-        JobKind::L1 if !l0.is_empty() || hours.len() != 1 => return Ok(None),
-        _ => {}
-    }
     let project: rusqlite::types::Value = r.project_id.as_str().to_string().into();
     match r.kind {
         JobKind::L0 => {
+            // 2. Kind A has an L0 input.
+            if l0.is_empty() {
+                return Ok(None);
+            }
             // 3. D1a: no visible L0 outside the inputs is older than the newest input.
             let newest = l0.iter().map(|s| s.min_version).max().unwrap_or(0);
             let sql = format!(
@@ -593,7 +616,7 @@ fn begin_in_txn(tx: &Transaction<'_>, r: &JobRequest, now: i64) -> MetaResult<Op
                  AND min_version < ? AND id NOT IN ({in_list})"
             );
             let head = vec![project.clone(), to_i64("min_version", newest)?.into()];
-            if count_with_ids(tx, &sql, head, &ids)? > 0 {
+            if count_with_ids(tx, &sql, head, &ids, vec![])? > 0 {
                 return Ok(None);
             }
             // 4. D1b: every visible L1 segment of each input hour is an input.
@@ -602,25 +625,25 @@ fn begin_in_txn(tx: &Transaction<'_>, r: &JobRequest, now: i64) -> MetaResult<Op
                  AND state <> 'deleted' AND id NOT IN ({in_list})"
             );
             for h in &hours {
-                if count_with_ids(tx, &sql, vec![project.clone(), (*h).into()], &ids)? > 0 {
+                if count_with_ids(tx, &sql, vec![project.clone(), (*h).into()], &ids, vec![])? > 0 {
                     return Ok(None);
                 }
             }
         }
         JobKind::L1 => {
+            // 2. Kind B has no L0 input and exactly one hour.
+            if !l0.is_empty() || hours.len() != 1 {
+                return Ok(None);
+            }
             // 5. D1c: a newest version suffix: every other visible L1 segment of the hour is older than every input.
             let min_input = segs.iter().map(|s| s.min_version).min().unwrap_or(0);
             let sql = format!(
                 "SELECT count(*) FROM segments WHERE project_id = ? AND level = 1 AND partition_hour = ? \
                  AND state <> 'deleted' AND id NOT IN ({in_list}) AND max_version >= ?"
             );
-            let mut p = vec![project.clone(), hours.first().copied().unwrap_or(0).into()];
-            p.extend(ids.iter().cloned().map(Into::into));
-            p.push(to_i64("min_version", min_input)?.into());
-            let newer: i64 = tx
-                .prepare(&sql)?
-                .query_row(rusqlite::params_from_iter(p), |x| x.get(0))?;
-            if newer > 0 {
+            let head = vec![project.clone(), hours.first().copied().unwrap_or(0).into()];
+            let tail = vec![to_i64("min_version", min_input)?.into()];
+            if count_with_ids(tx, &sql, head, &ids, tail)? > 0 {
                 return Ok(None);
             }
         }
@@ -659,7 +682,6 @@ fn begin_in_txn(tx: &Transaction<'_>, r: &JobRequest, now: i64) -> MetaResult<Op
                 ..s
             })
             .collect(),
-        created_at_ms: now,
     }))
 }
 
@@ -867,13 +889,7 @@ impl Metastore for SqliteMetastore {
             to_i64("flushed_wal_seq", c.flushed_wal_seq)?,
             to_i64("max_version", c.max_version)?,
         );
-        let mut ids = std::collections::HashSet::new();
-        if let Some(s) = c.segments.iter().find(|s| !ids.insert(s.meta.id)) {
-            return Err(MetaError::InvalidInput(format!(
-                "segment {} is listed twice in one commit",
-                s.meta.id
-            )));
-        }
+        unique_segments(&c.segments)?;
         self.write(move |tx| {
             let now = now_ms();
             let stored: Option<i64> = tx
@@ -1033,17 +1049,42 @@ impl Metastore for SqliteMetastore {
     }
 
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
-        self.forget(ids).await
+        let mut removed = 0;
+        let chunk = TRACE_INDEX_PURGE_CHUNK as i64;
+        for id in ids.iter().map(SegmentId::to_string) {
+            // Short txns: each deletes <= chunk trace rows of one deleted segment (one project per segment).
+            loop {
+                let id = id.clone();
+                let n = self
+                    .write(move |tx| {
+                        Ok(tx
+                            .prepare_cached(
+                                "DELETE FROM trace_index WHERE segment_id = ?1 AND trace_id IN \
+                                 (SELECT trace_id FROM trace_index WHERE segment_id = ?1 LIMIT ?2) \
+                                 AND EXISTS (SELECT 1 FROM segments WHERE id = ?1 AND state = 'deleted')",
+                            )?
+                            .execute(params![id, chunk])?)
+                    })
+                    .await?;
+                if (n as i64) < chunk {
+                    break;
+                }
+            }
+            removed += self
+                .write(move |tx| {
+                    Ok(tx
+                        .prepare_cached("DELETE FROM segments WHERE id = ?1 AND state = 'deleted'")?
+                        .execute([id])?)
+                })
+                .await?;
+        }
+        Ok(removed)
     }
 
     async fn segment_paths(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
         let project = project.clone();
-        self.read(move |c| {
-            let mut st = c.prepare_cached("SELECT path FROM segments WHERE project_id = ?1")?;
-            let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-        .await
+        self.read(move |c| string_set(c, "SELECT path FROM segments WHERE project_id = ?1", &project))
+            .await
     }
 
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
@@ -1054,13 +1095,7 @@ impl Metastore for SqliteMetastore {
     }
 
     async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
-        let mut ids = HashSet::new();
-        if let Some(s) = c.outputs.iter().find(|s| !ids.insert(s.meta.id)) {
-            return Err(MetaError::InvalidInput(format!(
-                "segment {} is listed twice in one commit",
-                s.meta.id
-            )));
-        }
+        unique_segments(&c.outputs)?;
         self.write(move |tx| commit_compaction_in_txn(tx, &c, now_ms())).await
     }
 
@@ -1138,47 +1173,8 @@ impl Metastore for SqliteMetastore {
 
     async fn blob_refs(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
         let project = project.clone();
-        self.read(move |c| {
-            let mut st = c.prepare_cached("SELECT DISTINCT path FROM blob_refs WHERE project_id = ?1")?;
-            let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-        .await
-    }
-}
-
-impl SqliteMetastore {
-    async fn forget(&self, ids: &[SegmentId]) -> MetaResult<usize> {
-        let mut removed = 0;
-        let chunk = crate::TRACE_INDEX_PURGE_CHUNK as i64;
-        for id in ids.iter().map(SegmentId::to_string) {
-            // Short txns: each deletes <= chunk trace rows of one deleted segment (one project per segment).
-            loop {
-                let id = id.clone();
-                let n = self
-                    .write(move |tx| {
-                        Ok(tx
-                            .prepare_cached(
-                                "DELETE FROM trace_index WHERE segment_id = ?1 AND trace_id IN \
-                                 (SELECT trace_id FROM trace_index WHERE segment_id = ?1 LIMIT ?2) \
-                                 AND EXISTS (SELECT 1 FROM segments WHERE id = ?1 AND state = 'deleted')",
-                            )?
-                            .execute(params![id, chunk])?)
-                    })
-                    .await?;
-                if (n as i64) < chunk {
-                    break;
-                }
-            }
-            removed += self
-                .write(move |tx| {
-                    Ok(tx
-                        .prepare_cached("DELETE FROM segments WHERE id = ?1 AND state = 'deleted'")?
-                        .execute([id])?)
-                })
-                .await?;
-        }
-        Ok(removed)
+        self.read(move |c| string_set(c, "SELECT DISTINCT path FROM blob_refs WHERE project_id = ?1", &project))
+            .await
     }
 }
 

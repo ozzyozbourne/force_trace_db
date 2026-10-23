@@ -20,7 +20,7 @@ const _: () = assert!(MAX_INPUTS <= forge_meta::MAX_JOB_INPUTS);
 pub const L1_MAX_RUNS: usize = 4;
 pub const MAX_OPEN_WRITERS: usize = 4;
 /// Jobs per `compact_project` run (a guard; the summary reports `capped`).
-pub const COMPACT_MAX_JOBS: usize = 64;
+const COMPACT_MAX_JOBS: usize = 64;
 pub const JOB_RETENTION: Duration = Duration::from_secs(7 * 86_400);
 
 pub struct CompactCtx {
