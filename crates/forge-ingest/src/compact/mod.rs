@@ -34,6 +34,9 @@ pub struct CompactCtx {
     pub clocks: Clocks,
     /// `merge_versions_projected`'s output bound per merged batch (`flush::MERGE_CHUNK_BYTES`).
     pub merge_chunk_bytes: usize,
+    /// An output closes at the next trace boundary once its `.fts` builder holds this many (term, row) pairs (D3;
+    /// default `MAX_SEGMENT_POSTINGS`; tests force rotation with small values).
+    pub max_postings: u64,
     /// Rotating start for `run_next`.
     pub next_project: AtomicUsize,
     /// Shutdown: checked between slices, never during the commit (D7).
@@ -88,6 +91,7 @@ impl CompactCtx {
             cfg,
             clocks,
             merge_chunk_bytes: crate::flush::MERGE_CHUNK_BYTES,
+            max_postings: MAX_SEGMENT_POSTINGS,
             next_project: AtomicUsize::new(0),
             cancel: Cancel::new(),
             running: RunningJobs::default(),

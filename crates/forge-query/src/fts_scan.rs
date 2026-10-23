@@ -6,11 +6,13 @@
 //! ("units") are therefore evaluated on rows; AND / OR across columns only on keys. Candidates are then either
 //! single-source (every version of the trace is one segment row: the index answer is the answer) or re-read in
 //! full, merged and re-checked.
+use crate::FtsCounters;
 use crate::QueryError;
 use crate::filters::KeyFilters;
-use crate::read::{ReadView, SegmentPart, coalesce};
+use crate::read::{ReadView, SegmentPart, coalesce, scan_request};
 use arrow::array::{Array, AsArray, RecordBatch};
-use forge_index::{Analyzer, FtsColumn, FtsExpr, FtsHits, FtsPredicate, IndexReader, Matcher};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+use forge_index::{Analyzer, FtsColumn, FtsExpr, FtsHits, FtsPredicate, IndexReader, Matcher, PrefixSeen};
 use forge_model::catalog::SegmentId;
 use forge_model::ids::{ProjectId, SpanId, TraceId};
 use forge_model::schema::{col, projected_schema};
@@ -19,7 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 pub(crate) type Key = (TraceId, SpanId);
 
@@ -80,18 +82,50 @@ impl Unit {
 
     /// The unit on one cell (null cells match nothing).
     pub fn matches(&self, an: &mut Analyzer, cell: &str) -> bool {
-        fn go(e: &FtsExpr, ms: &[Matcher], next: &mut usize, an: &mut Analyzer, cell: &str) -> bool {
-            match e {
+        self.eval(an, cell, None).expect("no prefix counting")
+    }
+
+    /// `matches` on a brute-forced source, counting prefix expansions (D13).
+    pub fn matches_counting(&self, an: &mut Analyzer, cell: &str, seen: &mut PrefixSeen) -> Result<bool, QueryError> {
+        self.eval(an, cell, Some(seen))
+    }
+
+    fn eval(&self, an: &mut Analyzer, cell: &str, mut seen: Option<&mut PrefixSeen>) -> Result<bool, QueryError> {
+        fn go(
+            e: &FtsExpr,
+            ms: &[Matcher],
+            next: &mut usize,
+            an: &mut Analyzer,
+            cell: &str,
+            seen: &mut Option<&mut PrefixSeen>,
+        ) -> Result<bool, QueryError> {
+            Ok(match e {
                 FtsExpr::Pred(_) => {
                     *next += 1;
-                    ms[*next - 1].matches(an, cell)
+                    let m = &ms[*next - 1];
+                    match seen.as_deref_mut() {
+                        Some(s) => m.matches_counting(an, cell, s)?,
+                        None => m.matches(an, cell),
+                    }
                 }
                 // Evaluate every child so `next` stays in step (no short-circuit).
-                FtsExpr::And(v) => v.iter().map(|c| go(c, ms, next, an, cell)).fold(true, |a, b| a & b),
-                FtsExpr::Or(v) => v.iter().map(|c| go(c, ms, next, an, cell)).fold(false, |a, b| a | b),
-            }
+                FtsExpr::And(v) => {
+                    let mut all = true;
+                    for c in v {
+                        all &= go(c, ms, next, an, cell, seen)?;
+                    }
+                    all
+                }
+                FtsExpr::Or(v) => {
+                    let mut any = false;
+                    for c in v {
+                        any |= go(c, ms, next, an, cell, seen)?;
+                    }
+                    any
+                }
+            })
         }
-        go(&self.expr, &self.matchers, &mut 0, an, cell)
+        go(&self.expr, &self.matchers, &mut 0, an, cell, &mut seen)
     }
 }
 
@@ -172,6 +206,15 @@ fn clip(mut rows: RoaringTreemap, sel: &RowSelection) -> RoaringTreemap {
     }
 }
 
+/// Rows a part selects.
+pub(crate) fn part_rows(p: &SegmentPart) -> u64 {
+    match &p.rows {
+        RowSelection::All => p.seg.row_count,
+        RowSelection::Range(r) => r.end - r.start,
+        RowSelection::Rows(s) => s.len(),
+    }
+}
+
 fn keys_of(b: &RecordBatch) -> Result<Vec<Key>, QueryError> {
     let s = b.schema_ref();
     let t = b.column(s.index_of(col::TRACE_ID)?).as_binary::<i32>();
@@ -181,27 +224,55 @@ fn keys_of(b: &RecordBatch) -> Result<Vec<Key>, QueryError> {
         .collect()
 }
 
-/// Rows of `part` (file row ids) where `unit` holds, by scanning its column (no sidecar, or `NoIndex`).
-pub(crate) async fn brute(view: &ReadView, part: &SegmentPart, unit: &Unit) -> Result<RoaringTreemap, QueryError> {
+/// Rows of `part` (file row ids) where `unit` holds, by scanning its column (no sidecar, or `NoIndex`). Streams:
+/// one batch at a time, charged to `pool` (D5).
+pub(crate) async fn brute(
+    view: &ReadView,
+    pool: &Arc<dyn MemoryPool>,
+    part: &SegmentPart,
+    unit: &Unit,
+) -> Result<RoaringTreemap, QueryError> {
     let start = match &part.rows {
         RowSelection::All => 0,
         RowSelection::Range(r) => r.start,
         RowSelection::Rows(_) => unreachable!("candidate parts are All or Range"),
     };
-    let batches = view.scan(std::slice::from_ref(part), &[unit.col.name()], None).await?;
-    let mut an = Analyzer::default();
+    let req = scan_request(part, &[unit.col.name()], None);
+    let mut stream = view.store().scan(&part.seg, req).await?;
+    let res = MemoryConsumer::new("fts.brute").register(pool);
+    let (mut an, mut seen) = (Analyzer::default(), PrefixSeen::default());
     let mut out = RoaringTreemap::new();
     let mut row = start;
-    for b in &batches {
+    while let Some(b) = stream.try_next().await? {
+        res.try_grow(b.get_array_memory_size())?;
         let c = b.column(0).as_string::<i32>();
         for i in 0..c.len() {
-            if c.is_valid(i) && unit.matches(&mut an, c.value(i)) {
+            if c.is_valid(i) && unit.matches_counting(&mut an, c.value(i), &mut seen)? {
                 out.insert(row + i as u64);
             }
         }
         row += b.num_rows() as u64;
+        res.shrink(b.get_array_memory_size());
     }
     Ok(out)
+}
+
+/// One unit's index answer for `seg`: `Ok(None)` when there is no usable sidecar (D4: every index error but a query
+/// error falls back to brute force).
+pub(crate) async fn lookup_unit(
+    index: &dyn IndexReader,
+    seg: &forge_model::catalog::SegmentMeta,
+    u: &Unit,
+) -> Result<Option<(RoaringTreemap, bool)>, QueryError> {
+    match index.search(seg, &u.expr, None).await {
+        Ok(FtsHits::Rows { rows, start_less, .. }) => Ok(Some((rows, start_less))),
+        Ok(FtsHits::NoIndex) => Ok(None),
+        Err(e @ forge_index::IndexError::Query(_)) => Err(e.into()),
+        Err(e) => {
+            tracing::debug!(segment = %seg.id, error = %e, ".fts unusable; brute force");
+            Ok(None)
+        }
+    }
 }
 
 async fn part_hits(
@@ -209,28 +280,30 @@ async fn part_hits(
     index: &dyn IndexReader,
     part: &SegmentPart,
     units: &[Unit],
-    bruted: &AtomicUsize,
+    counters: &FtsCounters,
+    pool: &Arc<dyn MemoryPool>,
 ) -> Result<PartHits, QueryError> {
+    let looked = futures::future::try_join_all(units.iter().map(|u| lookup_unit(index, &part.seg, u))).await?;
+    let bruted = looked.iter().any(Option::is_none);
+    FtsCounters::add(
+        if bruted {
+            &counters.brute_parts
+        } else {
+            &counters.index_parts
+        },
+        1,
+    );
     let mut per_unit = Vec::with_capacity(units.len());
-    for u in units {
-        // The reader decides (no `fts_byte_size`: NoIndex).
-        let hits = match index.search(&part.seg, &u.expr, None).await {
-            Ok(h) => h,
-            Err(e @ forge_index::IndexError::Query(_)) => return Err(e.into()),
-            Err(e) => {
-                tracing::debug!(segment = %part.seg.id, error = %e, ".fts unreadable; brute force");
-                FtsHits::NoIndex
-            }
-        };
-        if matches!(hits, FtsHits::NoIndex) {
-            bruted.fetch_add(1, Ordering::Relaxed);
-        }
-        per_unit.push(match hits {
-            FtsHits::Rows { rows, .. } => clip(rows, &part.rows),
-            FtsHits::NoIndex => brute(view, part, u).await?,
+    for (u, h) in units.iter().zip(looked) {
+        per_unit.push(match h {
+            Some((rows, _)) => clip(rows, &part.rows),
+            None => brute(view, pool, part, u).await?,
         });
     }
     let all = per_unit.iter().fold(RoaringTreemap::new(), |a, b| a | b);
+    if bruted || !all.is_empty() {
+        FtsCounters::add(&counters.segments_read, 1);
+    }
     let ids: Vec<u64> = all.iter().collect();
     let hit_part = SegmentPart {
         seg: part.seg.clone(),
@@ -257,6 +330,8 @@ async fn part_hits(
 pub(crate) async fn select(
     view: &ReadView,
     index: &dyn IndexReader,
+    counters: &FtsCounters,
+    pool: &Arc<dyn MemoryPool>,
     p: &ProjectId,
     k: &KeyFilters,
     parts: &[SegmentPart],
@@ -278,13 +353,14 @@ pub(crate) async fn select(
     mem_cols.extend(units.iter().map(|u| u.col.name()));
     let mem_cols: Vec<&'static str> = mem_cols.into_iter().collect();
     let mut mem_traces: BTreeSet<TraceId> = BTreeSet::new();
+    let mut seen = PrefixSeen::default();
     for b in view.mem_versions(&mk, &projected_schema(&mem_cols))? {
         let keys = keys_of(&b)?;
         mem_traces.extend(keys.iter().map(|k| k.0));
         for (ui, u) in units.iter().enumerate() {
             let c = b.column(b.schema().index_of(u.col.name())?).as_string::<i32>();
             for (i, key) in keys.iter().enumerate() {
-                if c.is_valid(i) && u.matches(&mut an, c.value(i)) {
+                if c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen)? {
                     per_unit[ui].insert(*key);
                 }
             }
@@ -293,16 +369,17 @@ pub(crate) async fn select(
 
     // Segments: index (or brute force) per unit, then the keys of the hit rows.
     // A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
-    let bruted = AtomicUsize::new(0);
+    let bruted0 = counters.brute_parts.load(Ordering::Relaxed);
     let mut futs = Vec::with_capacity(parts.len());
     for part in parts {
-        futs.push(part_hits(view, index, part, &units, &bruted));
+        futs.push(part_hits(view, index, part, &units, counters, pool));
     }
     let hits: Vec<PartHits> = futures::stream::iter(futs)
         .buffer_unordered(INDEX_CONCURRENCY)
         .try_collect()
         .await?;
-    let n = bruted.into_inner();
+    // Other queries add to the counter too: the count is approximate when they overlap.
+    let n = counters.brute_parts.load(Ordering::Relaxed).saturating_sub(bruted0);
     if n > 0 {
         tracing::warn!(project = %p, segments = n, "search: segments without a usable .fts were scanned by brute force");
     }
@@ -359,6 +436,7 @@ pub(crate) async fn select(
             let rows = tree.rows(&h.per_unit) & keep;
             if !rows.is_empty() {
                 let seg = parts.iter().find(|p| p.seg.id == h.seg).expect("hit part").seg.clone();
+                FtsCounters::add(&counters.exact_rows, rows.len());
                 sel.exact.push(SegmentPart {
                     seg,
                     rows: RowSelection::Rows(Arc::new(rows)),
@@ -374,6 +452,7 @@ pub(crate) async fn select(
         .map(|(_, l)| l)
         .collect();
     sel.merge = coalesce(merge_locs, 0);
+    FtsCounters::add(&counters.merge_rows, sel.merge.iter().map(part_rows).sum());
     Ok(Some(sel))
 }
 
@@ -435,46 +514,44 @@ impl IndexReader for FtsIndexReader {
                 f
             }
         };
+        if u64::from(file.footer().num_rows) != seg.row_count {
+            return Err(forge_index::IndexError::Corrupt {
+                path,
+                msg: format!("{} rows, the segment has {}", file.footer().num_rows, seg.row_count),
+            });
+        }
+        // Every predicate's lookups at once: one wave of FST blocks, one of postings (D1).
         let mut an = Analyzer::default();
-        let mut recheck = false;
-        let rows = eval_index(&file, &mut an, expr, &fetch, &mut recheck).await?;
+        let mut ps = Vec::new();
+        preds(expr, &mut ps);
+        let ms = ps
+            .into_iter()
+            .map(|p| Matcher::new(&mut an, p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let needs_recheck = ms.iter().any(|m| m.query().needs_recheck);
+        let bms = futures::future::try_join_all(ms.iter().map(|m| file.execute(m.query(), &fetch))).await?;
+        let rows = combine(expr, &mut bms.into_iter().map(|(b, _)| b));
+        let start_less = !rows.is_disjoint(file.null_starts());
         Ok(FtsHits::Rows {
             rows: RoaringTreemap::from_bitmaps([(0, rows)]),
-            needs_recheck: recheck,
+            needs_recheck,
+            start_less,
         })
     }
 }
 
-/// AND / OR of the per-predicate bitmaps (rows of ONE segment, any columns: the caller only passes units).
-fn eval_index<'a, F: Fn(Vec<std::ops::Range<u64>>) -> Fetch + Send + Sync>(
-    file: &'a forge_index::FtsFile,
-    an: &'a mut Analyzer,
-    e: &'a FtsExpr,
-    fetch: &'a F,
-    recheck: &'a mut bool,
-) -> futures::future::BoxFuture<'a, forge_index::IndexResult<roaring::RoaringBitmap>> {
-    Box::pin(async move {
-        Ok(match e {
-            FtsExpr::Pred(p) => {
-                let m = Matcher::new(an, p)?;
-                *recheck |= m.query().needs_recheck;
-                file.execute(m.query(), fetch).await?.0
-            }
-            FtsExpr::And(v) => {
-                let mut acc: Option<roaring::RoaringBitmap> = None;
-                for c in v {
-                    let b = eval_index(file, an, c, fetch, recheck).await?;
-                    acc = Some(acc.map_or(b.clone(), |a| a & b));
-                }
-                acc.unwrap_or_default()
-            }
-            FtsExpr::Or(v) => {
-                let mut acc = roaring::RoaringBitmap::new();
-                for c in v {
-                    acc |= eval_index(file, an, c, fetch, recheck).await?;
-                }
-                acc
-            }
-        })
-    })
+/// AND / OR of the per-predicate bitmaps, taken from `bms` in `preds` order.
+fn combine(e: &FtsExpr, bms: &mut dyn Iterator<Item = roaring::RoaringBitmap>) -> roaring::RoaringBitmap {
+    match e {
+        FtsExpr::Pred(_) => bms.next().expect("one bitmap per predicate"),
+        FtsExpr::And(v) => v
+            .iter()
+            .map(|c| combine(c, bms))
+            .reduce(|a, b| a & b)
+            .unwrap_or_default(),
+        FtsExpr::Or(v) => v
+            .iter()
+            .map(|c| combine(c, bms))
+            .fold(roaring::RoaringBitmap::new(), |a, b| a | b),
+    }
 }

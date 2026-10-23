@@ -1,6 +1,6 @@
 //! `run_job`: lazy trace slices -> scan + context -> merge (Keep) -> start fill -> dotted backfill -> sort -> route to
 //! per-(hour, orphan) writers -> commit (plans/phase-4 §2.8, CR §7).
-use super::{CompactCtx, JobReport, JobStats, MAX_OPEN_WRITERS, MAX_SEGMENT_POSTINGS};
+use super::{CompactCtx, JobReport, JobStats, MAX_OPEN_WRITERS};
 use crate::IngestError;
 use crate::sink::SegmentSink;
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampNanosecondArray, UInt32Array};
@@ -291,7 +291,7 @@ impl Writers {
 pub async fn run_job(cx: &CompactCtx, job: CompactionJob) -> Result<JobReport, IngestError> {
     failpoint::hit("compact_after_lease");
     let t0 = std::time::Instant::now();
-    let mut w = Writers::new(cx.segments.clone(), job.project_id.clone(), MAX_SEGMENT_POSTINGS);
+    let mut w = Writers::new(cx.segments.clone(), job.project_id.clone(), cx.max_postings);
     let (mut report, commit) = match build(cx, &job, &mut w).await {
         Ok(x) => x,
         Err(e) => {
@@ -725,9 +725,9 @@ mod tests {
     use forge_model::ids::TraceId;
     use forge_model::testing::{batch_from_rows, pid, sid, sort_by_key};
 
-    /// One trace of 20 spans, ~200 distinct tokens in `inputs` (10 per span).
+    /// One trace of 10 spans, 100 distinct tokens in `inputs` (10 per span), key-sorted.
     fn trace_batch(t: u64) -> RecordBatch {
-        let rows: Vec<_> = (0..20u64)
+        let rows: Vec<_> = (0..10u64)
             .map(|s| {
                 let words: Vec<String> = (0..10).map(|w| format!("w{t}x{s}x{w}")).collect();
                 forge_model::row::SpanRow {
@@ -751,15 +751,17 @@ mod tests {
             orphan: false,
         };
         let mut stats = JobStats::default();
-        for t in 0..10 {
+        for t in 0..20 {
             w.send(run, trace_batch(t), u64::MAX, &mut stats).await.unwrap();
         }
         w.finish().await.unwrap()
     }
 
-    #[tokio::test]
+    /// The count lags `push` by up to 4 batches (a channel of 2 + 1 sender slot + the batch in `add_batch`), so only
+    /// "more than one output" is asserted, never an exact count; current_thread keeps it deterministic.
+    #[tokio::test(flavor = "current_thread")]
     async fn posting_cap_rotates_outputs() {
-        let out = outputs(1_000).await;
+        let out = outputs(200).await;
         assert!(out.len() > 1, "{} outputs", out.len());
         assert_eq!(out.iter().map(|o| o.meta.row_count).sum::<u64>(), 200);
         for pair in out.windows(2) {

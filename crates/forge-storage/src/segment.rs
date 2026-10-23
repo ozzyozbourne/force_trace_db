@@ -45,8 +45,16 @@ pub struct VortexSegmentStore {
     /// spans_schema as a Vortex dtype, converted once.
     dtype: DType,
     strategy: Arc<dyn LayoutStrategy>,
-    /// D10b: Vortex footers by segment (segments are write-once, so no invalidation).
+    /// Vortex footers by segment, weighted by bytes (plans/phase-5 D12b; segments are write-once, so no invalidation).
     footers: moka::future::Cache<forge_model::catalog::SegmentId, vortex::file::Footer>,
+}
+
+/// Footer cache capacity (D12b). M5 replaces it with the configured cache tiers.
+pub const FOOTER_CACHE_BYTES: u64 = 64 << 20;
+
+/// A footer's cache weight: Vortex's own size estimate, else 64 KiB.
+pub fn footer_weight(f: &vortex::file::Footer) -> u32 {
+    u32::try_from(f.approx_byte_size().unwrap_or(64 << 10)).unwrap_or(u32::MAX)
 }
 
 impl std::fmt::Debug for VortexSegmentStore {
@@ -72,7 +80,10 @@ impl VortexSegmentStore {
             session,
             dtype,
             strategy,
-            footers: moka::future::Cache::new(4096),
+            footers: moka::future::Cache::builder()
+                .max_capacity(FOOTER_CACHE_BYTES)
+                .weigher(|_, f: &vortex::file::Footer| footer_weight(f))
+                .build(),
         }
     }
     /// Some(absolute root) for file:// stores.
@@ -406,5 +417,52 @@ mod tests {
             Err(StorageError::Unsorted(_))
         ));
         assert!(outcome(None, Ok(()), 1).is_ok());
+    }
+
+    /// D12b: a cached footer weighs Vortex's own size estimate.
+    #[tokio::test]
+    async fn footer_cache_weight_is_footer_bytes() {
+        use forge_model::catalog::{HourBucket, Level, SegmentId};
+        use forge_model::row::SpanRow;
+        use forge_model::testing::{batch_from_rows, pid, sid, tid};
+        use futures::TryStreamExt;
+        let st = VortexSegmentStore::new(
+            crate::build_object_store(&forge_model::config::StorageConfig {
+                url: "memory://".into(),
+            })
+            .unwrap(),
+        );
+        let rows: Vec<SpanRow> = (0..200u64)
+            .map(|i| SpanRow {
+                project_id: Some(pid("p")),
+                trace_id: tid(1),
+                span_id: sid(i),
+                version: 1,
+                ..Default::default()
+            })
+            .collect();
+        let b = forge_model::testing::sort_by_key(&batch_from_rows(&rows));
+        let spec = SegmentSpec {
+            id: SegmentId::new(),
+            project_id: pid("p"),
+            level: Level::L0,
+            partition_hour: HourBucket(0),
+        };
+        let w = st
+            .write_segment(spec, Box::pin(futures::stream::iter([Ok(b)])))
+            .await
+            .unwrap();
+        let _: Vec<_> = st
+            .scan(&w.meta, ScanRequest::default())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        st.footers.run_pending_tasks().await;
+        let f = st.footers.get(&w.meta.id).await.expect("cached");
+        let n = f.approx_byte_size().expect("vortex reports a footer size");
+        assert_eq!(footer_weight(&f) as usize, n);
+        assert_eq!(st.footers.weighted_size(), n as u64);
     }
 }

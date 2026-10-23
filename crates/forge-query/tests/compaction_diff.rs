@@ -76,6 +76,39 @@ async fn snapshot(fx: &Fixture) -> Vec<String> {
         for req in runs_requests(&p) {
             out.push(String::from_utf8(fx.engine.runs_json(&req).await.unwrap()).unwrap());
         }
+        // M4: search SQL and every `/v1/search` page are unchanged by compaction (sidecars rebuilt from rows).
+        for q in ["hi", "out OR boom", "span-1*", "\"span 1\""] {
+            let s = format!(
+                "SELECT trace_id, span_id, name FROM spans WHERE project_id = '{p}' AND search(name, '{}') \
+                 ORDER BY trace_id, span_id",
+                q.replace('\'', "''")
+            );
+            out.push(
+                arrow::util::pretty::pretty_format_batches(&[sql(&fx.engine, &s).await])
+                    .unwrap()
+                    .to_string(),
+            );
+            let mut cursor = None;
+            loop {
+                let body = forge_query::search::SearchBody {
+                    q: q.into(),
+                    limit: Some(7),
+                    cursor: cursor.take(),
+                    ..Default::default()
+                };
+                let r = forge_query::search::SearchRequest::parse(body, ProjectId::new(p.clone()).unwrap()).unwrap();
+                let page = fx.engine.search(&r).await.unwrap();
+                out.push(
+                    arrow::util::pretty::pretty_format_batches(&[page.rows])
+                        .unwrap()
+                        .to_string(),
+                );
+                match page.next_cursor {
+                    Some(c) => cursor = Some(r.encode_cursor(&c)),
+                    None => break,
+                }
+            }
+        }
     }
     out
 }

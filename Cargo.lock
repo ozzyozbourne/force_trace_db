@@ -2320,8 +2320,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "bytes",
  "clap",
  "flate2",
+ "forge-index",
  "forge-ingest",
  "forge-meta",
  "forge-model",

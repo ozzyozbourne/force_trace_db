@@ -538,3 +538,94 @@ async fn search_api() {
     let resp = api.clone().oneshot(get("/v1/search")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+/// `POST /v1/search` edges (plans/phase-5 §5.4) and the runs `q=` token semantics (D14).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_api_edges() {
+    let f = forge().await;
+    let api = api_router(f.clone());
+    let mut rows = Vec::new();
+    for t in 0..60 {
+        let mut s = span("default", t, 1000 + t, None);
+        s.inputs = Some(format!("{{\"q\":\"common word {t}\"}}"));
+        s.name = Some(["span-1", "span-12", "cafe"][t as usize % 3].into());
+        rows.push(s);
+    }
+    f.ingest.submit(rows).await.unwrap();
+    let hits = |v: &Value| v["hits"].as_array().unwrap().len();
+    // Default limit 50.
+    let (st, v) = call(&api, post("/v1/search", json!({"q": "common"}))).await;
+    assert_eq!((st, hits(&v)), (StatusCode::OK, 50), "{v}");
+    assert!(v["next_cursor"].is_string());
+    // q length bounds; no tokens; empty columns.
+    let (st, v) = call(&api, post("/v1/search", json!({"q": "a".repeat(1024)}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(&api, post("/v1/search", json!({"q": "a".repeat(1025)}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call(&api, post("/v1/search", json!({"q": "!!!"}))).await;
+    assert_eq!((st, hits(&v)), (StatusCode::OK, 0), "{v}");
+    let (st, _) = call(&api, post("/v1/search", json!({"q": "x", "columns": []}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // Cursors of other listings.
+    let (_, v) = call(&api, post("/v1/search", json!({"q": "common", "limit": 10}))).await;
+    let c = v["next_cursor"].as_str().unwrap().to_string();
+    let (_, runs) = call(&api, get("/v1/runs?limit=1")).await;
+    let runs_cursor = runs["next_cursor"].as_str().unwrap().to_string();
+    for bad in [
+        json!({"q": "common", "limit": 10, "cursor": runs_cursor}),
+        json!({"q": "common", "limit": 10, "cursor": c, "project": "other"}),
+        json!({"q": "common", "limit": 11, "cursor": c}),
+    ] {
+        let (st, v) = call(&api, post("/v1/search", bad.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} -> {v}");
+    }
+    // Exactly `limit` hits: no cursor when the listing is known to be complete (here: every source read); a cursor
+    // otherwise, and then page 2 is empty and ends the listing.
+    let (_, p1) = call(&api, post("/v1/search", json!({"q": "word 7", "limit": 1}))).await;
+    assert_eq!(hits(&p1), 1, "{p1}");
+    if let Some(c) = p1["next_cursor"].as_str() {
+        let (_, p2) = call(
+            &api,
+            post("/v1/search", json!({"q": "word 7", "limit": 1, "cursor": c})),
+        )
+        .await;
+        assert_eq!((hits(&p2), &p2["next_cursor"]), (0, &Value::Null), "{p2}");
+    }
+    // Runs q=: tokens, not substrings; case and accent folded; prefixes.
+    let names = |v: &Value| -> std::collections::BTreeSet<String> {
+        v["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, v) = call(&api, get("/v1/runs?q=span-1&limit=1000")).await;
+    assert_eq!(names(&v), ["span-1".to_string()].into(), "{v}");
+    let (_, v) = call(&api, get("/v1/runs?q=Caf%C3%A9&limit=1000")).await;
+    assert_eq!(names(&v), ["cafe".to_string()].into(), "{v}");
+    let (_, v) = call(&api, get("/v1/runs?q=span-1*&limit=1000")).await;
+    assert_eq!(names(&v), ["span-1".to_string(), "span-12".to_string()].into(), "{v}");
+}
+
+/// A deterministic 504: every segment scan takes 200 ms, the query timeout is 50 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_api_timeout() {
+    use forge_query::testing::RecordingSegmentStore;
+    let f = forge().await;
+    let mut s = span("default", 1, 1, None);
+    s.inputs = Some("{\"q\":\"refund\"}".into());
+    f.ingest.submit(vec![s]).await.unwrap();
+    f.ingest.flush_all().await.unwrap();
+    let slow = Arc::new(RecordingSegmentStore::slow(
+        f.segments.clone(),
+        std::time::Duration::from_millis(200),
+    ));
+    let cfg = forge_model::config::QueryConfig {
+        timeout: std::time::Duration::from_millis(50),
+        ..Default::default()
+    };
+    let api = api_router(with_engine(&f, slow, cfg));
+    let (st, v) = call(&api, post("/v1/search", json!({"q": "refund"}))).await;
+    assert_eq!(st, StatusCode::GATEWAY_TIMEOUT, "{v}");
+}

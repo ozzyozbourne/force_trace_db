@@ -1,10 +1,10 @@
 //! M4 query path: `search` / `json_key_search` as Exact provider filters answered from `.fts` sidecars, checked
 //! against the brute-force UDF above the merge, and EXPLAIN / recorded projections without payload columns.
 #![allow(clippy::print_stdout)]
-use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::array::{Array, AsArray};
 use arrow::util::pretty::pretty_format_batches;
 use async_trait::async_trait;
-use forge_index::{FtsBuilder, FtsExpr, FtsHits, IndexReader, IndexResult};
+use forge_index::{FtsExpr, FtsHits, IndexReader, IndexResult};
 use forge_meta::{Metastore, SegmentFilter};
 use forge_model::MemtableView;
 use forge_model::catalog::{HourBucket, SegmentId, SegmentMeta, paths};
@@ -13,21 +13,30 @@ use forge_model::row::SpanRow;
 use forge_model::testing::{FixedMemtable, batch_from_rows, pid, sid, tid};
 use forge_query::testing::{RecordingSegmentStore, memory_store, write_flush};
 use forge_query::{FtsIndexReader, QueryEngine};
-use forge_storage::{ScanRequest, SegmentStore};
-use futures::TryStreamExt;
+use forge_storage::SegmentStore;
 use object_store::ObjectStoreExt;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 
 const BASE: i64 = 1_700_000_000_000_000_000;
 
-/// The real reader, with `fts_byte_size` taken from the object (write_flush commits segments without it) and
-/// segments in `hidden` reported as sidecar-less.
+/// The real reader over the sink-built sidecars; segments in `hidden` are reported as sidecar-less, and `edit`
+/// changes the segment metadata the reader sees (a wrong size or row count).
 #[derive(Debug)]
 struct Sidecars {
     inner: FtsIndexReader,
-    store: Arc<dyn object_store::ObjectStore>,
     hidden: Mutex<HashSet<SegmentId>>,
+    edit: Mutex<Option<(SegmentId, fn(&mut SegmentMeta))>>,
+}
+
+impl Sidecars {
+    fn new(store: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            inner: FtsIndexReader::new(store),
+            hidden: Mutex::default(),
+            edit: Mutex::default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -36,12 +45,12 @@ impl IndexReader for Sidecars {
         if self.hidden.lock().unwrap().contains(&seg.id) {
             return Ok(FtsHits::NoIndex);
         }
-        let loc = paths::fts_path(&seg.path);
-        let size = self.store.head(&loc.as_str().into()).await.unwrap().size;
-        let seg = SegmentMeta {
-            fts_byte_size: Some(size),
-            ..seg.clone()
-        };
+        let mut seg = seg.clone();
+        if let Some((id, f)) = *self.edit.lock().unwrap()
+            && id == seg.id
+        {
+            f(&mut seg);
+        }
         self.inner.search(&seg, e, l).await
     }
 }
@@ -61,6 +70,8 @@ fn row(trace: u64, span: u64, inputs: Option<&str>) -> SpanRow {
 
 struct Fx {
     engine: QueryEngine,
+    meta: Arc<dyn Metastore>,
+    mem: Arc<dyn MemtableView>,
     store: Arc<RecordingSegmentStore>,
     segs: Vec<SegmentMeta>,
     sidecars: Arc<Sidecars>,
@@ -137,40 +148,21 @@ async fn fixture() -> Fx {
         )
         .await,
     );
-    // Sidecars, built from each segment's rows in file order (what SegmentSink does at flush).
-    for s in &segs {
-        let batches: Vec<RecordBatch> = store
-            .scan(s, ScanRequest::default())
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let mut b = FtsBuilder::default();
-        for x in &batches {
-            b.add_batch(x).unwrap();
-        }
-        let bytes = b.finish().unwrap().0;
-        let loc = paths::fts_path(&s.path);
-        store
-            .object_store()
-            .put(&loc.as_str().into(), bytes.into())
-            .await
-            .unwrap();
-    }
+    assert!(
+        segs.iter().all(|s| s.fts_byte_size.is_some()),
+        "the sink builds every sidecar"
+    );
     let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(vec![batch_from_rows(&m)]));
-    let sidecars = Arc::new(Sidecars {
-        inner: FtsIndexReader::new(store.object_store()),
-        store: store.object_store(),
-        hidden: Mutex::default(),
-    });
+    let sidecars = Arc::new(Sidecars::new(store.object_store()));
     let engine =
-        QueryEngine::new(meta.clone(), store.clone(), mem, QueryConfig::default()).with_index(sidecars.clone());
+        QueryEngine::new(meta.clone(), store.clone(), mem.clone(), QueryConfig::default()).with_index(sidecars.clone());
     let all = meta.list_segments(&SegmentFilter::default()).await.unwrap();
     assert_eq!(all.len(), 2);
     store.take_projections();
     Fx {
         engine,
+        meta,
+        mem,
         store,
         segs,
         sidecars,
@@ -241,43 +233,67 @@ async fn index_matches_brute_force_after_merge() {
     );
 }
 
-/// When every hit is single-source, no scan reads `inputs` (only footer/FST/postings and the hit rows' narrow
-/// columns); EXPLAIN shows a `Rows` part and no FilterExec on search. With candidates that need the merge, only the
-/// merge branch reads `inputs`, and only their trace ranges.
+/// When every hit is single-source, no scan reads `inputs`: EXPLAIN shows exactly the hit rows (`rows=Rows(1)`)
+/// and no FilterExec on search. With the sidecar hidden, the brute-force scan reads only `inputs`, and the answer is
+/// the same. With candidates that need the merge, only the merge branch reads `inputs`. `count(*)` is exact.
 #[tokio::test]
 async fn payload_not_read_when_index_answers() {
     let fx = fixture().await;
     let q = "SELECT span_id, name FROM spans WHERE project_id = 'p' AND search(inputs, 'order')";
     let plan = explain(&fx.engine, q).await;
-    println!("{plan}");
     assert!(!plan.contains("inputs"), "{plan}");
     assert!(!plan.contains("search("), "Exact: no FilterExec re-check\n{plan}");
-    fx.store.take_projections();
-    assert_eq!(
-        names(
-            &fx.engine,
-            "SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'order')"
-        )
-        .await
-        .len(),
-        1
+    assert!(
+        plan.contains("rows=Rows(1),") || plan.contains("rows=Rows(1) "),
+        "one hit row\n{plan}"
     );
+    fx.store.take_projections();
+    let q = "SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'order')";
+    assert_eq!(names(&fx.engine, q).await, ["span-21".to_string()].into());
     let read = fx.store.take_projections();
     assert!(read.iter().all(|p| !p.contains(&"inputs")), "{read:?}");
+    let count = async |q: String| {
+        let b = fx.engine.sql_batches(&q).await.unwrap();
+        b[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0)
+    };
+    let cq = |t: &str| format!("SELECT count(*) FROM spans WHERE project_id = 'p' AND search(inputs, '{t}')");
+    assert_eq!(count(cq("order")).await, 1);
+    assert_eq!(count(cq("refund")).await, 4);
+
+    // Hidden sidecar: brute force reads only `inputs` of that segment; same rows.
+    let seg = fx.segs.iter().find(|s| s.row_count > 50).expect("flush 1").id;
+    fx.sidecars.hidden.lock().unwrap().insert(seg);
+    fx.store.take_projections();
+    assert_eq!(names(&fx.engine, q).await, ["span-21".to_string()].into());
+    let read = fx.store.take_projections();
+    assert!(read.iter().any(|p| *p == ["inputs"]), "brute-force scan: {read:?}");
+    assert!(
+        read.iter().filter(|p| p.contains(&"inputs")).all(|p| *p == ["inputs"]),
+        "only the brute-force scan reads inputs: {read:?}"
+    );
+    assert_eq!(count(cq("order")).await, 1);
+    fx.sidecars.hidden.lock().unwrap().clear();
 
     // 'refund': a1 (2 versions), e1 (memtable), d1 (memtable only) need the merge; b1, h1 do not.
     let q = "SELECT span_id, name FROM spans WHERE project_id = 'p' AND search(inputs, 'refund')";
     let plan = explain(&fx.engine, q).await;
     assert!(plan.contains("search(inputs"), "re-check above the merge\n{plan}");
-    println!("{plan}");
+    let scans: Vec<&str> = plan.lines().filter(|l| l.contains("SegmentScanExec")).collect();
+    for l in &scans {
+        assert_eq!(
+            l.contains("inputs"),
+            !l.contains("rows=Rows("),
+            "only the merge branch reads inputs: {l}"
+        );
+    }
     fx.store.take_projections();
     names(&fx.engine, &q.replace("span_id, name", "name")).await;
     let read = fx.store.take_projections();
-    println!("projections: {read:?}");
-    let wide = read.iter().filter(|p| p.contains(&"inputs")).count();
-    assert!(wide >= 1, "{read:?}");
-    // A plain scan of the same columns reads inputs nowhere: the column comes only from the FTS re-check.
-    names(&fx.engine, "SELECT name FROM spans WHERE project_id = 'p'").await;
+    assert!(read.iter().filter(|p| p.contains(&"inputs")).count() >= 1, "{read:?}");
+    // A plain scan of the same columns reads inputs nowhere, and reads every row.
+    let plain = "SELECT name FROM spans WHERE project_id = 'p'";
+    assert!(explain(&fx.engine, plain).await.contains("rows=All"));
+    names(&fx.engine, plain).await;
     assert!(fx.store.take_projections().iter().all(|p| !p.contains(&"inputs")));
 }
 
@@ -310,136 +326,208 @@ async fn json_key_and_trace_tree() {
     );
 }
 
-/// Scaled perf (plan §6): 8 L0 segments x 50k spans (~1 KB inputs each, 1-in-500 rare term, 1-in-5 common term),
-/// every segment with a sidecar, + a 64-batch memtable. cargo test -p forge-query --profile quick-release --test fts
-/// -- --ignored --nocapture
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn perf_search_newest_50() {
-    use std::time::Instant;
-    let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
-    let store = Arc::new(RecordingSegmentStore::new(memory_store()));
-    let inner: Arc<dyn SegmentStore> = store.clone();
-    let (segs, per) = (8u64, 50_000u64);
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut word = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        format!("w{}", x % 50_000)
+/// D4: an unusable sidecar never fails the query and never changes the answer: the segment is brute-forced, and
+/// counted once.
+#[tokio::test]
+async fn corrupt_sidecar_falls_back_to_brute_force() {
+    let fx = fixture().await;
+    let q = "SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'refund')";
+    let want: BTreeSet<String> = ["span-21", "span-41", "span-51", "span-81"].map(String::from).into();
+    let seg = fx.segs[0].clone();
+    let os = fx.store.object_store();
+    let loc: object_store::path::Path = paths::fts_path(&seg.path).as_str().into();
+    let good = os.get(&loc).await.unwrap().bytes().await.unwrap();
+    let fetch = |rs: Vec<std::ops::Range<u64>>| {
+        let b = good.clone();
+        std::future::ready(Ok(rs
+            .into_iter()
+            .map(|r| b.slice(r.start as usize..r.end as usize))
+            .collect()))
     };
+    let footer = forge_index::FtsFile::open("t", good.len() as u64, &fetch)
+        .await
+        .unwrap()
+        .0
+        .footer()
+        .clone();
+    let n = good.len();
+    let flip = |r: std::ops::Range<usize>| {
+        let mut b = good.to_vec();
+        r.for_each(|i| b[i] ^= 0x5A);
+        Some(b)
+    };
+    type Edit = Option<fn(&mut SegmentMeta)>;
+    let cases: Vec<(&str, Option<Vec<u8>>, Edit)> = vec![
+        ("trailer magic", flip(n - 1..n), None),
+        ("footer crc", flip(n - 8..n - 7), None),
+        (
+            "fst block",
+            flip(footer.dict.start as usize..footer.dict.start as usize + 1),
+            None,
+        ),
+        (
+            "postings",
+            flip(footer.postings.start as usize..footer.postings.end as usize),
+            None,
+        ),
+        (
+            "truncated",
+            None,
+            Some(|s| s.fts_byte_size = s.fts_byte_size.map(|n| n + 100)),
+        ),
+        ("missing", Some(Vec::new()), None),
+        ("row count", None, Some(|s| s.row_count += 1)),
+    ];
+    for (name, bytes, edit) in cases {
+        match bytes {
+            Some(b) if b.is_empty() => os.delete(&loc).await.unwrap(),
+            Some(b) => {
+                os.put(&loc, b.into()).await.unwrap();
+            }
+            None => {}
+        }
+        let idx = Arc::new(Sidecars::new(os.clone()));
+        *idx.edit.lock().unwrap() = edit.map(|f| (seg.id, f));
+        let e = QueryEngine::new(
+            fx.meta.clone(),
+            fx.store.clone(),
+            fx.mem.clone(),
+            QueryConfig::default(),
+        )
+        .with_index(idx);
+        assert_eq!(names(&e, q).await, want, "{name}");
+        let c = e.fts_counters();
+        assert_eq!((c.brute_parts, c.index_parts), (1, 1), "{name}: {c:?}");
+        os.put(&loc, good.clone().into()).await.unwrap();
+    }
+}
+
+/// One segment (sidecar hidden when `hide`) of `seg_rows` plus a memtable of `mem_rows`, under `cfg`.
+async fn small_engine(seg_rows: Vec<SpanRow>, mem_rows: Vec<SpanRow>, hide: bool, cfg: QueryConfig) -> QueryEngine {
+    let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
+    let store = memory_store();
     let mut v = 0;
-    let hour = HourBucket::from_nanos(BASE);
-    let t0 = Instant::now();
-    for s in 0..segs {
-        let rows: Vec<SpanRow> = (0..per)
-            .map(|i| {
-                let n = s * per + i;
+    let mut stamp = |rows: Vec<SpanRow>| -> Vec<SpanRow> {
+        rows.into_iter()
+            .map(|r| {
                 v += 1;
-                let mut text: Vec<String> = (0..120).map(|_| word()).collect();
-                if n % 500 == 0 {
-                    text.push("zebracorn".into());
-                }
-                if n % 5 == 0 {
-                    text.push("refund".into());
-                }
-                let inputs = serde_json::json!({"messages":[{"role":"user","content":text.join(" ")}]}).to_string();
-                SpanRow {
-                    version: v,
-                    ..row(n / 20, n, Some(&inputs))
-                }
+                SpanRow { version: v, ..r }
             })
-            .collect();
-        let written = write_flush(
+            .collect()
+    };
+    let (seg_rows, mem_rows) = (stamp(seg_rows), stamp(mem_rows));
+    let n = seg_rows.len() as u64;
+    let segs = if seg_rows.is_empty() {
+        vec![]
+    } else {
+        let hour = HourBucket::from_nanos(BASE);
+        write_flush(
             &*meta,
-            inner.clone(),
-            &batch_from_rows(&rows),
+            store.clone(),
+            &batch_from_rows(&seg_rows),
             hour,
             "t",
-            64 << 20,
-            s + 1,
-            v,
+            1 << 20,
+            1,
+            n,
         )
-        .await;
-        for seg in &written {
-            let batches: Vec<RecordBatch> = store
-                .scan(seg, ScanRequest::default())
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-            let mut b = FtsBuilder::default();
-            for x in &batches {
-                b.add_batch(x).unwrap();
-            }
-            let (bytes, st) = b.finish().unwrap();
-            println!(
-                "segment {}: {} rows, vortex {} B, fts {} B",
-                seg.id, seg.row_count, seg.byte_size, st.file_bytes
-            );
-            store
-                .object_store()
-                .put(&paths::fts_path(&seg.path).as_str().into(), bytes.into())
-                .await
-                .unwrap();
-        }
+        .await
+    };
+    let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(if mem_rows.is_empty() {
+        vec![]
+    } else {
+        vec![batch_from_rows(&mem_rows)]
+    }));
+    let idx = Arc::new(Sidecars::new(store.object_store()));
+    if hide {
+        idx.hidden.lock().unwrap().extend(segs.iter().map(|s| s.id));
     }
-    println!("built in {:?}", t0.elapsed());
-    let mem_rows: Vec<RecordBatch> = (0..64u64)
-        .map(|b| {
-            batch_from_rows(
-                &(0..100u64)
-                    .map(|i| {
-                        v += 1;
-                        let n = 10_000_000 + b * 100 + i;
-                        SpanRow {
-                            version: v,
-                            ..row(n / 20, n, Some(&format!(r#"{{"q":"{} {}"}}"#, word(), word())))
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
+    QueryEngine::new(meta, store, mem, cfg).with_index(idx)
+}
+
+fn search_req(q: &str) -> forge_query::search::SearchRequest {
+    let body = forge_query::search::SearchBody {
+        q: q.into(),
+        columns: Some(vec!["inputs".into()]),
+        ..Default::default()
+    };
+    forge_query::search::SearchRequest::parse(body, pid("p")).unwrap()
+}
+
+/// D5: a sidecar-less segment is brute-forced one batch at a time: 20k rows x ~2 KB of `inputs` (~40 MiB) pass
+/// under a 16 MiB query memory limit, on the SQL and the `/v1/search` paths.
+#[tokio::test]
+async fn brute_force_streams_under_memory_limit() {
+    let filler = "lorem ipsum dolor sit amet ".repeat(75);
+    let rows: Vec<SpanRow> = (0..20_000u64)
+        .map(|i| {
+            let text = if i % 5_000 == 0 {
+                format!("{filler} needle")
+            } else {
+                filler.clone()
+            };
+            row(i / 20, i, Some(&serde_json::json!({ "q": text }).to_string()))
         })
         .collect();
-    let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(mem_rows));
-    let idx = Arc::new(Sidecars {
-        inner: FtsIndexReader::new(store.object_store()),
-        store: store.object_store(),
-        hidden: Mutex::default(),
-    });
-    let engine = QueryEngine::new(meta, store.clone(), mem, QueryConfig::default()).with_index(idx);
-    for (label, term) in [
-        ("rare (1/500)", "zebracorn"),
-        ("common (1/5)", "refund"),
-        ("absent", "qqqzzz"),
+    let bytes: usize = rows.iter().map(|r| r.inputs.as_ref().unwrap().len()).sum();
+    assert!(bytes > 32 << 20, "the column alone exceeds the limit: {bytes}");
+    let cfg = QueryConfig {
+        memory_limit: bytesize::ByteSize::mib(16),
+        ..QueryConfig::default()
+    };
+    let e = small_engine(rows, vec![], true, cfg).await;
+    let q = "SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'needle')";
+    assert_eq!(names(&e, q).await.len(), 4);
+    assert_eq!(e.search(&search_req("needle")).await.unwrap().rows.num_rows(), 4);
+    assert_eq!(e.fts_counters().brute_parts, 2);
+}
+
+/// D13: a prefix expanding to more than 10,000 terms in one source is a 400 whether the source is an indexed
+/// segment, a brute-forced segment or the memtable.
+#[tokio::test]
+async fn prefix_too_broad_everywhere() {
+    use forge_model::error::{Classify, ErrorKind};
+    let rows = || -> Vec<SpanRow> {
+        (0..101u64)
+            .map(|i| {
+                let words: Vec<String> = (0..100).map(|j| format!("w{}", i * 100 + j)).collect();
+                row(1, i, Some(&serde_json::json!({ "q": words.join(" ") }).to_string()))
+            })
+            .collect()
+    };
+    for (what, seg, mem, hide) in [
+        ("indexed segment", rows(), vec![], false),
+        ("brute-forced segment", rows(), vec![], true),
+        ("memtable", vec![], rows(), false),
     ] {
-        let q = format!(
-            "SELECT trace_id, span_id, name, start_time FROM spans WHERE project_id = 'p' AND search(inputs, '{term}') \
-             ORDER BY start_time DESC LIMIT 50"
-        );
-        let mut ts = Vec::new();
-        let mut n = 0;
-        for i in 0..25 {
-            let t = Instant::now();
-            let b = engine.sql_batches(&q).await.unwrap();
-            if i >= 5 {
-                ts.push(t.elapsed());
-            }
-            n = b.iter().map(|b| b.num_rows()).sum::<usize>();
-        }
-        ts.sort();
-        println!(
-            "{label:<14} rows {n:>3}  p50 {:?}  p95 {:?}",
-            ts[ts.len() / 2],
-            ts[ts.len() * 95 / 100]
-        );
-        let read = store.take_projections();
-        let wide = read.iter().filter(|p| p.contains(&"inputs")).count();
-        println!(
-            "   scans {} (with inputs: {wide}); first: {:?}",
-            read.len(),
-            read.iter().find(|p| p.contains(&"inputs"))
-        );
+        let e = small_engine(seg, mem, hide, QueryConfig::default()).await;
+        let err = e
+            .sql_batches("SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'w*')")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{what} (SQL): {err}");
+        assert!(err.to_string().contains("prefix too broad"), "{what}: {err}");
+        let err = e.search(&search_req("w*")).await.err().expect("400");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{what} (search): {err}");
+        // A narrower prefix works.
+        assert!(e.search(&search_req("w100*")).await.is_ok(), "{what}");
     }
+}
+
+/// `/v1/search`: single-source hits are read with the run columns only, never a payload column.
+#[tokio::test]
+async fn search_single_source_reads_no_payload() {
+    let fx = fixture().await;
+    fx.store.take_projections();
+    let page = fx.engine.search(&search_req("order")).await.unwrap();
+    assert_eq!(page.rows.num_rows(), 1);
+    let read = fx.store.take_projections();
+    assert!(!read.is_empty());
+    assert!(
+        read.iter().all(|p| !p
+            .iter()
+            .any(|c| ["inputs", "outputs", "events", "attributes"].contains(c))),
+        "{read:?}"
+    );
+    assert_eq!(fx.engine.fts_counters().exact_rows, 1);
 }

@@ -89,6 +89,9 @@ pub struct Footer {
     pub dict: Range<u64>,
     pub num_terms: u64,
     pub blocks: Vec<BlockMeta>,
+    /// Rows whose start_time is null (the search frontier, plans/phase-5 D8). Encoded last:
+    /// `len u32 | portable roaring`.
+    pub null_starts: roaring::RoaringBitmap,
 }
 
 impl Footer {
@@ -115,6 +118,8 @@ impl Footer {
             put_u32(o, b.num_terms);
             put_u32(o, b.crc);
         }
+        put_u32(o, self.null_starts.serialized_size() as u32);
+        self.null_starts.serialize_into(&mut *o).expect("Vec write");
     }
 
     /// `file_len`: every range must lie inside the file, before the footer.
@@ -164,6 +169,11 @@ impl Footer {
                 crc,
             });
         }
+        let n = c.u32()? as usize;
+        let null_starts = roaring::RoaringBitmap::deserialize_from(c.bytes(n)?).map_err(|e| e.to_string())?;
+        if null_starts.max().is_some_and(|r| r >= num_rows) {
+            return Err("null-start row out of range".into());
+        }
         if c.p != b.len() {
             return Err("trailing footer bytes".into());
         }
@@ -174,14 +184,24 @@ impl Footer {
             dict,
             num_terms,
             blocks,
+            null_starts,
         })
     }
 }
 
 /// Appends one posting entry for `rows` (sorted, distinct, len >= 2):
 /// `enc u8 | doc_freq u32 |` then `doc_freq x varint(delta)` (first delta absolute), or
-/// `n_rg u16 | n_rg x (rg u16, byte_len u32) | n_rg x portable roaring (global row ids, optimize()d)`.
+/// `n_rg u16 | n_rg x (rg u16, byte_len u32) | n_rg x portable roaring (global row ids, optimize()d)`;
+/// then `crc32 u32` of the entry's bytes. Returns true for the roaring form.
 pub fn encode_postings(rows: &[u32], o: &mut Vec<u8>) -> bool {
+    let start = o.len();
+    let roaring = encode_entry(rows, o);
+    let crc = crc32fast::hash(&o[start..]);
+    put_u32(o, crc);
+    roaring
+}
+
+fn encode_entry(rows: &[u32], o: &mut Vec<u8>) -> bool {
     debug_assert!(rows.len() >= 2 && rows.windows(2).all(|w| w[0] < w[1]));
     if rows.len() <= SMALL_LIST_MAX {
         o.push(ENC_VARINT);
@@ -218,6 +238,11 @@ pub fn encode_postings(rows: &[u32], o: &mut Vec<u8>) -> bool {
 
 /// Decodes one posting entry; `keep(rg)` skips row groups already ruled out (e.g. by another predicate).
 pub fn decode_postings(buf: &[u8], keep: &dyn Fn(u16) -> bool) -> FmtResult<roaring::RoaringBitmap> {
+    let body = buf.len().checked_sub(4).ok_or("truncated")?;
+    let (buf, crc) = buf.split_at(body);
+    if crc32fast::hash(buf) != u32::from_le_bytes(crc.try_into().expect("4 bytes")) {
+        return Err("postings crc".into());
+    }
     let mut c = Cur::new(buf);
     let enc = c.u8()?;
     let df = c.u32()?;

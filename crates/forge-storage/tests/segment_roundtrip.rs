@@ -571,5 +571,6 @@ async fn footer_cache_skips_reopen() {
     let (second, warm, t_warm) = scan().await;
     assert_eq!(first, second);
     assert_eq!(first.num_rows(), 100);
-    assert!(warm < cold, "warm {warm} GETs {t_warm:?}, cold {cold} GETs {t_cold:?}");
+    // Cold: the 2 footer reads + 2 data reads; warm: the footer comes from the cache (RA #6).
+    assert_eq!((cold, warm), (4, 2), "cold {t_cold:?}, warm {t_warm:?}");
 }

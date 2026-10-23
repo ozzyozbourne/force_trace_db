@@ -35,6 +35,7 @@ impl QueryEngine {
             segments: self.store.clone(),
             memtable: self.mem.clone(),
             index: self.index.clone(),
+            counters: self.fts.clone(),
         };
         ctx.register_table("spans", Arc::new(provider))?;
         ctx.register_udf(ScalarUDF::new_from_impl(fts::SearchUdf::default()));

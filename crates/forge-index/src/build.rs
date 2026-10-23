@@ -6,7 +6,7 @@ use crate::format::{BlockMeta, FST_BLOCK_RAW_BUDGET, Footer, MAGIC, TermValue, e
 use crate::{FtsColumn, IndexError, IndexResult};
 use arrow::array::{Array, AsArray};
 use arrow::record_batch::RecordBatch;
-use forge_model::schema::col_idx;
+use forge_model::schema::{col, col_idx};
 use std::collections::HashMap;
 
 type TermMap = HashMap<Box<[u8]>, u32, foldhash::fast::RandomState>;
@@ -37,6 +37,8 @@ pub struct FtsBuilder {
     pairs: Vec<(u32, u32)>,
     /// Rows seen = the next row id of `add_batch`.
     rows: u32,
+    /// Rows of `add_batch` whose start_time is null.
+    null_starts: roaring::RoaringBitmap,
     block_budget: usize,
 }
 
@@ -48,6 +50,7 @@ impl Default for FtsBuilder {
             last_row: Vec::new(),
             pairs: Vec::new(),
             rows: 0,
+            null_starts: roaring::RoaringBitmap::new(),
             block_budget: FST_BLOCK_RAW_BUDGET,
         }
     }
@@ -118,6 +121,11 @@ impl FtsBuilder {
             .ok()
             .filter(|n| base.checked_add(*n).is_some_and(|e| e < NO_ROW));
         let n = n.ok_or_else(|| IndexError::Build("segment exceeds u32 row ids".into()))?;
+        let start = b.column(col_idx(col::START_TIME));
+        if start.null_count() > 0 {
+            self.null_starts
+                .extend((0..n).filter(|i| start.is_null(*i as usize)).map(|i| base + i));
+        }
         for col in FtsColumn::ALL {
             let a = b.column(col_idx(col.name())).as_string::<i32>();
             if a.null_count() == a.len() {
@@ -220,6 +228,7 @@ impl FtsBuilder {
             dict,
             num_terms: keys.len() as u64,
             blocks,
+            null_starts: self.null_starts,
         };
         let f0 = out.len();
         footer.encode(&mut out);

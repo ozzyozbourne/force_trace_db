@@ -63,6 +63,16 @@ impl DisplayAs for SegmentScanExec {
             self.parts.len(),
             self.cols.join(", ")
         )?;
+        let rows: Vec<String> = self
+            .parts
+            .iter()
+            .map(|p| match &p.rows {
+                forge_storage::RowSelection::All => "All".to_string(),
+                forge_storage::RowSelection::Range(r) => format!("Range({})", r.end - r.start),
+                forge_storage::RowSelection::Rows(r) => format!("Rows({})", r.len()),
+            })
+            .collect();
+        write!(f, ", rows={}", rows.join("|"))?;
         if let Some(x) = &self.filter {
             write!(f, ", filter={x}")?;
         }

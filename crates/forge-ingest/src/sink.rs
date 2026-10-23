@@ -36,7 +36,8 @@ pub struct SegmentSink {
     /// Dropping an unfinished sink aborts the writer and the `.fts` task (nothing is uploaded).
     aborts: [AbortHandle; 2],
     blobs: BTreeSet<String>,
-    /// (term, row) pairs the `.fts` builder holds; updated after each batch, so it lags `push` by <= 3 batches.
+    /// (term, row) pairs the `.fts` builder holds; updated after each batch, so it lags `push` by <= 4 batches
+    /// (a channel of 2 + 1 sender slot + the batch in `add_batch`).
     postings: Arc<AtomicU64>,
 }
 
@@ -174,5 +175,109 @@ impl Drop for SegmentSink {
         if self.handle.is_some() || self.fts.is_some() {
             self.aborts.iter().for_each(AbortHandle::abort);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, AsArray};
+    use forge_model::catalog::{HourBucket, Level, SegmentId};
+    use forge_model::row::SpanRow;
+    use forge_model::schema::col;
+    use forge_model::testing::{batch_from_rows, pid, sid, sort_by_key, tid};
+    use forge_storage::ScanRequest;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    /// RT #7: three batches through the sink; every row's unique token is indexed at exactly the row position the
+    /// `.vortex` scan gives it, and each batch's shared token covers exactly that batch's rows.
+    #[tokio::test]
+    async fn sink_rows_align_across_batches() {
+        let store = forge_storage::testing::memory_store();
+        let rows: Vec<SpanRow> = (0..90u64)
+            .map(|i| SpanRow {
+                project_id: Some(pid("p")),
+                trace_id: tid(i / 10),
+                span_id: sid(i),
+                start_time_ns: (i % 7 != 0).then_some(i as i64),
+                inputs: Some(format!("{{\"q\":\"row{i}\"}}")),
+                version: 1,
+                ..Default::default()
+            })
+            .collect();
+        let all = sort_by_key(&batch_from_rows(&rows));
+        let spec = SegmentSpec {
+            id: SegmentId::new(),
+            project_id: pid("p"),
+            level: Level::L0,
+            partition_hour: HourBucket(0),
+        };
+        let mut sink = SegmentSink::open(store.clone(), spec).unwrap();
+        for (k, (off, len)) in [(0, 20), (20, 30), (50, 40)].into_iter().enumerate() {
+            // Tag each batch's rows with a shared token.
+            let b = all.slice(off, len);
+            let inputs = b.column(forge_model::schema::col_idx(col::INPUTS)).as_string::<i32>();
+            let tagged: arrow::array::StringArray = (0..len)
+                .map(|i| Some(inputs.value(i).replace("\"}", &format!(" batch{k}\"}}"))))
+                .collect();
+            let mut cols = b.columns().to_vec();
+            cols[forge_model::schema::col_idx(col::INPUTS)] = Arc::new(tagged);
+            sink.push(RecordBatch::try_new(b.schema(), cols).unwrap())
+                .await
+                .unwrap();
+        }
+        let seg = sink.finish().await.unwrap().meta;
+        let len = seg.fts_byte_size.expect("sidecar");
+        let req = ScanRequest {
+            projection: Some(vec![col::INPUTS]),
+            ..Default::default()
+        };
+        let scanned: Vec<RecordBatch> = store.scan(&seg, req).await.unwrap().try_collect().await.unwrap();
+        let cells: Vec<String> = scanned
+            .iter()
+            .flat_map(|b| {
+                let c = b.column(0).as_string::<i32>();
+                (0..c.len()).map(|i| c.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(cells.len(), 90);
+        let os = store.object_store();
+        let loc = object_store::path::Path::from(paths::fts_path(&seg.path).as_str());
+        let bytes = os.get(&loc).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.len() as u64, len);
+        let fetch = |rs: Vec<std::ops::Range<u64>>| {
+            std::future::ready(Ok(rs
+                .into_iter()
+                .map(|r| bytes.slice(r.start as usize..r.end as usize))
+                .collect()))
+        };
+        let f = forge_index::FtsFile::open("t", len, &fetch).await.unwrap().0;
+        let an = &mut forge_index::Analyzer::default();
+        let lookup = async |an: &mut forge_index::Analyzer, t: &str| {
+            let p = forge_index::FtsPredicate::Search {
+                column: forge_index::FtsColumn::Inputs,
+                query: t.into(),
+            };
+            let m = forge_index::Matcher::new(an, &p).unwrap();
+            f.execute(m.query(), &fetch).await.unwrap().0
+        };
+        for (pos, c) in cells.iter().enumerate() {
+            let tok = c.split(['"', ' ']).find(|w| w.starts_with("row")).unwrap();
+            assert_eq!(lookup(an, tok).await, [pos as u32].into_iter().collect(), "{tok}");
+        }
+        for (k, range) in [(0, 0..20u32), (1, 20..50), (2, 50..90)] {
+            assert_eq!(lookup(an, &format!("batch{k}")).await, range.collect(), "batch{k}");
+        }
+        let nulls: Vec<u32> = (0..90u32)
+            .filter(|p| {
+                let tok = cells[*p as usize]
+                    .split(['"', ' '])
+                    .find(|w| w.starts_with("row"))
+                    .unwrap();
+                tok[3..].parse::<u64>().unwrap() % 7 == 0
+            })
+            .collect();
+        assert_eq!(f.null_starts().iter().collect::<Vec<_>>(), nulls);
     }
 }

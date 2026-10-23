@@ -152,6 +152,10 @@ impl ReadView {
         Ok(out)
     }
 
+    pub fn store(&self) -> &Arc<dyn SegmentStore> {
+        &self.store
+    }
+
     /// The snapshot (cheap to clone: Arcs), e.g. to mask it on the blocking pool beside the I/O.
     pub fn mem(&self) -> &MemtableSnapshot {
         &self.mem

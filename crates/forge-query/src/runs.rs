@@ -313,13 +313,24 @@ pub(crate) fn upper_bound(end_ns: Option<i64>, cursor: Option<Cursor>) -> Option
 pub(crate) trait CandidateSource: Send + Sync {
     /// Upper bound on the merged start_time of every row this segment can contribute (None: none).
     fn frontier(&self, s: &SegmentMeta) -> Option<i64>;
-    /// Optional lookahead for the next segments in frontier order (search: index lookups, D9).
+    /// Called once before the segments are sorted by frontier (search: the eager lookups of D8).
+    async fn start(&self, _q: &QueryCtx, _view: &ReadView, _segs: &[SegmentMeta]) -> Result<(), QueryError> {
+        Ok(())
+    }
+    /// Lookahead window size; 0 = no prefetch.
+    fn prefetch_window(&self) -> usize {
+        0
+    }
+    /// Lookahead over one whole window of the next segments in frontier order (search: index lookups, D10).
     async fn prefetch(&self, _q: &QueryCtx, _view: &ReadView, _next: &[SegmentMeta]) -> Result<(), QueryError> {
         Ok(())
     }
+    /// The end of the next round's segments, read from `segs[i..]` (runs: every segment sharing `segs[i]`'s
+    /// frontier; search: `read_group` segments).
+    fn group_end(&self, segs: &[SegmentMeta], i: usize) -> usize;
     /// Positions in the memtable snapshot (called once).
     async fn mem(&self, q: &QueryCtx, view: &ReadView) -> Result<Vec<Candidate>, QueryError>;
-    /// Positions in `parts` (up to READ_GROUP segments, read concurrently).
+    /// Positions in `parts` (one round of segments, read concurrently).
     async fn segments(
         &self,
         q: &QueryCtx,
@@ -351,8 +362,6 @@ impl Candidate {
     }
 }
 
-pub(crate) const READ_GROUP: usize = 8; // D8
-pub(crate) const PREFETCH: usize = 64; // D9
 const MIN_CHUNK: usize = 256;
 
 /// The shared early-stop loop (D8): the newest `k` verified rows of `src` over `segs`, as a page.
@@ -365,6 +374,7 @@ pub(crate) async fn page(
     schema: &SchemaRef,
 ) -> Result<(RunsPage, MemoryReservation), QueryError> {
     let k = k.max(1);
+    src.start(q, view, &segs).await?;
     segs.retain(|s| src.frontier(s).is_some());
     segs.sort_by_key(|s| Reverse((src.frontier(s), s.id)));
     let mut res = MemoryConsumer::new("page").register(&q.pool);
@@ -383,8 +393,12 @@ pub(crate) async fn page(
     let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
     let mut seen: BTreeSet<(TraceId, SpanId)> = BTreeSet::new();
     let chunk = MIN_CHUNK.max(2 * k);
-    let mut i = 0;
+    let (mut i, mut horizon) = (0, 0);
     loop {
+        // A segment whose lookup found no hits has nothing to read (search).
+        while segs.get(i).is_some_and(|s| src.frontier(s).is_none()) {
+            i += 1;
+        }
         let frontier = segs.get(i).and_then(|s| src.frontier(s));
         let above = |p: &Pos| frontier.is_none_or(|f| p.0 > f);
         // Done when the K-th verified row is above the frontier AND no unverified candidate is newer than it: a row
@@ -427,8 +441,15 @@ pub(crate) async fn page(
         if kth_above(&verified, &cand, &pending) || frontier.is_none() {
             break;
         }
-        src.prefetch(q, view, &segs[i..(i + PREFETCH).min(segs.len())]).await?;
-        let end = (i + READ_GROUP).min(segs.len());
+        let end = src.group_end(&segs, i).min(segs.len());
+        let w = src.prefetch_window();
+        while w > 0 && horizon < end {
+            // Whole windows: one round of lookups per `w` segments, not one per group (RA M3).
+            horizon = horizon.max(i);
+            let he = (horizon + w).min(segs.len());
+            src.prefetch(q, view, &segs[horizon..he]).await?;
+            horizon = he;
+        }
         let parts: Vec<SegmentPart> = segs[i..end]
             .iter()
             .map(|s| SegmentPart {
@@ -468,6 +489,12 @@ impl CandidateSource for RootScan<'_> {
     fn frontier(&self, s: &SegmentMeta) -> Option<i64> {
         // All-null-start segments hold no candidates (their rows are still read by verify via locate_traces).
         s.max_start_ns
+    }
+
+    /// One frontier value per round (the pre-M4 loop).
+    fn group_end(&self, segs: &[SegmentMeta], i: usize) -> usize {
+        let f = segs[i].max_start_ns;
+        i + segs[i..].iter().take_while(|s| s.max_start_ns == f).count()
     }
 
     async fn mem(&self, q: &QueryCtx, view: &ReadView) -> Result<Vec<Candidate>, QueryError> {

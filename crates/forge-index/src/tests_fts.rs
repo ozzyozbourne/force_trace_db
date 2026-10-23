@@ -299,18 +299,63 @@ proptest! {
         for cut in [0, 1, buf.len() / 2, buf.len() - 1] {
             prop_assert!(decode_postings(&buf[..cut], &|_| true).is_err());
         }
+        // The entry's crc catches any flipped byte (a flipped delta would otherwise decode to wrong rows).
+        for i in [0, 5, buf.len() / 3, buf.len() / 2, buf.len() - 5, buf.len() - 1] {
+            let mut bad = buf.clone();
+            bad[i] ^= 0x10;
+            prop_assert!(decode_postings(&bad, &|_| true).is_err(), "flip at {}", i);
+        }
     }
 
     #[test]
-    fn footer_round_trip(blocks in prop::collection::vec((prop::collection::vec(any::<u8>(), 0..40), any::<u32>(), any::<u32>()), 0..20), rows: u32) {
+    fn footer_round_trip(
+        blocks in prop::collection::vec((prop::collection::vec(any::<u8>(), 0..40), any::<u32>(), any::<u32>()), 0..20),
+        rows: u32,
+        nulls in prop::collection::btree_set(any::<u32>(), 0..200),
+    ) {
         let blocks: Vec<BlockMeta> = blocks.into_iter().enumerate().map(|(i, (k, n, crc))| BlockMeta {
             first_key: k.clone(), last_key: k, offset: 100 + i as u64 * 10, len: 10, num_terms: n, crc,
         }).collect();
-        let f = Footer { num_rows: rows, cols: vec![0, 1, 2, 3, 4], postings: 4..100, dict: 100..100 + blocks.len() as u64 * 10, num_terms: 7, blocks };
+        let f = Footer { num_rows: rows, cols: vec![0, 1, 2, 3, 4], postings: 4..100, dict: 100..100 + blocks.len() as u64 * 10, num_terms: 7, blocks, null_starts: nulls.into_iter().filter(|r| *r < rows).collect() };
         let mut buf = Vec::new();
         f.encode(&mut buf);
         prop_assert_eq!(Footer::decode(&buf, f.dict.end).unwrap(), f.clone());
         prop_assert!(Footer::decode(&buf[..buf.len() - 1], f.dict.end).is_err());
         prop_assert!(f.dict.end == 100 || Footer::decode(&buf, f.dict.end - 1).is_err());
     }
+}
+
+/// A flipped byte inside a df >= 2 posting entry is `Corrupt`, never wrong rows.
+#[tokio::test]
+async fn postings_crc_mismatch_is_corrupt() {
+    let mut b = FtsBuilder::default();
+    for row in 0..40 {
+        b.add(row, FtsColumn::Name, "hello world").unwrap();
+    }
+    let (file, st) = b.finish().unwrap();
+    assert!(st.varint_terms + st.roaring_terms > 0);
+    let fetch = fetcher(Bytes::from(file.clone()));
+    let (f, _) = FtsFile::open("t.fts", file.len() as u64, &fetch).await.unwrap();
+    let postings = f.footer().postings.clone();
+    let q = Query {
+        groups: vec![vec![Leaf::Exact(key_token(FtsColumn::Name, "hello"))]],
+        needs_recheck: false,
+    };
+    assert_eq!(f.execute(&q, &fetch).await.unwrap().0, (0..40).collect());
+    let mut corrupt = 0;
+    for i in postings.clone().step_by(3) {
+        let mut bad = file.clone();
+        bad[i as usize] ^= 0x01;
+        let fetch = fetcher(Bytes::from(bad.clone()));
+        let (f, _) = FtsFile::open("t.fts", bad.len() as u64, &fetch).await.unwrap();
+        match f.execute(&q, &fetch).await {
+            Err(crate::IndexError::Corrupt { .. }) => corrupt += 1,
+            Ok((rows, _)) => {
+                // Only the other term's entry was hit.
+                assert_eq!(rows, (0..40).collect(), "flip at {i} gave wrong rows");
+            }
+            Err(e) => panic!("flip at {i}: {e}"),
+        }
+    }
+    assert!(corrupt > 0);
 }

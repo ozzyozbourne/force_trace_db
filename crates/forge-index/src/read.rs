@@ -93,6 +93,11 @@ impl FtsFile {
         &self.footer
     }
 
+    /// Rows whose start_time is null (plans/phase-5 D8).
+    pub fn null_starts(&self) -> &RoaringBitmap {
+        &self.footer.null_starts
+    }
+
     /// Candidate rows (file row ids) of `q`. A term missing from the dictionary ends its AND group before any
     /// postings read; when every group is dead, the second wave never happens.
     pub async fn execute<F, Fut>(&self, q: &Query, fetch: &F) -> IndexResult<(RoaringBitmap, Io)>
@@ -222,9 +227,7 @@ impl FtsFile {
                     while let Some((_, v)) = st.next() {
                         vals.push(v);
                         if vals.len() > MAX_PREFIX_TERMS {
-                            return Err(IndexError::Query(format!(
-                                "prefix matches more than {MAX_PREFIX_TERMS} terms"
-                            )));
+                            return Err(crate::matcher::prefix_too_broad());
                         }
                     }
                 }

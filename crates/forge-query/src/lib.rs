@@ -37,6 +37,7 @@ use forge_model::merge::{Cancel, CancelOnDrop};
 use forge_storage::SegmentStore;
 use read::ReadView;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -148,6 +149,40 @@ impl Classify for QueryError {
 #[cfg(any(test, feature = "test-util"))]
 pub type BlockingHook = Arc<dyn Fn(&str, &Cancel) + Send + Sync>;
 
+/// What the FTS paths did, summed over every query of an engine (tests diff two snapshots; D4's brute-force count).
+#[derive(Debug, Default)]
+pub(crate) struct FtsCounters {
+    pub index_parts: AtomicU64,
+    pub brute_parts: AtomicU64,
+    pub exact_rows: AtomicU64,
+    pub merge_rows: AtomicU64,
+    pub segments_read: AtomicU64,
+    pub unpositioned: AtomicU64,
+}
+
+/// A copy of the engine's FTS counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FtsCountersSnapshot {
+    /// Segment parts answered from a `.fts` sidecar.
+    pub index_parts: u64,
+    /// Segment parts brute-forced (no sidecar, or an unusable one).
+    pub brute_parts: u64,
+    /// Rows answered from the index alone (single-source).
+    pub exact_rows: u64,
+    /// Candidate rows merged and re-checked.
+    pub merge_rows: u64,
+    /// Segments whose hit keys or brute-force column were scanned.
+    pub segments_read: u64,
+    /// `/v1/search` hits on start-less rows (verified before their position is known).
+    pub unpositioned: u64,
+}
+
+impl FtsCounters {
+    pub(crate) fn add(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 pub struct QueryEngine {
     pub(crate) meta: Arc<dyn Metastore>,
     pub(crate) store: Arc<dyn SegmentStore>,
@@ -156,6 +191,10 @@ pub struct QueryEngine {
     /// `.fts` lookups (default: `FtsIndexReader` over the segment store).
     pub(crate) index: Arc<dyn forge_index::IndexReader>,
     pub(crate) sql_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) fts: Arc<FtsCounters>,
+    /// `/v1/search`: segments read per round, and the lookahead window of index lookups (D10).
+    pub(crate) read_group: usize,
+    pub(crate) prefetch: usize,
     /// DataFusion `target_partitions` (default: the CPU count).
     pub target_partitions: usize,
     #[cfg(any(test, feature = "test-util"))]
@@ -236,6 +275,9 @@ impl QueryEngine {
             mem,
             cfg,
             sql_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+            fts: Arc::default(),
+            read_group: 8,
+            prefetch: 64,
             target_partitions: cpus,
             #[cfg(any(test, feature = "test-util"))]
             blocking_hook: None,
@@ -246,6 +288,26 @@ impl QueryEngine {
     pub fn with_index(mut self, index: Arc<dyn forge_index::IndexReader>) -> Self {
         self.index = index;
         self
+    }
+
+    /// `/v1/search` segments per round and lookahead window (defaults 8 and 64; tests use small values).
+    pub fn with_search_sizes(mut self, read_group: usize, prefetch: usize) -> Self {
+        self.read_group = read_group.max(1);
+        self.prefetch = prefetch.max(1);
+        self
+    }
+
+    pub fn fts_counters(&self) -> FtsCountersSnapshot {
+        let c = &*self.fts;
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        FtsCountersSnapshot {
+            index_parts: g(&c.index_parts),
+            brute_parts: g(&c.brute_parts),
+            exact_rows: g(&c.exact_rows),
+            merge_rows: g(&c.merge_rows),
+            segments_read: g(&c.segments_read),
+            unpositioned: g(&c.unpositioned),
+        }
     }
 
     /// The memtable snapshot, taken now (before any metastore call made through the view).

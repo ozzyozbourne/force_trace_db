@@ -12,7 +12,7 @@ mod tests_fts;
 
 pub use analyzer::Analyzer;
 pub use build::{BuildStats, FtsBuilder};
-pub use matcher::Matcher;
+pub use matcher::{Matcher, PrefixSeen};
 pub use read::FtsFile;
 
 use async_trait::async_trait;
@@ -97,6 +97,9 @@ pub enum FtsHits {
     Rows {
         rows: roaring::RoaringTreemap,
         needs_recheck: bool,
+        /// Some hit row has a null start_time (the footer's null-start bitmap): the segment's `max_start_ns` does not
+        /// bound the merged start of its hits (plans/phase-5 D8).
+        start_less: bool,
     },
 }
 

@@ -40,6 +40,7 @@ pub(crate) struct SpansTableProvider {
     pub segments: Arc<dyn SegmentStore>,
     pub memtable: Arc<dyn MemtableView>,
     pub index: Arc<dyn forge_index::IndexReader>,
+    pub counters: Arc<crate::FtsCounters>,
 }
 
 /// More candidate keys than this per project: scan with a post-merge re-check instead of key lookups.
@@ -199,9 +200,19 @@ impl TableProvider for SpansTableProvider {
         if let Some(expr) = &fts_expr {
             for (p, (parts, _)) in groups {
                 let pid = ProjectId::new(p).map_err(ext)?;
-                let sel = crate::fts_scan::select(&view, &*self.index, &pid, &k, &parts, expr, MAX_FTS_KEYS)
-                    .await
-                    .map_err(ext)?;
+                let sel = crate::fts_scan::select(
+                    &view,
+                    &*self.index,
+                    &self.counters,
+                    &state.runtime_env().memory_pool,
+                    &pid,
+                    &k,
+                    &parts,
+                    expr,
+                    MAX_FTS_KEYS,
+                )
+                .await
+                .map_err(ext)?;
                 let (exact, merge_parts, mk) = match sel {
                     Some(sel) => {
                         let mk = KeyFilters {

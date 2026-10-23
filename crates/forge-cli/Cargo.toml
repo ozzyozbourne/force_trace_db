@@ -33,6 +33,8 @@ mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 forge-ingest = { workspace = true, features = ["test-util"] }
+forge-index.workspace = true
+bytes.workspace = true
 forge-storage.workspace = true
 prost.workspace = true
 futures.workspace = true

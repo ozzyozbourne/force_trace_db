@@ -252,6 +252,7 @@ struct Row {
     max: Duration,
     gets: f64,
     waves: f64,
+    seg_reads: u64,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -361,6 +362,7 @@ async fn e3_search_newest_50() {
                     max: Duration::ZERO,
                     gets: 0.0,
                     waves: 0.0,
+                    seg_reads: 0,
                 });
             } else {
                 for i in 1..3 {
@@ -369,8 +371,14 @@ async fn e3_search_newest_50() {
                 rec.take_projections();
                 let (g0, w0) = (lat.gets.load(Ordering::SeqCst), lat.waves.load(Ordering::SeqCst));
                 let mut ts = Vec::with_capacity(TIMED);
+                let mut seg_reads = 0;
                 for i in 0..TIMED {
+                    let c0 = e.fts_counters().segments_read;
                     ts.push(call(kind.term(i)).await);
+                    seg_reads = seg_reads.max(e.fts_counters().segments_read - c0);
+                }
+                if delay == 75 && matches!(kind, Kind::Rare | Kind::Common) && seg_reads > 16 {
+                    failed.push(format!("{}: {seg_reads} segments read in one call", kind.name()));
                 }
                 let gets = (lat.gets.load(Ordering::SeqCst) - g0) as f64 / TIMED as f64;
                 let waves = (lat.waves.load(Ordering::SeqCst) - w0) as f64 / TIMED as f64;
@@ -397,12 +405,13 @@ async fn e3_search_newest_50() {
                     max: ts[TIMED - 1],
                     gets,
                     waves,
+                    seg_reads,
                 });
             }
             let r = table.last().unwrap();
             eprintln!(
                 "delay {delay:>3} ms {:>6}: cold {:>9.1?} ({} GETs, {} waves)  p50 {:>9.1?} p95 {:>9.1?} max {:>9.1?}  \
-                 {:.1} GETs/call, {:.1} waves/call",
+                 {:.1} GETs/call, {:.1} waves/call, max {} segments read",
                 kind.name(),
                 r.cold,
                 r.cold_gets,
@@ -411,7 +420,8 @@ async fn e3_search_newest_50() {
                 r.p95,
                 r.max,
                 r.gets,
-                r.waves
+                r.waves,
+                r.seg_reads
             );
             if delay == 75 {
                 let name = kind.name();
