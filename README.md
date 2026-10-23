@@ -4,10 +4,11 @@ Forge is a single-binary trace database for LLM applications. It ingests OpenTel
 stores them as Vortex segments on local disk or object storage, keeps its catalog in SQLite, and serves
 trace lookups, SQL and full-text search.
 
-**Status: M3 (compaction and lifecycle).** OTLP spans are normalized, written to a WAL (acked after fsync), and
+**Status: M4 (full-text search).** OTLP spans are normalized, written to a WAL (acked after fsync), and
 flushed to L0 Vortex segments plus the SQLite catalog; the WAL replays after a crash. Acknowledged spans are
-queryable at once (memtable + segments, merged per span): trace trees, a runs list and SQL. L0 segments are
-compacted into hourly L1 segments, retention and GC run in the background. Search lands later.
+queryable at once (memtable + segments, merged per span): trace trees, a runs list, SQL and full-text search.
+L0 segments are compacted into hourly L1 segments, retention and GC run in the background. Every segment gets a
+`.fts` sidecar index at flush and compaction.
 
 ## Build and test
 
@@ -29,7 +30,7 @@ forge serve --config forge.example.toml      # the spec's layout under /var/lib/
 |---|---|---|
 | 4317 | OTLP gRPC (`TraceService/Export`) | ingest (gzip/zstd); project from `x-forge-project` metadata |
 | 4318 | OTLP HTTP (`POST /v1/traces`) | ingest, protobuf or JSON, gzip/zstd; project from `x-forge-project` |
-| 8080 | API (`/v1/...`) | projects, traces, runs, SQL (below); other routes 501 |
+| 8080 | API (`/v1/...`) | projects, traces, runs, search, SQL (below); other routes 501 |
 | 9090 | Ops (`/healthz`, `/readyz`, `/metrics`) | 200 / 200 once listening / placeholder |
 
 The first SIGTERM or SIGINT drains all listeners (bounded by `server.shutdown_grace`, default 10s), fsyncs the WAL,
@@ -53,7 +54,8 @@ The project comes from `?project=`, else the `x-forge-project` header, else `ing
   `flat` lists the same order with `depth`. `payloads=false` leaves out `inputs/outputs/events/attributes`.
 - `GET /v1/runs?start=&end=&run_type=&status=&q=&limit=&cursor=`: root spans (null parent, non-null start),
   newest first (`start_time DESC, trace_id DESC, span_id DESC`). `start`/`end` are RFC3339 (`end` exclusive),
-  `run_type`/`status` comma-separated, `q` a case-insensitive substring of `name`, `limit` 1..1000 (default 50).
+  `run_type`/`status` comma-separated, `q` a search query on the merged `name` (tokens, see Full-text search:
+  `q=span-1` is `span AND 1` and does not match `span-12`; `q=span-1*` does), `limit` 1..1000 (default 50).
   Page with the returned `next_cursor` until it is `null`; a cursor only continues the same filters.
 - `POST /v1/sql {"query": "...", "max_rows": 10000, "timeout_ms": ...}`: read-only SQL (DataFusion) over the
   table `spans`. Returns `{"columns":[{name,type}],"rows":[{...}],"row_count","truncated","elapsed_ms"}`; rows stop
@@ -75,6 +77,60 @@ can exceed 2^53, which JavaScript numbers cannot represent exactly.
 pruning and by the runs list. Deep runs pages re-read every segment that overlaps the window (bounded by M3's
 compaction). The trace and runs fast paths are not behind the SQL concurrency limit; they reserve their input
 against `query.memory_limit` per call. A merge of a whole project (`SELECT *`) is bounded by the memory limit.
+
+## Full-text search
+
+- `POST /v1/search {"q", "project"?, "columns"?, "filters"?, "limit"?, "cursor"?}`: matching spans, newest first by
+  `(start_time, trace_id, span_id)` DESC, without payload columns. `columns` ⊆ `name, error, inputs, outputs,
+  metadata` (default all; any column may match). `filters`: `start`/`end` (RFC3339), `run_type`/`status` (lists),
+  `roots_only`, and `json: [{"column","path","text"}]` (each ANDed, as `json_key_search`). `q` ≤ 1,024 bytes,
+  `limit` 1..1000 (default 50). Returns `{"hits":[…],"next_cursor":hex|null}`; a cursor only continues the same
+  request (same `limit` too). Spans whose merged start is null are not returned.
+- SQL: `search(col, 'q')`, `json_key_search(col, '$.path', 'text')` (empty text: the path exists),
+  `json_key(col, '$.a[0].b')` (the value at a concrete path), and the table function
+  `trace_tree('trace_id'[, 'project'])` (one trace with `depth` and `tree_order`). `search` and `json_key_search`
+  in `WHERE` are answered from the sidecars (exact; candidates with several versions are merged and re-checked).
+
+Query syntax: words are ANDed, `OR` between groups, `"a phrase"`, `prefix*`. Tokens are Unicode alphanumeric runs
+(tantivy `SimpleTokenizer`), lowercased and ASCII-folded (`Café` = `cafe`, `ß` = `ss`); tokens of 256 bytes or more
+are dropped; there is no stemming, and a CJK run stays one token. JSON columns index each leaf's tokens under its
+path (`$.messages[*].content`); a concrete index (`[0]`) and phrases are re-checked on the row (no positions in the
+index). The first 1 MiB of each field per span is indexed; the cut can split a token, and every path (index,
+memtable, re-check) sees the same split. Payloads moved to blob storage are not searchable in v1.
+
+Limits: a prefix that expands to more than 10,000 distinct terms within one source (one segment's dictionary, one
+segment without a usable index, or the memtable) fails the query with 400 `prefix too broad`, so the same prefix can
+succeed on a small data set and fail on a larger one. A segment without a usable sidecar (none, corrupt, or
+unreadable) is scanned instead (counted, one warning per query); the answer is the same. A term on a row without a
+start (an end post or patch in a newer segment) makes that segment unboundable for the newest-first early stop until
+compaction merges it. SQL `search` has no early stop; `/v1/search` is the fast path.
+
+**Performance (the M4 exit, scaled down).** The spec's target (newest-50 search ≤ 500 ms p50 on 100 M spans, 1 TB
+of payloads, S3) cannot run on this machine. It is replaced by `tests/fts_perf.rs` (E3): 200 L0 segments × 8,000
+spans (1.76 M rows; 199 segments hold start-less end posts of the previous hour), a 100k-row memtable (137 MiB of
+Arrow), on an in-memory store that adds a fixed delay to every read request. Ten distinct terms per kind, after
+warm-up (Vortex footers and `.fts` footers cached, dictionary blocks not); `cold` = the first call on empty caches.
+
+| delay | kind | p50 | p95 | waves/call | cold | cold waves |
+|---|---|---|---|---|---|---|
+| 0 ms | rare | 76 ms | 105 ms | – | 84 ms | – |
+| 0 ms | common | 76 ms | 78 ms | – | 83 ms | – |
+| 0 ms | absent | 57 ms | 62 ms | – | 61 ms | – |
+| 50 ms | rare / common / absent | 252 / 233 / 56 ms | 268 / 242 / 161 ms | 3.0 / 3.0 / 0.2 | 401 / 436 / 273 ms | 4 / 4 / 2 |
+| **75 ms** | **rare** | **307 ms** | 316 ms | 3.0 | 547 ms | 4 |
+| **75 ms** | **common** | **310 ms** | 334 ms | 3.0 | 550 ms | 4 |
+| **75 ms** | **absent** | **59 ms** | 212 ms | 0.2 | 375 ms | 2 |
+| 75 ms | needle (10 oldest segments) | – | – | – | 968 ms | 7 |
+| 100 ms | rare / common / absent | 387 / 384 / 57 ms | 404 / 391 / 262 ms | 3.0 / 3.0 / 0.2 | 700 / 698 / 475 ms | 4 / 4 / 2 |
+
+Asserted at 75 ms: p50 < 500 ms (rare, common, absent), ≤ 5 waves per call (absent ≤ 2), cold < 1.5 s and ≤ 8
+waves, page 1 equal to the generator's newest 50, no payload column read for the rare term, ≤ 16 segments read.
+Run: `cargo test -p forge-query --profile quick-release --test fts_perf -- --ignored --nocapture`.
+
+What E3 does not prove: 100 M spans and 1 TB (60× fewer spans, 8k-span L0s instead of 256 MiB L1s); real S3
+variance and bandwidth (the in-memory store returns 1 MB as fast as 1 KB); needle terms over a 30-day window (about
+⌈segments/64⌉ × 1–2 round trips cold); non-ASCII memtable payloads (the memtable scan's pre-filter is ASCII-only);
+many concurrent queries.
 
 ## Compaction, retention and GC
 
