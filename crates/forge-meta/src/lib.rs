@@ -161,7 +161,7 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     async fn list_segments(&self, f: &SegmentFilter) -> MetaResult<Vec<SegmentMeta>>;
     /// Visible segments holding the trace, with row ranges; ordered by segment id.
     async fn locate_trace(&self, project: &ProjectId, trace: TraceId) -> MetaResult<Vec<TraceLocation>>;
-    /// Batched `locate_trace`: visible segments per trace (traces with no rows are absent). One read; chunked IN.
+    /// Batched `locate_trace`: visible segments per trace, ordered by segment id; traces with no rows are absent.
     async fn locate_traces(
         &self,
         project: &ProjectId,
@@ -169,18 +169,25 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>>;
 }
 
-/// Read-only open (`sqlite://path` only): no create, no migrations, no journal_mode change.
+/// Read-only open (`sqlite://path` only): no create, no migrations, no journal_mode change. A missing file is a
+/// `Config` error and nothing is created.
 pub async fn open_read_only(cfg: &MetastoreConfig) -> MetaResult<Arc<dyn Metastore>> {
     let url = cfg.url.clone();
     let path = match split_scheme(&url) {
         Some(("sqlite", p)) if !p.is_empty() => PathBuf::from(p),
         _ => {
-            return Err(MetaError::Config { url, msg: "read-only open needs sqlite://<path>".into() });
+            return Err(MetaError::Config {
+                url,
+                msg: "read-only open needs sqlite://<path>".into(),
+            });
         }
     };
     let m = tokio::task::spawn_blocking(move || {
         if !path.is_file() {
-            return Err(MetaError::Config { url, msg: format!("no metastore at {}", path.display()) });
+            return Err(MetaError::Config {
+                url,
+                msg: format!("no metastore at {}", path.display()),
+            });
         }
         SqliteMetastore::open_read_only(&path)
     })

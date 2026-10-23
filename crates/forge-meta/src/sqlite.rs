@@ -8,6 +8,7 @@ use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, SegmentSta
 use forge_model::ids::{ProjectId, TraceId};
 use forge_model::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -67,6 +68,69 @@ static LOCATE_TRACE: LazyLock<String> = LazyLock::new(|| {
          WHERE state <> 'deleted' ORDER BY id"
     )
 });
+/// Opens `path` read-only and checks the schema version (the first read).
+fn read_only_conn(path: &Path, immutable: bool) -> MetaResult<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+    let c = if immutable {
+        let p = path
+            .to_string_lossy()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23");
+        Connection::open_with_flags(format!("file:{p}?immutable=1"), flags)?
+    } else {
+        Connection::open_with_flags(path, flags)?
+    };
+    c.pragma_update(None, "busy_timeout", 5000)?;
+    c.set_prepared_statement_cache_capacity(64);
+    let latest = migrations::LATEST;
+    let has: bool = c.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'schema_versions'",
+        [],
+        |r| r.get(0),
+    )?;
+    let cur = if has { migrations::current_version(&c)? } else { 0 };
+    if cur > latest {
+        return Err(MetaError::SchemaTooNew {
+            db: cur,
+            binary: latest,
+        });
+    }
+    if cur < latest {
+        return Err(MetaError::Migration {
+            version: latest,
+            msg: format!("database schema v{cur} is older than v{latest}: run `forge serve` once to migrate"),
+        });
+    }
+    Ok(c)
+}
+
+/// Runs the LOCATE_TRACE statement for one trace.
+fn locations(
+    st: &mut rusqlite::CachedStatement<'_>,
+    project: &ProjectId,
+    trace: TraceId,
+) -> MetaResult<Vec<TraceLocation>> {
+    let rows = st.query_map(params![project.as_str(), trace.as_bytes()], |r| {
+        Ok((
+            segment_from_row(r),
+            r.get::<_, i64>("ti_start")?,
+            r.get::<_, i64>("ti_count")?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (seg, start, count) = r?;
+        out.push(TraceLocation {
+            segment: seg?,
+            row_start: to_u64("trace_index", start)?,
+            row_count: to_u64("trace_index", count)?,
+        });
+    }
+    Ok(out)
+}
+
 const INSERT_TRACE: &str =
     "INSERT INTO trace_index (project_id, trace_id, segment_id, row_start, row_count) VALUES (?1,?2,?3,?4,?5)";
 const UPSERT_CHECKPOINT: &str = "INSERT INTO wal_checkpoints (node_id, flushed_seq, max_version, updated_at_ms) \
@@ -288,31 +352,31 @@ impl SqliteMetastore {
         Self::init(Connection::open(path)?)
     }
 
-    /// SQLITE_OPEN_READ_ONLY | NO_MUTEX; busy_timeout only; the schema version must equal the latest.
+    /// Read-only (`forge sql --data-dir`): SQLITE_OPEN_READ_ONLY, busy_timeout only (no journal_mode, no
+    /// migrations); the schema version must equal this binary's. Writes fail with SQLITE_READONLY (Internal).
+    /// SQLite creates `-wal` / `-shm` beside a WAL database on the first read; when the directory is not writable
+    /// (or that first read fails with CANTOPEN / READONLY) it reopens with `immutable=1`, which assumes nobody
+    /// writes the database: true when nothing can write the directory.
     pub fn open_read_only(path: &Path) -> MetaResult<Self> {
-        use rusqlite::OpenFlags;
-        let c = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        c.pragma_update(None, "busy_timeout", 5000)?;
-        let latest = migrations::LATEST;
-        let has: bool = c.query_row(
-            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'schema_versions'",
-            [],
-            |r| r.get(0),
-        )?;
-        let cur = if has { migrations::current_version(&c)? } else { 0 };
-        if cur > latest {
-            return Err(MetaError::SchemaTooNew { db: cur, binary: latest });
-        }
-        if cur < latest {
-            return Err(MetaError::Migration {
-                version: latest,
-                msg: format!("database schema v{cur} is older than v{latest}: run `forge serve` once to migrate"),
-            });
-        }
-        Ok(Self { conn: Arc::new(Mutex::new(c)) })
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let ro_dir = std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly());
+        let c = match ro_dir {
+            true => read_only_conn(path, true)?,
+            false => match read_only_conn(path, false) {
+                Err(MetaError::Sqlite(rusqlite::Error::SqliteFailure(f, _)))
+                    if matches!(f.code, rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly) =>
+                {
+                    read_only_conn(path, true)?
+                }
+                r => r?,
+            },
+        };
+        Ok(Self {
+            conn: Arc::new(Mutex::new(c)),
+        })
     }
 
     pub fn open_in_memory() -> MetaResult<Self> {
@@ -321,6 +385,8 @@ impl SqliteMetastore {
 
     fn init(mut c: Connection) -> MetaResult<Self> {
         set_pragmas(&c)?;
+        // sqlite.rs has 16 cached statements, rusqlite's default capacity.
+        c.set_prepared_statement_cache_capacity(64);
         migrations::migrate(&mut c)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(c)),
@@ -509,77 +575,29 @@ impl Metastore for SqliteMetastore {
 
     async fn locate_trace(&self, project: &ProjectId, trace: TraceId) -> MetaResult<Vec<TraceLocation>> {
         let project = project.clone();
-        self.read(move |c| {
-            let mut st = c.prepare_cached(&LOCATE_TRACE)?;
-            let rows = st.query_map(params![project.as_str(), trace.as_bytes()], |r| {
-                Ok((
-                    segment_from_row(r),
-                    r.get::<_, i64>("ti_start")?,
-                    r.get::<_, i64>("ti_count")?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (seg, start, count) = r?;
-                out.push(TraceLocation {
-                    segment: seg?,
-                    row_start: to_u64("trace_index", start)?,
-                    row_count: to_u64("trace_index", count)?,
-                });
-            }
-            Ok(out)
-        })
-        .await
+        self.read(move |c| locations(&mut c.prepare_cached(&LOCATE_TRACE)?, &project, trace))
+            .await
     }
 
     async fn locate_traces(
         &self,
         project: &ProjectId,
         traces: &[TraceId],
-    ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>> {
+    ) -> MetaResult<HashMap<TraceId, Vec<TraceLocation>>> {
         let project = project.clone();
         let traces = traces.to_vec();
+        // One lock and one blocking task; the cached LOCATE_TRACE statement per id (no generated SQL).
         self.read(move |c| {
-            let mut out: std::collections::HashMap<TraceId, Vec<TraceLocation>> = Default::default();
-            for chunk in traces.chunks(500) {
-                let n = chunk.len().next_power_of_two();
-                let sql = locate_traces_sql(n);
-                let mut st = c.prepare_cached(&sql)?;
-                let p = project.as_str();
-                let ids: Vec<&[u8]> = (0..n).map(|i| chunk[i.min(chunk.len() - 1)].as_bytes().as_slice()).collect();
-                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&p];
-                params.extend(ids.iter().map(|b| b as &dyn rusqlite::ToSql));
-                let rows = st.query_map(params.as_slice(), |r| {
-                    Ok((
-                        segment_from_row(r),
-                        r.get::<_, Vec<u8>>("ti_trace")?,
-                        r.get::<_, i64>("ti_start")?,
-                        r.get::<_, i64>("ti_count")?,
-                    ))
-                })?;
-                for r in rows {
-                    let (seg, t, start, count) = r?;
-                    let t = TraceId::from_slice(&t).map_err(|e| corrupt("trace_index", e))?;
-                    out.entry(t).or_default().push(TraceLocation {
-                        segment: seg?,
-                        row_start: to_u64("trace_index", start)?,
-                        row_count: to_u64("trace_index", count)?,
-                    });
+            let mut st = c.prepare_cached(&LOCATE_TRACE)?;
+            let mut out: HashMap<TraceId, Vec<TraceLocation>> = HashMap::new();
+            for t in traces {
+                let locs = locations(&mut st, &project, t)?;
+                if !locs.is_empty() {
+                    out.insert(t, locs);
                 }
             }
             Ok(out)
         })
         .await
     }
-}
-
-fn locate_traces_sql(n: usize) -> String {
-    let ph: Vec<String> = (0..n).map(|i| format!("?{}", i + 2)).collect();
-    format!(
-        "SELECT {SEGMENT_COLS}, ti_trace, ti_start, ti_count FROM segments JOIN \
-         (SELECT segment_id, trace_id AS ti_trace, row_start AS ti_start, row_count AS ti_count FROM trace_index \
-          WHERE project_id = ?1 AND trace_id IN ({})) ON id = segment_id \
-         WHERE state <> 'deleted' ORDER BY id",
-        ph.join(",")
-    )
 }

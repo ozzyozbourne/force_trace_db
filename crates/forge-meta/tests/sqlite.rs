@@ -585,72 +585,158 @@ async fn stale_watermark_commit_inserts_nothing() {
     assert_eq!(s.max_version().await.unwrap(), 99);
 }
 
-#[tokio::test]
-async fn p3v_read_only_open() {
+fn files(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_open() {
     let d = tempfile::tempdir().unwrap();
-    let url = |p: &Path| MetastoreConfig { url: format!("sqlite://{}", p.display()) };
-    // missing
+    let url = |p: &Path| MetastoreConfig {
+        url: format!("sqlite://{}", p.display()),
+    };
+    // A missing file: Config, and nothing is created.
     let missing = d.path().join("nope.db");
     let e = open_read_only(&url(&missing)).await.unwrap_err();
     assert!(matches!(e, MetaError::Config { .. }), "{e}");
     assert!(!missing.exists());
-    // writer with data
+    // Committed data is readable; writes fail (Internal).
     let path = d.path().join("meta.db");
     let w = db(d.path());
-    w.commit_flush(flush(vec![seg("p", Level::L0, Some((1, 2)), 0, 3)], 1, 3)).await.unwrap();
+    w.commit_flush(flush(vec![seg("p", Level::L0, Some((1, 2)), 0, 3)], 1, 3))
+        .await
+        .unwrap();
     let r = open_read_only(&url(&path)).await.unwrap();
     assert_eq!(r.list_segments(&SegmentFilter::default()).await.unwrap().len(), 1);
-    let m = r.locate_traces(&pid("p"), &[TraceId([1; 16]), TraceId([9; 16]), TraceId([2; 16])]).await.unwrap();
-    assert_eq!(m.len(), 2);
     let e = r.create_project(proj("x", "x")).await.unwrap_err();
-    eprintln!("ro write error: {e} kind={:?}", forge_model::error::Classify::kind(&e));
-    // open while writer holds an open write txn
+    assert!(e.to_string().contains("readonly"), "{e}");
+    assert_eq!(
+        forge_model::error::Classify::kind(&e),
+        forge_model::error::ErrorKind::Internal
+    );
+    // Another connection holds an uncommitted BEGIN IMMEDIATE: the open works and reads committed data.
     let wc = Connection::open(&path).unwrap();
-    wc.execute_batch("BEGIN IMMEDIATE; INSERT INTO projects (id, name, created_at_ms) VALUES ('zz','zz',1);").unwrap();
+    wc.execute_batch("BEGIN IMMEDIATE; INSERT INTO projects (id, name, created_at_ms) VALUES ('zz','zz',1);")
+        .unwrap();
     let r2 = open_read_only(&url(&path)).await.unwrap();
     assert_eq!(r2.list_segments(&SegmentFilter::default()).await.unwrap().len(), 1);
+    assert!(r2.get_project(&pid("zz")).await.unwrap().is_none());
     wc.execute_batch("ROLLBACK").unwrap();
-    drop(wc);
-    drop(r);
-    drop(r2);
-    drop(w);
-    let names: Vec<String> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-    eprintln!("after close: {names:?}");
-    let r3 = open_read_only(&url(&path)).await;
-    match &r3 {
-        Ok(r3) => eprintln!("clean-close open ok: {:?}", r3.list_segments(&SegmentFilter::default()).await.map(|v| v.len())),
-        Err(e) => eprintln!("clean-close open err: {e}"),
-    }
-    let names: Vec<String> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-    eprintln!("after ro open: {names:?}");
-    // older schema
+    drop((wc, r, r2, w));
+    // After a clean close.
+    let r3 = open_read_only(&url(&path)).await.unwrap();
+    assert_eq!(r3.list_segments(&SegmentFilter::default()).await.unwrap().len(), 1);
+    drop(r3);
+    // An older schema.
     let old = d.path().join("old.db");
-    { let c = Connection::open(&old).unwrap(); c.execute_batch("CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)").unwrap(); }
+    Connection::open(&old)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+        )
+        .unwrap();
     let e = open_read_only(&url(&old)).await.unwrap_err();
-    eprintln!("old: {e}");
-    let _ = MIGRATIONS;
-    let _ = migrate_with;
+    assert!(e.to_string().contains("run `forge serve` once"), "{e}");
 }
 
-#[tokio::test]
-async fn p3v_locate_traces_matches() {
+/// A closed database in a 0o555 directory opens with `immutable=1`: readable, and no `-wal` / `-shm` appear.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_dir_open() {
+    use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     let w = db(d.path());
-    let mut segs = Vec::new();
+    w.commit_flush(flush(vec![seg("p", Level::L0, Some((1, 2)), 0, 3)], 1, 3))
+        .await
+        .unwrap();
+    drop(w);
+    let ro = d.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::copy(d.path().join("meta.db"), ro.join("meta.db")).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let cfg = MetastoreConfig {
+        url: format!("sqlite://{}", ro.join("meta.db").display()),
+    };
+    let r = open_read_only(&cfg).await.unwrap();
+    assert_eq!(r.list_segments(&SegmentFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(r.locate_trace(&pid("p"), TraceId([1; 16])).await.unwrap().len(), 1);
+    drop(r);
+    assert_eq!(files(&ro), ["meta.db"]);
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// 1,200 traces over 3 flushes: the batched call equals `locate_trace` per id; missing ids are absent; deleted
+/// segments are excluded; other projects are invisible.
+#[tokio::test(flavor = "multi_thread")]
+async fn locate_traces_matches_locate_trace() {
+    let d = tempfile::tempdir().unwrap();
+    let w = db(d.path());
+    let tid = |k: u64, i: u8| {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&k.to_be_bytes());
+        b[8] = i;
+        TraceId(b)
+    };
+    let mut all = Vec::new();
     for i in 0..3u8 {
-        let mut s = seg("p", Level::L0, Some((1, 2)), 0, 3);
-        s.meta.id = SegmentId::new();
-        s.meta.path = format!("x/{i}");
-        s.meta.row_count = 1200;
-        s.traces = (0..1200u64).map(|k| TraceRange { trace_id: TraceId([(k % 251) as u8, (k / 251) as u8, i,0,0,0,0,0,0,0,0,0,0,0,0,0]), row_start: k, row_count: 1 }).collect();
-        segs.push(s);
+        let mut segs = Vec::new();
+        for p in ["p", "q"] {
+            let mut s = seg(p, Level::L0, Some((1, 2)), 0, 3);
+            s.meta.row_count = 440;
+            // Traces 0..440 of this flush (i) plus, in the p segment, every 10th trace of flush 0 again.
+            s.traces = (0..440u64)
+                .map(|k| TraceRange {
+                    trace_id: if p == "p" && k % 10 == 0 { tid(k, 0) } else { tid(k, i) },
+                    row_start: k,
+                    row_count: 1,
+                })
+                .collect();
+            s.traces.sort_by_key(|t| t.trace_id);
+            for (k, t) in s.traces.iter_mut().enumerate() {
+                t.row_start = k as u64;
+            }
+            segs.push(s);
+        }
+        all.extend(segs.iter().filter(|s| s.meta.project_id == pid("p")).cloned());
+        w.commit_flush(flush(segs, i as u64 + 1, 3)).await.unwrap();
     }
-    w.commit_flush(flush(segs.clone(), 1, 3)).await.unwrap();
-    let ids: Vec<TraceId> = segs.iter().flat_map(|s| s.traces.iter().map(|t| t.trace_id)).step_by(3).collect();
+    // Flush 1's p segment is deleted.
+    Connection::open(d.path().join("meta.db"))
+        .unwrap()
+        .execute(
+            "UPDATE segments SET state = 'deleted', deleted_at_ms = 1 WHERE path = ?1",
+            [all[1].meta.path.as_str()],
+        )
+        .unwrap();
+    let mut ids: Vec<TraceId> = all.iter().flat_map(|s| s.traces.iter().map(|t| t.trace_id)).collect();
+    ids.sort();
+    ids.dedup();
+    ids.push(TraceId([0xee; 16]));
     let m = w.locate_traces(&pid("p"), &ids).await.unwrap();
+    let mut found = 0;
     for t in &ids {
         let one = w.locate_trace(&pid("p"), *t).await.unwrap();
-        assert_eq!(m.get(t).cloned().unwrap_or_default(), one);
+        assert!(
+            one.iter().all(|l| l.segment.id != all[1].meta.id),
+            "deleted segment listed"
+        );
+        assert!(
+            one.iter().all(|l| l.segment.project_id == pid("p")),
+            "other project listed"
+        );
+        assert_eq!(
+            m.contains_key(t),
+            !one.is_empty(),
+            "{t}: traces with no rows are absent"
+        );
+        found += m.get(t).map_or(0, |v| v.len());
+        assert_eq!(m.get(t).cloned().unwrap_or_default(), one, "{t}");
     }
-    assert_eq!(m.len(), ids.len());
+    assert!(ids.len() >= 1_200, "{} traces", ids.len());
+    assert_eq!(found, 880, "flush 0 and flush 2 segments of p");
+    assert!(!m.contains_key(&TraceId([0xee; 16])));
 }
