@@ -1,4 +1,7 @@
 //! forge-ingest: the write path (M1). M0 defines the error type only.
+
+use forge_model::error::{Classify, ErrorKind, Unimplemented};
+
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error(transparent)]
@@ -10,9 +13,29 @@ pub enum IngestError {
     #[error(transparent)]
     Index(#[from] forge_index::IndexError),
     #[error("invalid input: {0}")]
-    Invalid(String), // -> 400 / INVALID_ARGUMENT
+    Invalid(String),
     #[error("memtable memory budget exceeded")]
-    Backpressure, // -> 429 / RESOURCE_EXHAUSTED
-    #[error("not implemented until {0}")]
-    Unimplemented(&'static str),
+    Backpressure,
+    #[error(transparent)]
+    Unimplemented(#[from] Unimplemented),
+}
+
+impl Classify for IngestError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Model(e) => e.kind(),
+            Self::Meta(e) => e.kind(),
+            Self::Storage(e) => e.kind(),
+            Self::Index(e) => e.kind(),
+            Self::Invalid(_) => ErrorKind::InvalidInput,
+            Self::Backpressure => ErrorKind::Backpressure,
+            Self::Unimplemented(e) => e.kind(),
+        }
+    }
+    fn message(&self) -> String {
+        match self {
+            Self::Meta(e) => e.message(),
+            other => other.to_string(),
+        }
+    }
 }

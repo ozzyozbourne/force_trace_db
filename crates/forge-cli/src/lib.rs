@@ -2,6 +2,7 @@
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use forge_model::config::ForgeConfig;
+use forge_model::error::Unimplemented;
 use forge_server::{Forge, ShutdownSignals};
 use std::path::PathBuf;
 
@@ -98,13 +99,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = ForgeConfig::load(cli.config.as_deref()).context("loading config")?;
             Forge::open(cfg).await?.serve(signals).await
         }
-        Cmd::Sql(_) => not_yet("sql", "M2"),
-        Cmd::Inspect(_) => not_yet("inspect segment", "M1"),
-        Cmd::Compact { .. } => not_yet("compact", "M3"),
-        Cmd::Gc { .. } => not_yet("gc", "M3"),
-        Cmd::Bench(_) => not_yet("bench", "M6"),
+        Cmd::Sql(_) => not_yet("sql", Unimplemented("M2")),
+        Cmd::Inspect(_) => not_yet("inspect segment", Unimplemented("M1")),
+        Cmd::Compact { .. } => not_yet("compact", Unimplemented("M3")),
+        Cmd::Gc { .. } => not_yet("gc", Unimplemented("M3")),
+        Cmd::Bench(_) => not_yet("bench", Unimplemented("M6")),
     }
 }
-fn not_yet(cmd: &str, m: &str) -> anyhow::Result<()> {
+fn not_yet(cmd: &str, Unimplemented(m): Unimplemented) -> anyhow::Result<()> {
     anyhow::bail!("`forge {cmd}` is not implemented yet (lands in {m})")
 }

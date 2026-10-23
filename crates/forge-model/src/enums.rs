@@ -1,27 +1,27 @@
-use crate::error::ModelError;
-use std::{fmt, str::FromStr};
-
+/// A Copy enum stored as fixed strings: `as_str`, `ALL`, Display, strict FromStr and serde, all from one table.
 macro_rules! str_enum {
-    ($name:ident, $what:literal, { $($v:ident => $s:literal),+ $(,)? }) => {
+    ($(#[$m:meta])* $name:ident, $what:literal, { $($v:ident => $s:literal),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($v),+ }
+        $(#[$m])*
+        pub enum $name { $(#[serde(rename = $s)] $v),+ }
         impl $name {
             pub const ALL: &'static [$name] = &[$($name::$v),+];
             pub const fn as_str(self) -> &'static str { match self { $($name::$v => $s),+ } }
         }
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.as_str()) }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
         }
-        /// Strict parse of the stored (canonical, lowercase) form.
-        impl FromStr for $name {
-            type Err = ModelError;
-            fn from_str(s: &str) -> Result<Self, ModelError> {
-                match s { $($s => Ok($name::$v),)+ _ => Err(ModelError::UnknownEnum { what: $what, value: s.to_string() }) }
+        /// Strict parse of the stored (canonical) form.
+        impl std::str::FromStr for $name {
+            type Err = $crate::error::ModelError;
+            fn from_str(s: &str) -> Result<Self, $crate::error::ModelError> {
+                match s { $($s => Ok($name::$v),)+ _ => Err($crate::error::ModelError::UnknownEnum { what: $what, value: s.to_string() }) }
             }
         }
     };
 }
+pub(crate) use str_enum;
+
 str_enum!(RunType, "run_type", {
     Llm => "llm", ChatModel => "chat_model", Tool => "tool", Chain => "chain", Agent => "agent",
     Retriever => "retriever", Embedding => "embedding", Other => "other",
@@ -38,6 +38,7 @@ impl RunType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ModelError;
 
     #[test]
     fn round_trips() {

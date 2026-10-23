@@ -36,5 +36,8 @@ pub mod ids;
 pub mod memtable;
 pub mod row;
 pub mod schema;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
+pub mod time;
 
 pub use memtable::{EmptyMemtable, MemtableSnapshot, MemtableView};

@@ -1,45 +1,35 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use forge_meta::MetaError;
-use forge_model::error::ModelError;
+use forge_model::error::{Classify, ErrorKind};
 
-/// API error; the body is `{"error": msg}`.
+/// API error; the body is `{"error": msg}`. Built from any classified crate error.
 #[derive(Debug)]
-pub enum ApiError {
-    BadRequest(String),
-    Conflict(String),
-    Unimplemented(&'static str),
-    Internal(String),
+pub struct ApiError {
+    kind: ErrorKind,
+    msg: String,
+}
+
+impl<E: Classify> From<E> for ApiError {
+    fn from(e: E) -> Self {
+        let kind = e.kind();
+        if kind == ErrorKind::Internal {
+            tracing::error!(error = %e, "internal error");
+        }
+        Self { kind, msg: e.message() }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (code, msg) = match self {
-            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            Self::Conflict(m) => (StatusCode::CONFLICT, m),
-            Self::Unimplemented(m) => (StatusCode::NOT_IMPLEMENTED, format!("not implemented until {m}")),
-            Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        let code = match self.kind {
+            ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+            ErrorKind::Conflict => StatusCode::CONFLICT,
+            ErrorKind::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+            ErrorKind::Backpressure => StatusCode::TOO_MANY_REQUESTS,
+            ErrorKind::Transient => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (code, Json(serde_json::json!({ "error": msg }))).into_response()
-    }
-}
-
-impl From<MetaError> for ApiError {
-    fn from(e: MetaError) -> Self {
-        match e {
-            MetaError::Conflict(m) => Self::Conflict(m),
-            MetaError::Unimplemented(m) => Self::Unimplemented(m),
-            other => {
-                tracing::error!(error = %other, "metastore error");
-                Self::Internal(other.to_string())
-            }
-        }
-    }
-}
-
-impl From<ModelError> for ApiError {
-    fn from(e: ModelError) -> Self {
-        Self::BadRequest(e.to_string())
+        (code, Json(serde_json::json!({ "error": self.msg }))).into_response()
     }
 }

@@ -6,7 +6,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 pub const MIGRATIONS: &[(u32, &str, &str)] = &[(1, "initial", include_str!("sql/0001_initial.sql"))];
 
 pub fn migrate(c: &mut Connection) -> MetaResult<u32> {
-    migrate_with(c, MIGRATIONS)
+    apply(c, MIGRATIONS)
 }
 
 fn current_version(c: &Connection) -> rusqlite::Result<u32> {
@@ -15,10 +15,15 @@ fn current_version(c: &Connection) -> rusqlite::Result<u32> {
     })
 }
 
+/// Test hook: migrate with a custom migration list.
+#[cfg(any(test, feature = "test-util"))]
+pub fn migrate_with(c: &mut Connection, migrations: &[(u32, &str, &str)]) -> MetaResult<u32> {
+    apply(c, migrations)
+}
+
 /// Applies `migrations` (ascending versions) in one IMMEDIATE txn each; the current version is read inside
 /// the txn, so concurrent openers apply each migration once.
-#[doc(hidden)]
-pub fn migrate_with(c: &mut Connection, migrations: &[(u32, &str, &str)]) -> MetaResult<u32> {
+fn apply(c: &mut Connection, migrations: &[(u32, &str, &str)]) -> MetaResult<u32> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_versions \
          (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
@@ -43,7 +48,7 @@ pub fn migrate_with(c: &mut Connection, migrations: &[(u32, &str, &str)]) -> Met
         tx.execute_batch(sql).map_err(failed)?;
         tx.execute(
             "INSERT INTO schema_versions (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            params![version, name, crate::sqlite::now_ms()],
+            params![version, name, forge_model::time::now_ms()],
         )
         .map_err(failed)?;
         tx.pragma_update(None, "user_version", version).map_err(failed)?;

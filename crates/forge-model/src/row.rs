@@ -1,7 +1,7 @@
 use crate::enums::{RunType, SpanStatus};
 use crate::error::{ModelError, Result};
 use crate::ids::{ProjectId, SpanId, TraceId};
-use crate::schema::{TIMEZONE, col, spans_schema};
+use crate::schema::{TIMEZONE, col, spans_schema, tags_item_field};
 use arrow::array::*;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -82,9 +82,9 @@ impl SpanBatchBuilder {
         let ts = || TimestampNanosecondBuilder::with_capacity(rows).with_timezone(TIMEZONE);
         Self {
             project_id: s(),
-            trace_id: b(16),
-            span_id: b(8),
-            parent_span_id: b(8),
+            trace_id: b(TraceId::LEN),
+            span_id: b(SpanId::LEN),
+            parent_span_id: b(SpanId::LEN),
             dotted_order: s(),
             name: s(),
             run_type: s(),
@@ -99,11 +99,7 @@ impl SpanBatchBuilder {
             total_tokens: Int64Builder::with_capacity(rows),
             cost_usd: Float64Builder::with_capacity(rows),
             session_id: s(),
-            // Field must match spans_schema exactly ("item", Utf8, nullable).
-            tags: ListBuilder::new(StringBuilder::new()).with_field(Arc::new(arrow::datatypes::Field::new_list_field(
-                arrow::datatypes::DataType::Utf8,
-                true,
-            ))),
+            tags: ListBuilder::new(StringBuilder::new()).with_field(tags_item_field()),
             metadata: s(),
             attributes: s(),
             events: s(),
@@ -205,7 +201,11 @@ pub fn validate_batch(b: &RecordBatch) -> Result<()> {
     if b.schema() != spans_schema() {
         return Err(ModelError::Schema(format!("schema mismatch: {:?}", b.schema())));
     }
-    for (name, len) in [(col::TRACE_ID, 16), (col::SPAN_ID, 8), (col::PARENT_SPAN_ID, 8)] {
+    for (name, len) in [
+        (col::TRACE_ID, TraceId::LEN),
+        (col::SPAN_ID, SpanId::LEN),
+        (col::PARENT_SPAN_ID, SpanId::LEN),
+    ] {
         let a = b
             .column_by_name(name)
             .unwrap()
@@ -224,7 +224,7 @@ mod tests {
     use super::*;
 
     fn pid() -> Option<ProjectId> {
-        Some(ProjectId::new("p").unwrap())
+        Some(crate::testing::pid("p"))
     }
 
     #[test]

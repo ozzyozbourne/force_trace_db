@@ -128,6 +128,12 @@ pub(crate) fn string_or_scalar<'de, D: serde::Deserializer<'de>>(d: D) -> Result
     })
 }
 
+/// `scheme://rest` -> `(scheme, rest)`. The shared first step of storage and metastore URL parsing (D9):
+/// after the scheme, the rest is a filesystem path for `file://` and `sqlite://`.
+pub fn split_scheme(url: &str) -> Option<(&str, &str)> {
+    url.split_once("://")
+}
+
 impl ForgeConfig {
     /// defaults <- `path` (must exist) | `./forge.toml` if it is a file (cwd only) <- `FORGE_<SECTION>__<KEY>` env.
     pub fn load(path: Option<&Path>) -> Result<Self, figment::Error> {

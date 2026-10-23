@@ -1,4 +1,4 @@
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use std::sync::{Arc, LazyLock};
 
 /// Column names. Use these everywhere; never string literals.
@@ -50,6 +50,11 @@ pub fn timestamp_type() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMEZONE.into()))
 }
 
+/// The `tags` list item: ("item", Utf8, nullable). Builders must use exactly this field.
+pub fn tags_item_field() -> FieldRef {
+    Arc::new(Field::new_list_field(DataType::Utf8, true))
+}
+
 static SPANS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let ts = timestamp_type();
     // Only the merge key + version + deleted are NOT NULL. Every other column is nullable because
@@ -74,11 +79,7 @@ static SPANS: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new(col::TOTAL_TOKENS, DataType::Int64, true),
         Field::new(col::COST_USD, DataType::Float64, true),
         Field::new(col::SESSION_ID, DataType::Utf8, true),
-        Field::new(
-            col::TAGS,
-            DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
-            true,
-        ),
+        Field::new(col::TAGS, DataType::List(tags_item_field()), true),
         Field::new(col::METADATA, DataType::Utf8, true), // JSON object text
         Field::new(col::ATTRIBUTES, DataType::Utf8, true), // JSON object text
         Field::new(col::EVENTS, DataType::Utf8, true),   // JSON array text

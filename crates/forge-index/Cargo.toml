@@ -16,4 +16,5 @@ roaring.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+forge-model = { workspace = true, features = ["test-util"] }
 tokio.workspace = true

@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use forge_model::catalog::{Level, SegmentId, SegmentMeta, TraceLocation, TraceRange};
-use forge_model::config::MetastoreConfig;
+use forge_model::config::{MetastoreConfig, split_scheme};
+use forge_model::error::{Classify, ErrorKind, Unimplemented};
 use forge_model::ids::{ProjectId, TraceId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,12 +26,31 @@ pub enum MetaError {
     Corrupt { table: &'static str, msg: String },
     #[error("invalid metastore url {0:?}")]
     Config(String),
-    #[error("not implemented until {0}")]
-    Unimplemented(&'static str),
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error(transparent)]
+    Unimplemented(#[from] Unimplemented),
     #[error("blocking task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 }
 pub type MetaResult<T> = Result<T, MetaError>;
+
+impl Classify for MetaError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Conflict(_) => ErrorKind::Conflict,
+            Self::InvalidInput(_) => ErrorKind::InvalidInput,
+            Self::Unimplemented(e) => e.kind(),
+            _ => ErrorKind::Internal,
+        }
+    }
+    fn message(&self) -> String {
+        match self {
+            Self::Conflict(m) | Self::InvalidInput(m) => m.clone(),
+            other => other.to_string(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
@@ -41,6 +61,27 @@ pub struct Project {
     /// None = keep forever.
     pub retention_days: Option<u32>,
     pub created_at_ms: i64,
+}
+
+impl Project {
+    /// The one place new-project defaults live: `name` defaults to the id, no API key, retention must be > 0.
+    pub fn new(
+        id: ProjectId,
+        name: Option<String>,
+        retention_days: Option<u32>,
+        created_at_ms: i64,
+    ) -> MetaResult<Self> {
+        if retention_days == Some(0) {
+            return Err(MetaError::InvalidInput("retention_days must be > 0".into()));
+        }
+        Ok(Self {
+            name: name.unwrap_or_else(|| id.to_string()),
+            id,
+            api_key_hash: None,
+            retention_days,
+            created_at_ms,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,24 +147,21 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
 /// `sqlite::memory:` | `sqlite://<path>` (relative to the cwd unless it starts with `/`) | `postgres://` (later).
 pub async fn open(cfg: &MetastoreConfig) -> MetaResult<Arc<dyn Metastore>> {
     let url = cfg.url.as_str();
-    if url == "sqlite::memory:" {
-        let m = tokio::task::spawn_blocking(SqliteMetastore::open_in_memory).await??;
-        return Ok(Arc::new(m));
-    }
-    if let Some(p) = url.strip_prefix("sqlite://").filter(|p| !p.is_empty()) {
-        let path = PathBuf::from(p);
-        let m = tokio::task::spawn_blocking(move || {
-            if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| MetaError::Config(format!("cannot create {}: {e}", parent.display())))?;
-            }
-            SqliteMetastore::open_path(&path)
-        })
-        .await??;
-        return Ok(Arc::new(m));
-    }
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        return Err(MetaError::Unimplemented("postgres metastore"));
-    }
-    Err(MetaError::Config(cfg.url.clone()))
+    let m = match split_scheme(url) {
+        _ if url == "sqlite::memory:" => tokio::task::spawn_blocking(SqliteMetastore::open_in_memory).await??,
+        Some(("sqlite", p)) if !p.is_empty() => {
+            let path = PathBuf::from(p);
+            tokio::task::spawn_blocking(move || {
+                if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| MetaError::Config(format!("cannot create {}: {e}", parent.display())))?;
+                }
+                SqliteMetastore::open_path(&path)
+            })
+            .await??
+        }
+        Some(("postgres" | "postgresql", _)) => return Err(Unimplemented("postgres metastore").into()),
+        _ => return Err(MetaError::Config(cfg.url.clone())),
+    };
+    Ok(Arc::new(m))
 }

@@ -3,6 +3,7 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, TraceRange};
+use forge_model::error::{Classify, ErrorKind, Unimplemented};
 use forge_model::ids::ProjectId;
 use futures::stream::BoxStream;
 use object_store::ObjectStore;
@@ -31,28 +32,42 @@ pub enum StorageError {
     EmptySegment,
     #[error("invalid storage url {url:?}: {msg}")]
     Config { url: String, msg: String },
-    #[error("not implemented until {0}")]
-    Unimplemented(&'static str),
+    #[error(transparent)]
+    Unimplemented(#[from] Unimplemented),
+}
+
+impl Classify for StorageError {
+    /// Transient is an allow-list (D6): retry with backoff, the flush keeps the memtable frozen.
+    fn kind(&self) -> ErrorKind {
+        use std::io::ErrorKind as K;
+        match self {
+            Self::ObjectStore(object_store::Error::Generic { .. } | object_store::Error::JoinError { .. }) => {
+                ErrorKind::Transient
+            }
+            Self::Io(e)
+                if matches!(
+                    e.kind(),
+                    K::TimedOut
+                        | K::Interrupted
+                        | K::ConnectionReset
+                        | K::ConnectionAborted
+                        | K::ConnectionRefused
+                        | K::BrokenPipe
+                        | K::UnexpectedEof
+                ) =>
+            {
+                ErrorKind::Transient
+            }
+            Self::Model(e) => e.kind(),
+            Self::Unimplemented(e) => e.kind(),
+            _ => ErrorKind::Internal,
+        }
+    }
 }
 
 impl StorageError {
-    /// Retry with backoff (flush keeps the memtable frozen). Allow-list only (D6).
     pub fn is_transient(&self) -> bool {
-        use std::io::ErrorKind as K;
-        match self {
-            Self::ObjectStore(object_store::Error::Generic { .. } | object_store::Error::JoinError { .. }) => true,
-            Self::Io(e) => matches!(
-                e.kind(),
-                K::TimedOut
-                    | K::Interrupted
-                    | K::ConnectionReset
-                    | K::ConnectionAborted
-                    | K::ConnectionRefused
-                    | K::BrokenPipe
-                    | K::UnexpectedEof
-            ),
-            _ => false,
-        }
+        self.kind() == ErrorKind::Transient
     }
 }
 

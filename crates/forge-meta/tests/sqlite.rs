@@ -2,13 +2,10 @@ use forge_meta::migrations::{MIGRATIONS, migrate_with};
 use forge_meta::*;
 use forge_model::catalog::*;
 use forge_model::config::MetastoreConfig;
-use forge_model::ids::{ProjectId, TraceId};
+use forge_model::ids::TraceId;
+use forge_model::testing::{pid, segment_meta};
 use rusqlite::Connection;
 use std::path::Path;
-
-fn pid(s: &str) -> ProjectId {
-    ProjectId::new(s).unwrap()
-}
 
 fn proj(id: &str, name: &str) -> Project {
     Project {
@@ -22,16 +19,9 @@ fn proj(id: &str, name: &str) -> Project {
 
 /// A segment of project `p` with start times [min, max] (None = all null) and traces 1 and 2.
 fn seg(p: &str, level: Level, start: Option<(i64, i64)>, nulls: u64, max_version: u64) -> NewSegment {
-    let id = SegmentId::new();
-    let project_id = pid(p);
     let (t1, t2) = (TraceId([1; 16]), TraceId([2; 16]));
     NewSegment {
         meta: SegmentMeta {
-            id,
-            path: paths::segment_path(&project_id, level, HourBucket(100), id),
-            project_id,
-            level,
-            partition_hour: HourBucket(100),
             row_count: 20,
             byte_size: 1000,
             fts_byte_size: Some(10),
@@ -40,12 +30,9 @@ fn seg(p: &str, level: Level, start: Option<(i64, i64)>, nulls: u64, max_version
             start_time_nulls: nulls,
             min_trace_id: t1,
             max_trace_id: t2,
-            min_version: 1,
             max_version,
-            schema_version: 1,
             created_at_ms: 5,
-            state: SegmentState::Live,
-            deleted_at_ms: None,
+            ..segment_meta(p, level, HourBucket(100))
         },
         traces: vec![
             TraceRange {

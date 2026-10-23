@@ -6,21 +6,29 @@ use crate::{
 use async_trait::async_trait;
 use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, SegmentState, TraceLocation};
 use forge_model::ids::{ProjectId, TraceId};
+use forge_model::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
-    // busy_timeout first: switching to WAL needs a lock that a concurrent opener may hold.
     c.pragma_update(None, "busy_timeout", 5000)?;
+    // Switching a new file to WAL needs an exclusive lock and SQLite returns BUSY without calling the busy
+    // handler when a concurrent opener holds it, so retry for up to the busy timeout.
     // `:memory:` answers "memory"; nothing to assert.
-    let _mode: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    for attempt in 0.. {
+        match c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+            Err(rusqlite::Error::SqliteFailure(f, _))
+                if f.code == rusqlite::ErrorCode::DatabaseBusy && attempt < 500 =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            r => {
+                r?;
+                break;
+            }
+        }
+    }
     c.pragma_update(None, "synchronous", "FULL")?;
     c.pragma_update(None, "foreign_keys", "ON")?;
     c.pragma_update(None, "cache_size", -16000)?;
@@ -114,8 +122,17 @@ fn project_from_row(r: &Row<'_>) -> MetaResult<Project> {
 fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<()> {
     let m = &s.meta;
     let id = m.id.to_string();
-    tx.prepare_cached("INSERT INTO projects (id, name, created_at_ms) VALUES (?1, ?1, ?2) ON CONFLICT(id) DO NOTHING")?
-        .execute(params![m.project_id.as_str(), now])?;
+    let p = Project::new(m.project_id.clone(), None, None, now)?;
+    tx.prepare_cached(&format!(
+        "INSERT INTO projects ({PROJECT_COLS}) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING"
+    ))?
+    .execute(params![
+        p.id.as_str(),
+        p.name,
+        p.api_key_hash,
+        p.retention_days,
+        p.created_at_ms
+    ])?;
     tx.prepare_cached(&format!(
         "INSERT INTO segments ({SEGMENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"
     ))?
@@ -175,7 +192,8 @@ impl SqliteMetastore {
         })
     }
 
-    #[doc(hidden)]
+    /// Test hook: the value of `PRAGMA <name>`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn pragma(&self, name: &str) -> MetaResult<String> {
         use rusqlite::types::Value;
         let c = self.conn.lock().unwrap_or_else(|e| e.into_inner());

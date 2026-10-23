@@ -5,7 +5,9 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use forge_meta::Project;
+use forge_model::error::Unimplemented;
 use forge_model::ids::ProjectId;
+use forge_model::time::now_ms;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -51,41 +53,24 @@ async fn create(
     Json(req): Json<CreateProject>,
 ) -> Result<(StatusCode, Json<ProjectView>), ApiError> {
     let id = ProjectId::new(req.id)?;
-    if req.retention_days == Some(0) {
-        return Err(ApiError::BadRequest("retention_days must be > 0".into()));
-    }
-    let created_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    let p = Project {
-        name: req.name.unwrap_or_else(|| id.to_string()),
-        id,
-        api_key_hash: None,
-        retention_days: req.retention_days,
-        created_at_ms,
-    };
+    let p = Project::new(id, req.name, req.retention_days, now_ms())?;
     s.meta.create_project(p.clone()).await?;
     Ok((StatusCode::CREATED, Json(p.into())))
 }
 
-async fn m2() -> ApiError {
-    ApiError::Unimplemented("M2")
-}
-async fn m4() -> ApiError {
-    ApiError::Unimplemented("M4")
-}
-async fn m6() -> ApiError {
-    ApiError::Unimplemented("M6")
+/// A route that answers 501 `not implemented until <milestone>`.
+fn stub(milestone: &'static str) -> impl Fn() -> std::future::Ready<ApiError> + Clone + Send + Sync + 'static {
+    move || std::future::ready(Unimplemented(milestone).into())
 }
 
 pub fn api_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/projects", get(list).post(create))
-        .route("/v1/runs", post(m6).get(m2))
-        .route("/v1/runs/{id}", patch(m6))
-        .route("/v1/runs/batch", post(m6))
-        .route("/v1/traces/{trace_id}", get(m2))
-        .route("/v1/sql", post(m2))
-        .route("/v1/search", post(m4))
+        .route("/v1/runs", post(stub("M6")).get(stub("M2")))
+        .route("/v1/runs/{id}", patch(stub("M6")))
+        .route("/v1/runs/batch", post(stub("M6")))
+        .route("/v1/traces/{trace_id}", get(stub("M2")))
+        .route("/v1/sql", post(stub("M2")))
+        .route("/v1/search", post(stub("M4")))
         .with_state(state)
 }

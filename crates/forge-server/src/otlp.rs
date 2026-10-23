@@ -5,6 +5,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{Tra
 use opentelemetry_proto::tonic::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use tonic::{Request, Response, Status};
 
+/// Both OTLP receivers answer with this until ingest lands.
+const STUB_MSG: &str = "OTLP ingest lands in M1";
+
 #[derive(Debug, Default)]
 pub struct OtlpGrpcStub;
 
@@ -14,7 +17,7 @@ impl TraceService for OtlpGrpcStub {
         &self,
         _req: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        Err(Status::unimplemented("OTLP ingest lands in M1"))
+        Err(Status::unimplemented(STUB_MSG))
     }
 }
 
@@ -23,8 +26,5 @@ pub fn grpc_service() -> TraceServiceServer<OtlpGrpcStub> {
 }
 
 pub fn http_router() -> Router {
-    Router::new().route(
-        "/v1/traces",
-        post(|| async { (StatusCode::NOT_IMPLEMENTED, "OTLP ingest lands in M1") }),
-    )
+    Router::new().route("/v1/traces", post(|| async { (StatusCode::NOT_IMPLEMENTED, STUB_MSG) }))
 }

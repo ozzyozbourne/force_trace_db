@@ -109,12 +109,6 @@ impl SegmentStats {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 #[async_trait]
 impl SegmentStore for VortexSegmentStore {
     async fn write_segment(&self, spec: SegmentSpec, rows: BatchStream) -> StorageResult<WrittenSegment> {
@@ -168,7 +162,7 @@ impl SegmentStore for VortexSegmentStore {
             min_version: stats.min_version.unwrap_or(0),
             max_version: stats.max_version.unwrap_or(0),
             schema_version: SPANS_SCHEMA_VERSION,
-            created_at_ms: now_ms(),
+            created_at_ms: forge_model::time::now_ms(),
             state: SegmentState::Live,
             deleted_at_ms: None,
         };

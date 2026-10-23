@@ -2,6 +2,8 @@
 
 use async_trait::async_trait;
 use forge_model::catalog::SegmentMeta;
+use forge_model::error::{Classify, ErrorKind, Unimplemented};
+use forge_model::schema::{FTS_COLUMNS, JSON_COLUMNS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -9,10 +11,20 @@ pub enum IndexError {
     Corrupt { path: String, msg: String },
     #[error("invalid search query: {0}")]
     Query(String),
-    #[error("not implemented until {0}")]
-    Unimplemented(&'static str),
+    #[error(transparent)]
+    Unimplemented(#[from] Unimplemented),
 }
 pub type IndexResult<T> = Result<T, IndexError>;
+
+impl Classify for IndexError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Query(_) => ErrorKind::InvalidInput,
+            Self::Unimplemented(e) => e.kind(),
+            Self::Corrupt { .. } => ErrorKind::Internal,
+        }
+    }
+}
 
 /// FTS column id = position in forge_model::schema::FTS_COLUMNS (stored as u8 in .fts keys).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -25,18 +37,16 @@ pub enum FtsColumn {
     Metadata = 4,
 }
 impl FtsColumn {
+    /// In id order, parallel to `FTS_COLUMNS`.
+    pub const ALL: [Self; 5] = [Self::Name, Self::Error, Self::Inputs, Self::Outputs, Self::Metadata];
+    pub fn name(self) -> &'static str {
+        FTS_COLUMNS[self as usize]
+    }
     pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "name" => Self::Name,
-            "error" => Self::Error,
-            "inputs" => Self::Inputs,
-            "outputs" => Self::Outputs,
-            "metadata" => Self::Metadata,
-            _ => return None,
-        })
+        FTS_COLUMNS.iter().position(|c| *c == name).map(|i| Self::ALL[i])
     }
     pub fn is_json(self) -> bool {
-        matches!(self, Self::Inputs | Self::Outputs | Self::Metadata)
+        JSON_COLUMNS.contains(&self.name())
     }
 }
 
@@ -92,52 +102,24 @@ impl IndexReader for NoopIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentState, paths};
-    use forge_model::ids::ProjectId;
+    use forge_model::catalog::{HourBucket, Level};
+    use forge_model::testing::segment_meta;
 
     #[test]
     fn column_ids_match_schema_positions() {
-        let all = [
-            FtsColumn::Name,
-            FtsColumn::Error,
-            FtsColumn::Inputs,
-            FtsColumn::Outputs,
-            FtsColumn::Metadata,
-        ];
-        assert_eq!(all.len(), forge_model::schema::FTS_COLUMNS.len());
-        for (i, n) in forge_model::schema::FTS_COLUMNS.iter().enumerate() {
-            let c = FtsColumn::from_name(n).unwrap();
+        assert_eq!(FtsColumn::ALL.len(), FTS_COLUMNS.len());
+        for (i, c) in FtsColumn::ALL.into_iter().enumerate() {
             assert_eq!(c as u8 as usize, i);
-            assert_eq!(c, all[i]);
+            assert_eq!(FtsColumn::from_name(c.name()), Some(c));
         }
+        let json: Vec<_> = FtsColumn::ALL.into_iter().filter(|c| c.is_json()).collect();
+        assert_eq!(json, [FtsColumn::Inputs, FtsColumn::Outputs, FtsColumn::Metadata]);
         assert_eq!(FtsColumn::from_name("model"), None);
     }
 
     #[tokio::test]
     async fn noop_reader_reports_no_index() {
-        let p = ProjectId::new("p").unwrap();
-        let id = SegmentId::new();
-        let seg = SegmentMeta {
-            id,
-            path: paths::segment_path(&p, Level::L0, HourBucket(0), id),
-            project_id: p,
-            level: Level::L0,
-            partition_hour: HourBucket(0),
-            row_count: 1,
-            byte_size: 1,
-            fts_byte_size: None,
-            min_start_ns: None,
-            max_start_ns: None,
-            start_time_nulls: 1,
-            min_trace_id: Default::default(),
-            max_trace_id: Default::default(),
-            min_version: 1,
-            max_version: 1,
-            schema_version: 1,
-            created_at_ms: 0,
-            state: SegmentState::Live,
-            deleted_at_ms: None,
-        };
+        let seg = segment_meta("p", Level::L0, HourBucket(0));
         let expr = FtsExpr::Pred(FtsPredicate::Search {
             column: FtsColumn::Name,
             query: "x".into(),

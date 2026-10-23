@@ -4,16 +4,13 @@ use arrow::record_batch::RecordBatch;
 use forge_model::catalog::{HourBucket, Level, SegmentId, paths};
 use forge_model::config::StorageConfig;
 use forge_model::dotted::dotted_order;
-use forge_model::ids::{ProjectId, SpanId, TraceId};
+use forge_model::ids::{SpanId, TraceId};
 use forge_model::row::{SpanBatchBuilder, SpanRow};
 use forge_model::schema::{col, col_idx, projected_schema, spans_schema};
+use forge_model::testing::pid;
 use forge_storage::*;
 use futures::{TryStreamExt, stream};
 use object_store::ObjectStoreExt;
-
-fn pid(s: &str) -> ProjectId {
-    ProjectId::new(s).unwrap()
-}
 
 fn trace(t: usize) -> TraceId {
     TraceId((t as u128 + 1).to_be_bytes())
@@ -220,7 +217,10 @@ async fn write_invariants() {
 #[test]
 fn urls() {
     let u = |s: &str| build_object_store(&StorageConfig { url: s.into() });
-    assert!(matches!(u("s3://b/p"), Err(StorageError::Unimplemented("M5"))));
+    assert!(matches!(
+        u("s3://b/p"),
+        Err(StorageError::Unimplemented(forge_model::error::Unimplemented("M5")))
+    ));
     assert!(matches!(u("ftp://x"), Err(StorageError::Config { .. })));
     assert!(matches!(u("file://"), Err(StorageError::Config { .. })));
     assert!(u("memory://").unwrap().local_root.is_none());

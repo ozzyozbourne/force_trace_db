@@ -1,4 +1,5 @@
 //! Catalog types shared by meta, storage, index, ingest and query.
+use crate::enums::str_enum;
 use crate::ids::{ProjectId, TraceId};
 use std::{fmt, str::FromStr};
 
@@ -32,28 +33,17 @@ impl FromStr for SegmentId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Level {
-    L0 = 0,
-    L1 = 1,
-}
+str_enum!(
+    #[derive(PartialOrd, Ord)]
+    #[repr(u8)]
+    Level, "level", { L0 => "L0", L1 => "L1" }
+);
 impl Level {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
     pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::L0),
-            1 => Some(Self::L1),
-            _ => None,
-        }
-    }
-    pub fn dir(self) -> &'static str {
-        match self {
-            Self::L0 => "L0",
-            Self::L1 => "L1",
-        }
+        Self::ALL.get(usize::from(v)).copied()
     }
 }
 
@@ -78,27 +68,14 @@ impl HourBucket {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SegmentState {
-    Live,
-    Compacting,
-    Deleted,
-}
+str_enum!(SegmentState, "segment_state", {
+    Live => "live",
+    Compacting => "compacting",
+    Deleted => "deleted",
+});
 impl SegmentState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Live => "live",
-            Self::Compacting => "compacting",
-            Self::Deleted => "deleted",
-        }
-    }
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "live" => Some(Self::Live),
-            "compacting" => Some(Self::Compacting),
-            "deleted" => Some(Self::Deleted),
-            _ => None,
-        }
+        s.parse().ok()
     }
     /// Live and compacting segments are both visible to queries.
     pub fn is_visible(self) -> bool {
@@ -173,7 +150,7 @@ pub mod paths {
     use super::{HourBucket, Level, SegmentId};
     use crate::ids::ProjectId;
     pub fn segment_path(p: &ProjectId, level: Level, hour: HourBucket, id: SegmentId) -> String {
-        format!("segments/{p}/{}/{}/{id}.vortex", level.dir(), hour.path_component())
+        format!("segments/{p}/{}/{}/{id}.vortex", level.as_str(), hour.path_component())
     }
     pub fn fts_path(segment_path: &str) -> String {
         format!("{}.fts", segment_path.strip_suffix(".vortex").unwrap_or(segment_path))
@@ -193,28 +170,11 @@ mod tests {
     use chrono::TimeZone;
 
     fn meta(min: Option<i64>, max: Option<i64>, nulls: u64) -> SegmentMeta {
-        let id = SegmentId::new();
-        let p = ProjectId::new("p").unwrap();
         SegmentMeta {
-            id,
-            path: paths::segment_path(&p, Level::L0, HourBucket(0), id),
-            project_id: p,
-            level: Level::L0,
-            partition_hour: HourBucket(0),
-            row_count: 1,
-            byte_size: 1,
-            fts_byte_size: None,
             min_start_ns: min,
             max_start_ns: max,
             start_time_nulls: nulls,
-            min_trace_id: TraceId::default(),
-            max_trace_id: TraceId::default(),
-            min_version: 1,
-            max_version: 1,
-            schema_version: 1,
-            created_at_ms: 0,
-            state: SegmentState::Live,
-            deleted_at_ms: None,
+            ..crate::testing::segment_meta("p", Level::L0, HourBucket(0))
         }
     }
 
@@ -238,7 +198,7 @@ mod tests {
         let id: SegmentId = "01JAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
         assert_eq!(id.to_string().parse::<SegmentId>().unwrap(), id);
         assert!("nope".parse::<SegmentId>().is_err());
-        let p = ProjectId::new("p").unwrap();
+        let p = crate::testing::pid("p");
         let path = paths::segment_path(&p, Level::L1, HourBucket(0), id);
         assert_eq!(path, "segments/p/L1/1970-01-01/00/01JAAAAAAAAAAAAAAAAAAAAAAA.vortex");
         assert_eq!(
@@ -249,7 +209,7 @@ mod tests {
             assert_eq!(Level::from_u8(l.as_u8()), Some(l));
         }
         assert_eq!(Level::from_u8(2), None);
-        for s in [SegmentState::Live, SegmentState::Compacting, SegmentState::Deleted] {
+        for &s in SegmentState::ALL {
             assert_eq!(SegmentState::parse(s.as_str()), Some(s));
         }
         assert_eq!(SegmentState::parse("x"), None);
