@@ -28,6 +28,18 @@ pub enum MetaError {
     Config { url: String, msg: String },
     #[error("cannot create {}: {source}", path.display())]
     CreateDir { path: PathBuf, source: std::io::Error },
+    #[error("cannot copy {} to {}: {source}", from.display(), to.display())]
+    Copy {
+        from: PathBuf,
+        to: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
+        "{} changed during {attempts} copy attempts (a server is writing it): query the running server with \
+         `forge sql --server`",
+        path.display()
+    )]
+    Unstable { path: PathBuf, attempts: u32 },
     #[error("{0}")]
     InvalidInput(String),
     #[error(transparent)]

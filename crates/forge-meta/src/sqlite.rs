@@ -80,6 +80,98 @@ fn probe_nonce() -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
+/// Prefix of `copy_snapshot`'s directories under the system temp dir.
+const COPY_PREFIX: &str = "forge-meta-ro-";
+/// A copy this old was left by a killed process (the guard removes it on every normal exit); the next copy
+/// sweeps it.
+const STALE_COPY: std::time::Duration = std::time::Duration::from_secs(3600);
+const COPY_ATTEMPTS: u32 = 3;
+
+/// What a writer changes between our two file copies: `meta.db`'s change counter (header bytes 24..28), size and
+/// mtime (a checkpoint writes pages), and the WAL salts (header bytes 16..24, new on every WAL restart). An
+/// append to the WAL changes none of them, and a torn last frame is dropped by SQLite's checksum.
+#[derive(Debug, PartialEq)]
+struct Generation {
+    counter: Vec<u8>,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    salts: Vec<u8>,
+}
+
+fn generation(db: &Path, wal: &Path) -> std::io::Result<Generation> {
+    use std::io::{Read, Seek, SeekFrom};
+    let header = |p: &Path, at: u64, n: u64| -> std::io::Result<Vec<u8>> {
+        let mut f = std::fs::File::open(p)?;
+        f.seek(SeekFrom::Start(at))?;
+        let mut v = Vec::new();
+        f.take(n).read_to_end(&mut v)?;
+        Ok(v)
+    };
+    let m = std::fs::metadata(db)?;
+    Ok(Generation {
+        counter: header(db, 24, 4)?,
+        len: m.len(),
+        mtime: m.modified().ok(),
+        salts: header(wal, 16, 8)?,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs between the `meta.db` and the `-wal` copy of each attempt.
+    static COPY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Copies `db` and its non-empty `wal` into a fresh dir under the system temp dir; the guard removes it on drop.
+/// A live writer can checkpoint and restart the WAL between the two copies (a silently stale or torn snapshot), so
+/// the copy is kept only if `generation` is the same before and after; up to `COPY_ATTEMPTS`, then `Unstable`.
+/// There is no size limit: the whole `meta.db` is copied each time. A kill skips the guard and leaves the dir
+/// behind; copies older than `STALE_COPY` are swept here first.
+fn copy_snapshot(db: &Path, wal: &Path) -> MetaResult<(std::path::PathBuf, Arc<TempCopy>)> {
+    let tmp_root = std::env::temp_dir();
+    sweep_stale_copies(&tmp_root);
+    let tmp = tmp_root.join(format!("{COPY_PREFIX}{}-{}", std::process::id(), probe_nonce()));
+    std::fs::create_dir_all(&tmp).map_err(|source| MetaError::CreateDir {
+        path: tmp.clone(),
+        source,
+    })?;
+    let guard = Arc::new(TempCopy(tmp.clone()));
+    let to = tmp.join(db.file_name().unwrap_or("meta.db".as_ref()));
+    let to_wal = sibling(&to, "-wal");
+    let err = |from: &Path, to: &Path| {
+        let (from, to) = (from.to_path_buf(), to.to_path_buf());
+        move |source| MetaError::Copy { from, to, source }
+    };
+    for _ in 0..COPY_ATTEMPTS {
+        let before = generation(db, wal).map_err(err(db, &to))?;
+        std::fs::copy(db, &to).map_err(err(db, &to))?;
+        #[cfg(test)]
+        COPY_HOOK.with(|h| h.borrow_mut().as_mut().map(|f| f()));
+        std::fs::copy(wal, &to_wal).map_err(err(wal, &to_wal))?;
+        if generation(db, wal).map_err(err(db, &to))? == before {
+            return Ok((to, guard));
+        }
+    }
+    Err(MetaError::Unstable {
+        path: db.to_path_buf(),
+        attempts: COPY_ATTEMPTS,
+    })
+}
+
+/// Removes `COPY_PREFIX` dirs in `root` last modified more than `STALE_COPY` ago (best effort).
+fn sweep_stale_copies(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for e in entries.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with(COPY_PREFIX)
+            && e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > STALE_COPY));
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// `path` + `suffix` (e.g. `meta.db-wal`).
 fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_owned();
@@ -400,8 +492,9 @@ impl SqliteMetastore {
     /// migrations); the schema version must equal this binary's. Writes fail with SQLITE_READONLY (Internal).
     /// SQLite creates `-shm` beside a WAL database on the first read, so a directory that does not accept files
     /// (a probe, or that first read failing with CANTOPEN / READONLY) needs another way in:
-    /// - a non-empty `-wal` (commits not yet checkpointed, e.g. after a crash): `meta.db` and the `-wal` are copied
-    ///   to a private temp dir and opened there, so SQLite replays the WAL (`immutable=1` would ignore it);
+    /// - a non-empty `-wal` (commits not yet checkpointed, e.g. after a crash or a live server): `meta.db` and the
+    ///   `-wal` are copied to a private temp dir and opened there, so SQLite replays the WAL (`immutable=1` would
+    ///   ignore it); see `copy_snapshot` (a consistency check against a live writer, no size limit);
     /// - otherwise `immutable=1`: the main file is the whole database and nothing can write the directory.
     pub fn open_read_only(path: &Path) -> MetaResult<Self> {
         let dir = path
@@ -417,16 +510,7 @@ impl SqliteMetastore {
         }
         let wal = sibling(path, "-wal");
         if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-            let tmp = std::env::temp_dir().join(format!("forge-ro-{}-{}", std::process::id(), probe_nonce()));
-            let io = |source| MetaError::CreateDir {
-                path: tmp.clone(),
-                source,
-            };
-            std::fs::create_dir_all(&tmp).map_err(io)?;
-            let copy = Arc::new(TempCopy(tmp.clone()));
-            let db = tmp.join(path.file_name().unwrap_or("meta.db".as_ref()));
-            std::fs::copy(path, &db).map_err(io)?;
-            std::fs::copy(&wal, sibling(&db, "-wal")).map_err(io)?;
+            let (db, copy) = copy_snapshot(path, &wal)?;
             return Ok(Self::read_only(read_only_conn(&db, false)?, Some(copy)));
         }
         Ok(Self::read_only(read_only_conn(path, true)?, None))
@@ -658,5 +742,133 @@ impl Metastore for SqliteMetastore {
             Ok(out)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A WAL database with 10 checkpointed rows and txn A (10 rows) still in the WAL; the writer stays open.
+    fn wal_db(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, Connection) {
+        let db = dir.join("meta.db");
+        let w = Connection::open(&db).unwrap();
+        w.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())).unwrap();
+        w.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        w.execute_batch("CREATE TABLE t(x)").unwrap();
+        let insert10 = || {
+            for i in 0..10 {
+                w.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+            }
+        };
+        insert10();
+        w.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        insert10();
+        (db.clone(), sibling(&db, "-wal"), w)
+    }
+
+    fn rows(db: &Path) -> i64 {
+        Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Between the two copies the writer checkpoints and commits txn B, restarting the WAL: txn A is in neither
+    /// copied file. The first attempt is discarded; the retry sees all 21 rows.
+    #[test]
+    fn copy_retries_when_the_writer_restarts_the_wal() {
+        let d = tempfile::tempdir().unwrap();
+        let (db, wal, w) = wal_db(d.path());
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = calls.clone();
+        COPY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                c.set(c.get() + 1);
+                if c.get() == 1 {
+                    w.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
+                    w.execute("INSERT INTO t VALUES (99)", []).unwrap();
+                }
+            }))
+        });
+        let (copy, guard) = copy_snapshot(&db, &wal).unwrap();
+        COPY_HOOK.with(|h| h.borrow_mut().take());
+        assert_eq!(calls.get(), 2, "retried once");
+        assert_eq!(rows(&copy), 21);
+        let tmp = guard.0.clone();
+        drop(guard);
+        assert!(!tmp.exists());
+    }
+
+    /// A writer that changes the database on every attempt: `Unstable` after 3 attempts, pointing at
+    /// `forge sql --server`; the temp dir is removed.
+    #[test]
+    fn copy_gives_up_on_a_busy_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let (db, wal, w) = wal_db(d.path());
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = calls.clone();
+        COPY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                c.set(c.get() + 1);
+                w.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())).unwrap();
+                w.execute("INSERT INTO t VALUES (99)", []).unwrap();
+            }))
+        });
+        let before = copies();
+        let e = copy_snapshot(&db, &wal).unwrap_err();
+        COPY_HOOK.with(|h| h.borrow_mut().take());
+        assert_eq!(calls.get(), 3);
+        assert!(matches!(e, MetaError::Unstable { attempts: 3, .. }), "{e:?}");
+        assert!(e.to_string().contains("forge sql --server"), "{e}");
+        assert!(copies().is_subset(&before), "temp dir left behind");
+    }
+
+    fn copies() -> std::collections::BTreeSet<std::ffi::OsString> {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with(COPY_PREFIX))
+            .collect()
+    }
+
+    /// A failed copy names its source and destination.
+    #[test]
+    fn copy_failure_names_both_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("missing.db");
+        let e = copy_snapshot(&db, &sibling(&db, "-wal")).unwrap_err();
+        let MetaError::Copy { ref from, ref to, .. } = e else {
+            panic!("{e:?}")
+        };
+        assert_eq!(from, &db);
+        assert!(
+            to.starts_with(std::env::temp_dir()) && to.ends_with("missing.db"),
+            "{to:?}"
+        );
+        assert!(e.to_string().contains(&*db.to_string_lossy()), "{e}");
+    }
+
+    /// A copy dir older than an hour (left by a killed process) is swept by the next copy; a recent one is kept.
+    #[test]
+    fn copy_sweeps_stale_copies() {
+        let tmp = std::env::temp_dir();
+        let (stale, fresh) = (
+            tmp.join(format!("{COPY_PREFIX}stale-{}", probe_nonce())),
+            tmp.join(format!("{COPY_PREFIX}fresh-{}", probe_nonce())),
+        );
+        for p in [&stale, &fresh] {
+            std::fs::create_dir(p).unwrap();
+            std::fs::write(p.join("meta.db"), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - 2 * STALE_COPY;
+        std::fs::File::open(&stale).unwrap().set_modified(old).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let (db, wal, _w) = wal_db(d.path());
+        let _copy = copy_snapshot(&db, &wal).unwrap();
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        std::fs::remove_dir_all(&fresh).unwrap();
     }
 }

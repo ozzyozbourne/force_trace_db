@@ -327,10 +327,10 @@ impl QueryEngine {
         // Candidates from `unchecked` on (in `cand`'s order) are not verified yet; None: all are. Segments are
         // read in descending max_start, so every verified candidate starts above every unverified one.
         let mut unchecked = Some(Bound::Unbounded);
-        // The verified rows, trimmed to the top K after each wave (`overflow`: more than K were verified).
+        // The verified rows of every wave. Only the last wave can take `verified` past K (the loop stops at the
+        // first wave that reaches K), so they stay bounded by K + one wave.
         let mut merged: Vec<RecordBatch> = Vec::new();
         let mut verified: BTreeMap<Reverse<Pos>, (usize, usize)> = BTreeMap::new();
-        let mut overflow = false;
         let mut i = 0;
         loop {
             let frontier = segs.get(i).and_then(|s| s.max_start_ns);
@@ -347,14 +347,6 @@ impl QueryEngine {
                         verified.insert(Reverse(p), (merged.len(), row));
                     }
                     merged.push(b);
-                    overflow |= verified.len() > k;
-                    if merged.len() > 1 || verified.len() > k {
-                        let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
-                        let top = interleave_record_batch(&merged.iter().collect::<Vec<_>>(), &idx)?;
-                        verified = verified.into_keys().take(k).zip((0..).map(|j| (0, j))).collect();
-                        res.resize(top.get_array_memory_size());
-                        merged = vec![top];
-                    }
                 }
             }
             unchecked = upper.map(Bound::Included);
@@ -387,7 +379,7 @@ impl QueryEngine {
             cand.extend(found.into_iter().map(Reverse));
         }
         let unverified = unchecked.is_some_and(|lo| cand.range((lo, Bound::Unbounded)).next().is_some());
-        let more = overflow || i < segs.len() || unverified;
+        let more = verified.len() > k || i < segs.len() || unverified;
         let next_cursor = (verified.len() >= k && more).then(|| Cursor(verified.keys().nth(k - 1).expect("k rows").0));
         let idx: Vec<(usize, usize)> = verified.values().take(k).copied().collect();
         let rows = if idx.is_empty() {
