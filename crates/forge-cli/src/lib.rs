@@ -13,6 +13,9 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[arg(long, global = true, env = "FORGE_LOG", default_value = "info")]
     pub log: String,
+    /// `json` selects JSON logs; any other value is human-readable text.
+    #[arg(long, global = true, env = "FORGE_LOG_FORMAT", default_value = "text")]
+    pub log_format: String,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -76,22 +79,18 @@ pub enum BenchMode {
     Query,
 }
 
-/// `RUST_LOG` wins, else `--log`; always stderr; `FORGE_LOG_FORMAT=json` selects JSON.
-pub fn init_tracing(log: &str) {
+/// `RUST_LOG` wins, else `--log`; always stderr; format `json` selects JSON.
+pub fn init_tracing(log: &str, format: &str) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log));
     let b = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr);
-    if std::env::var("FORGE_LOG_FORMAT").is_ok_and(|v| v == "json") {
-        b.json().init()
-    } else {
-        b.init()
-    }
+    if format == "json" { b.json().init() } else { b.init() }
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    init_tracing(&cli.log);
+    init_tracing(&cli.log, &cli.log_format);
     match cli.cmd {
         Cmd::Serve => {
             // Before any startup work, so an early SIGTERM is queued instead of killing the process.

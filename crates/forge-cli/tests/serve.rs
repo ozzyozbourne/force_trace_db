@@ -1,13 +1,16 @@
 //! M0 exit test: spawn the real `forge serve` binary, talk to all four listeners, SIGTERM it.
 
+mod common;
+
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -25,19 +28,15 @@ struct ServerProc {
 
 impl ServerProc {
     fn spawn(dir: &Path, cfg: Option<&Path>, env: &[(&str, &str)]) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
+        let mut cmd = common::forge_cmd();
         cmd.arg("serve");
         if let Some(cfg) = cfg {
             cmd.arg("--config").arg(cfg);
         }
-        cmd.current_dir(dir);
-        for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("FORGE_")) {
-            cmd.env_remove(k);
-        }
-        cmd.env("FORGE_LOG_FORMAT", "json").env("RUST_LOG", "info");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        cmd.current_dir(dir)
+            .env("FORGE_LOG_FORMAT", "json")
+            .env("RUST_LOG", "info");
+        cmd.envs(env.iter().copied());
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -53,114 +52,109 @@ impl ServerProc {
         Self { child, logs }
     }
 
+    fn lines(&self) -> MutexGuard<'_, Vec<String>> {
+        self.logs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn logs(&self) -> String {
-        self.logs.lock().unwrap_or_else(|e| e.into_inner()).join("\n")
+        self.lines().join("\n")
     }
 
-    fn pid(&self) -> String {
-        self.child.id().to_string()
-    }
-
-    fn check_running(&mut self) {
-        if let Some(status) = self.child.try_wait().expect("try_wait") {
-            panic!("forge exited early: {status}\n--- server stderr ---\n{}", self.logs());
+    /// Calls `f` every 50 ms until it returns Some; panics with `what` and the server logs after `within`.
+    /// With `alive`, also panics as soon as the server exits.
+    async fn poll<T>(
+        &mut self,
+        within: Duration,
+        what: &str,
+        alive: bool,
+        mut f: impl AsyncFnMut(&mut Self) -> Option<T>,
+    ) -> T {
+        let start = Instant::now();
+        loop {
+            if let Some(v) = f(self).await {
+                return v;
+            }
+            if alive && let Some(status) = self.child.try_wait().expect("try_wait") {
+                panic!("forge exited early: {status}\n--- server stderr ---\n{}", self.logs());
+            }
+            assert!(start.elapsed() < within, "{what} within {within:?}\n{}", self.logs());
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     /// Bound addresses from the `listening` log events (all configured addrs are port 0).
     async fn ports(&mut self) -> Ports {
-        let start = Instant::now();
-        loop {
-            self.check_running();
-            let mut found = HashMap::new();
-            for line in self.logs.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                let f = &v["fields"];
-                if f["message"] == "listening"
-                    && let (Some(name), Some(addr)) = (f["name"].as_str(), f["addr"].as_str())
-                {
-                    found.insert(name.to_string(), addr.parse::<SocketAddr>().expect("listening addr"));
+        self.poll(
+            Duration::from_secs(30),
+            "no listening lines",
+            true,
+            async |s: &mut Self| {
+                let mut found = HashMap::new();
+                for line in s.lines().iter() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    let f = &v["fields"];
+                    if f["message"] == "listening"
+                        && let (Some(name), Some(addr)) = (f["name"].as_str(), f["addr"].as_str())
+                    {
+                        found.insert(name.to_string(), addr.parse::<SocketAddr>().expect("listening addr"));
+                    }
                 }
-            }
-            if let (Some(&ops), Some(&api), Some(&otlp_http), Some(&otlp_grpc)) = (
-                found.get("ops"),
-                found.get("api"),
-                found.get("otlp-http"),
-                found.get("otlp-grpc"),
-            ) {
-                return Ports {
-                    ops,
-                    api,
-                    otlp_http,
-                    otlp_grpc,
-                };
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "no listening lines after 30s\n{}",
-                self.logs()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+                let get = |n: &str| found.get(n).copied();
+                Some(Ports {
+                    ops: get("ops")?,
+                    api: get("api")?,
+                    otlp_http: get("otlp-http")?,
+                    otlp_grpc: get("otlp-grpc")?,
+                })
+            },
+        )
+        .await
     }
 
     async fn wait_healthy(&mut self, ops: SocketAddr) {
         let c = reqwest::Client::new();
-        let start = Instant::now();
-        loop {
-            self.check_running();
-            if let Ok(r) = c.get(format!("http://{ops}/healthz")).send().await
-                && r.status() == 200
-            {
-                assert_eq!(r.text().await.expect("body"), "ok");
-                return;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "/healthz never 200\n{}",
-                self.logs()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let url = format!("http://{ops}/healthz");
+        let body = self
+            .poll(
+                Duration::from_secs(30),
+                "/healthz never 200",
+                true,
+                async |_: &mut Self| {
+                    let r = c.get(&url).send().await.ok().filter(|r| r.status() == 200)?;
+                    Some(r.text().await.expect("body"))
+                },
+            )
+            .await;
+        assert_eq!(body, "ok");
     }
 
     fn sigterm(&self) {
         let st = Command::new("kill")
-            .args(["-TERM", &self.pid()])
+            .args(["-TERM", &self.child.id().to_string()])
             .status()
             .expect("run kill");
         assert!(st.success(), "kill -TERM failed: {st}");
     }
 
     async fn wait_exit(&mut self, within: Duration) -> ExitStatus {
-        let start = Instant::now();
-        loop {
-            if let Some(s) = self.child.try_wait().expect("try_wait") {
-                // Let the stderr reader thread drain the last lines.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return s;
-            }
-            assert!(
-                start.elapsed() < within,
-                "forge did not exit within {within:?}\n{}",
-                self.logs()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let st = self
+            .poll(within, "forge did not exit", false, async |s: &mut Self| {
+                s.child.try_wait().expect("try_wait")
+            })
+            .await;
+        // Let the stderr reader thread drain the last lines.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        st
     }
 
-    fn wait_for_log(&self, needle: &str, within: Duration) {
-        let start = Instant::now();
-        while !self.logs().contains(needle) {
-            assert!(
-                start.elapsed() < within,
-                "log {needle:?} not seen within {within:?}\n{}",
-                self.logs()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    async fn wait_for_log(&mut self, needle: &str, within: Duration) {
+        let what = format!("log {needle:?} not seen");
+        self.poll(within, &what, false, async |s: &mut Self| {
+            s.lines().iter().any(|l| l.contains(needle)).then_some(())
+        })
+        .await;
     }
 }
 
@@ -201,12 +195,21 @@ shutdown_grace = "{grace}"
     path
 }
 
-async fn start(dir: &Path, grace: &str) -> (ServerProc, Ports) {
-    let cfg = write_config(dir, grace);
-    let mut s = ServerProc::spawn(dir, Some(&cfg), &[]);
+/// Spawns `forge serve` and waits until all listeners are up and /healthz answers.
+async fn spawn_ready(dir: &Path, cfg: Option<&Path>, env: &[(&str, &str)]) -> (ServerProc, Ports) {
+    let mut s = ServerProc::spawn(dir, cfg, env);
     let p = s.ports().await;
     s.wait_healthy(p.ops).await;
     (s, p)
+}
+
+async fn start(dir: &Path, grace: &str) -> (ServerProc, Ports) {
+    spawn_ready(dir, Some(&write_config(dir, grace)), &[]).await
+}
+
+async fn project_list(c: &reqwest::Client, api: SocketAddr) -> String {
+    let r = c.get(format!("http://{api}/v1/projects")).send().await.expect("get");
+    r.text().await.expect("body")
 }
 
 #[tokio::test]
@@ -232,7 +235,6 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
             .await
             .expect_err("export must fail in M0");
         assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-        drop(grpc);
 
         let r = c
             .post(format!("http://{}/v1/traces", p.otlp_http))
@@ -282,7 +284,7 @@ async fn second_signal_forces_exit() {
     let _grpc = std::net::TcpStream::connect(p.otlp_grpc).expect("connect grpc");
     tokio::time::sleep(Duration::from_millis(200)).await;
     s.sigterm();
-    s.wait_for_log("shutdown signal received", Duration::from_secs(5));
+    s.wait_for_log("shutdown signal received", Duration::from_secs(5)).await;
     s.sigterm();
     let st = s.wait_exit(Duration::from_secs(5)).await;
     assert_eq!(st.code(), Some(130), "{st}\n{}", s.logs());
@@ -295,41 +297,23 @@ async fn projects_persist_across_restart() {
 
     let (mut s, p) = start(tmp.path(), "2s").await;
     let url = format!("http://{}/v1/projects", p.api);
-    let post = |body: serde_json::Value| c.post(&url).json(&body).send();
-    assert_eq!(
-        post(serde_json::json!({"id": "demo"})).await.expect("post").status(),
-        201
-    );
-    assert_eq!(
-        post(serde_json::json!({"id": "demo"})).await.expect("post").status(),
-        409
-    );
-    assert_eq!(
-        post(serde_json::json!({"id": "bad/id"})).await.expect("post").status(),
-        400
-    );
-    assert_eq!(
-        post(serde_json::json!({"id": "z", "retention_days": 0}))
-            .await
-            .expect("post")
-            .status(),
-        400
-    );
-    let body = c.get(&url).send().await.expect("get").text().await.expect("body");
+    for (body, want) in [
+        (json!({"id": "demo"}), 201),
+        (json!({"id": "demo"}), 409),
+        (json!({"id": "bad/id"}), 400),
+        (json!({"id": "z", "retention_days": 0}), 400),
+    ] {
+        let r = c.post(&url).json(&body).send().await.expect("post");
+        assert_eq!(r.status(), want, "{body}");
+    }
+    let body = project_list(&c, p.api).await;
     assert!(body.contains("\"demo\""), "{body}");
     s.sigterm();
     assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
     drop(s);
 
     let (mut s, p) = start(tmp.path(), "2s").await;
-    let body = c
-        .get(format!("http://{}/v1/projects", p.api))
-        .send()
-        .await
-        .expect("get")
-        .text()
-        .await
-        .expect("body");
+    let body = project_list(&c, p.api).await;
     assert!(body.contains("\"demo\""), "{body}");
     s.sigterm();
     assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
@@ -345,9 +329,7 @@ async fn serve_without_config_uses_relative_defaults() {
         ("FORGE_SERVER__OTLP_GRPC_ADDR", "127.0.0.1:0"),
         ("FORGE_SERVER__SHUTDOWN_GRACE", "2s"),
     ];
-    let mut s = ServerProc::spawn(tmp.path(), None, &env);
-    let p = s.ports().await;
-    s.wait_healthy(p.ops).await;
+    let (mut s, _) = spawn_ready(tmp.path(), None, &env).await;
     s.sigterm();
     assert!(s.wait_exit(Duration::from_secs(10)).await.success(), "{}", s.logs());
     assert!(tmp.path().join("forge-data/meta.db").is_file(), "{}", s.logs());

@@ -1,11 +1,9 @@
-use std::process::{Command, Output};
+mod common;
+
+use std::process::Output;
 
 fn forge(args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_forge"));
-    for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("FORGE_")) {
-        cmd.env_remove(k);
-    }
-    cmd.args(args).output().expect("run forge")
+    common::forge_cmd().args(args).output().expect("run forge")
 }
 
 #[test]

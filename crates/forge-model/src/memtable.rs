@@ -6,18 +6,10 @@ pub trait MemtableView: Send + Sync + std::fmt::Debug + 'static {
     fn snapshot(&self) -> MemtableSnapshot;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MemtableSnapshot {
     /// spans_schema batches, unsorted, may hold several versions per key.
     pub batches: Arc<[RecordBatch]>,
-}
-
-impl Default for MemtableSnapshot {
-    fn default() -> Self {
-        Self {
-            batches: Arc::from(Vec::new()),
-        }
-    }
 }
 
 /// No unflushed rows (M0, offline tools).

@@ -9,7 +9,7 @@ use forge_model::ids::{ProjectId, TraceId};
 use forge_model::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 fn set_pragmas(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "busy_timeout", 5000)?;
@@ -45,7 +45,6 @@ const PROJECT_COLS: &str = "id, name, api_key_hash, retention_days, created_at_m
 const SEGMENT_COLS: &str = "id, project_id, level, partition_hour, path, row_count, byte_size, fts_byte_size, \
     min_start_ns, max_start_ns, start_time_nulls, min_trace_id, max_trace_id, min_version, max_version, \
     schema_version, created_at_ms, state, deleted_at_ms";
-const SEGMENT_NCOLS: usize = 19;
 
 /// Only PRIMARY KEY / UNIQUE violations are conflicts; CHECK and NOT NULL stay `Sqlite` (D16).
 fn map_err(e: rusqlite::Error, what: &str) -> MetaError {
@@ -62,14 +61,19 @@ fn map_err(e: rusqlite::Error, what: &str) -> MetaError {
     }
 }
 
-fn corrupt(msg: impl std::fmt::Display) -> MetaError {
+fn corrupt(table: &'static str, msg: impl std::fmt::Display) -> MetaError {
     MetaError::Corrupt {
-        table: "segments",
+        table,
         msg: msg.to_string(),
     }
 }
-fn to_u64(v: i64) -> MetaResult<u64> {
-    u64::try_from(v).map_err(|_| corrupt(format!("negative value {v}")))
+fn to_u64(table: &'static str, v: i64) -> MetaResult<u64> {
+    u64::try_from(v).map_err(|_| corrupt(table, format!("negative value {v}")))
+}
+
+/// Poison-tolerant: a panic in another holder does not make the connection unusable.
+fn lock(m: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 fn to_i64(v: u64) -> MetaResult<i64> {
     i64::try_from(v).map_err(|_| MetaError::Conflict(format!("value {v} exceeds i64")))
@@ -82,25 +86,27 @@ fn segment_from_row(r: &Row<'_>) -> MetaResult<SegmentMeta> {
     let min_tid: Vec<u8> = r.get(11)?;
     let max_tid: Vec<u8> = r.get(12)?;
     let state: String = r.get(17)?;
+    let bad = |m: String| corrupt("segments", m);
+    let num = |i: usize| to_u64("segments", r.get(i)?);
     Ok(SegmentMeta {
-        id: id.parse().map_err(corrupt)?,
-        project_id: ProjectId::new(project).map_err(corrupt)?,
-        level: Level::from_u8(level).ok_or_else(|| corrupt(format!("level {level}")))?,
+        id: id.parse().map_err(|e| bad(format!("{e}")))?,
+        project_id: ProjectId::new(project).map_err(|e| bad(e.to_string()))?,
+        level: Level::from_u8(level).ok_or_else(|| bad(format!("level {level}")))?,
         partition_hour: HourBucket(r.get(3)?),
         path: r.get(4)?,
-        row_count: to_u64(r.get(5)?)?,
-        byte_size: to_u64(r.get(6)?)?,
-        fts_byte_size: r.get::<_, Option<i64>>(7)?.map(to_u64).transpose()?,
+        row_count: num(5)?,
+        byte_size: num(6)?,
+        fts_byte_size: r.get::<_, Option<i64>>(7)?.map(|v| to_u64("segments", v)).transpose()?,
         min_start_ns: r.get(8)?,
         max_start_ns: r.get(9)?,
-        start_time_nulls: to_u64(r.get(10)?)?,
-        min_trace_id: TraceId::from_slice(&min_tid).map_err(corrupt)?,
-        max_trace_id: TraceId::from_slice(&max_tid).map_err(corrupt)?,
-        min_version: to_u64(r.get(13)?)?,
-        max_version: to_u64(r.get(14)?)?,
+        start_time_nulls: num(10)?,
+        min_trace_id: TraceId::from_slice(&min_tid).map_err(|e| bad(e.to_string()))?,
+        max_trace_id: TraceId::from_slice(&max_tid).map_err(|e| bad(e.to_string()))?,
+        min_version: num(13)?,
+        max_version: num(14)?,
         schema_version: r.get(15)?,
         created_at_ms: r.get(16)?,
-        state: SegmentState::parse(&state).ok_or_else(|| corrupt(format!("state {state}")))?,
+        state: SegmentState::parse(&state).ok_or_else(|| bad(format!("state {state}")))?,
         deleted_at_ms: r.get(18)?,
     })
 }
@@ -108,10 +114,7 @@ fn segment_from_row(r: &Row<'_>) -> MetaResult<SegmentMeta> {
 fn project_from_row(r: &Row<'_>) -> MetaResult<Project> {
     let id: String = r.get(0)?;
     Ok(Project {
-        id: ProjectId::new(id).map_err(|e| MetaError::Corrupt {
-            table: "projects",
-            msg: e.to_string(),
-        })?,
+        id: ProjectId::new(id).map_err(|e| corrupt("projects", e))?,
         name: r.get(1)?,
         api_key_hash: r.get(2)?,
         retention_days: r.get(3)?,
@@ -196,7 +199,7 @@ impl SqliteMetastore {
     #[cfg(any(test, feature = "test-util"))]
     pub fn pragma(&self, name: &str) -> MetaResult<String> {
         use rusqlite::types::Value;
-        let c = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let c = lock(&self.conn);
         let v: Value = c.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?;
         Ok(match v {
             Value::Integer(i) => i.to_string(),
@@ -210,7 +213,7 @@ impl SqliteMetastore {
         f: impl FnOnce(&Connection) -> MetaResult<T> + Send + 'static,
     ) -> MetaResult<T> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || f(&conn.lock().unwrap_or_else(|e| e.into_inner()))).await?
+        tokio::task::spawn_blocking(move || f(&lock(&conn))).await?
     }
 
     async fn write<T: Send + 'static>(
@@ -219,7 +222,7 @@ impl SqliteMetastore {
     ) -> MetaResult<T> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock(&conn);
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let out = f(&tx)?;
             tx.commit()?;
@@ -232,14 +235,7 @@ impl SqliteMetastore {
 #[async_trait]
 impl Metastore for SqliteMetastore {
     async fn schema_version(&self) -> MetaResult<u32> {
-        self.read(|c| {
-            Ok(
-                c.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_versions", [], |r| {
-                    r.get(0)
-                })?,
-            )
-        })
-        .await
+        self.read(|c| Ok(migrations::current_version(c)?)).await
     }
 
     async fn create_project(&self, p: Project) -> MetaResult<()> {
@@ -307,8 +303,8 @@ impl Metastore for SqliteMetastore {
                 .optional()?;
             r.map(|(s, v)| {
                 Ok(WalCheckpoint {
-                    flushed_seq: to_u64(s)?,
-                    max_version: to_u64(v)?,
+                    flushed_seq: to_u64("wal_checkpoints", s)?,
+                    max_version: to_u64("wal_checkpoints", v)?,
                 })
             })
             .transpose()
@@ -324,7 +320,7 @@ impl Metastore for SqliteMetastore {
                 [],
                 |r| r.get(0),
             )?;
-            to_u64(v)
+            to_u64("segments", v)
         })
         .await
     }
@@ -376,20 +372,17 @@ impl Metastore for SqliteMetastore {
     async fn locate_trace(&self, project: &ProjectId, trace: TraceId) -> MetaResult<Vec<TraceLocation>> {
         let project = project.clone();
         self.read(move |c| {
-            let cols = SEGMENT_COLS
-                .split(", ")
-                .map(|c| format!("s.{c}"))
-                .collect::<Vec<_>>()
-                .join(", ");
             let mut st = c.prepare_cached(&format!(
-                "SELECT {cols}, ti.row_start, ti.row_count FROM trace_index ti JOIN segments s ON s.id = ti.segment_id \
-                 WHERE ti.project_id = ?1 AND ti.trace_id = ?2 AND s.state <> 'deleted' ORDER BY s.id"
+                "SELECT {SEGMENT_COLS}, ti_start, ti_count FROM segments JOIN \
+                 (SELECT segment_id, row_start AS ti_start, row_count AS ti_count FROM trace_index \
+                  WHERE project_id = ?1 AND trace_id = ?2) ON id = segment_id \
+                 WHERE state <> 'deleted' ORDER BY id"
             ))?;
             let rows = st.query_map(params![project.as_str(), trace.as_bytes()], |r| {
                 Ok((
                     segment_from_row(r),
-                    r.get::<_, i64>(SEGMENT_NCOLS)?,
-                    r.get::<_, i64>(SEGMENT_NCOLS + 1)?,
+                    r.get::<_, i64>("ti_start")?,
+                    r.get::<_, i64>("ti_count")?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -397,8 +390,8 @@ impl Metastore for SqliteMetastore {
                 let (seg, start, count) = r?;
                 out.push(TraceLocation {
                     segment: seg?,
-                    row_start: to_u64(start)?,
-                    row_count: to_u64(count)?,
+                    row_start: to_u64("trace_index", start)?,
+                    row_count: to_u64("trace_index", count)?,
                 });
             }
             Ok(out)

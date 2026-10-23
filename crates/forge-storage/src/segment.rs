@@ -52,13 +52,18 @@ impl VortexSegmentStore {
 #[derive(Default)]
 struct SegmentStats {
     rows: u64,
-    project: Option<String>,
     traces: Vec<TraceRange>,
     min_start: Option<i64>,
     max_start: Option<i64>,
     start_nulls: u64,
     min_version: Option<u64>,
     max_version: Option<u64>,
+}
+
+/// Extends the running [lo, hi] range with `x`.
+fn widen<T: Ord + Copy>(lo: &mut Option<T>, hi: &mut Option<T>, x: T) {
+    *lo = Some(lo.map_or(x, |m| m.min(x)));
+    *hi = Some(hi.map_or(x, |m| m.max(x)));
 }
 
 impl SegmentStats {
@@ -77,7 +82,6 @@ impl SegmentStats {
                     "row project {proj} != segment project {spec_project}"
                 )));
             }
-            self.project.get_or_insert_with(|| proj.to_string());
             let tid = TraceId::from_slice(t.value(i)).map_err(|e| StorageError::Unsorted(e.to_string()))?;
             match self.traces.last_mut() {
                 Some(last) if last.trace_id == tid => last.row_count += 1,
@@ -96,13 +100,9 @@ impl SegmentStats {
             if s.is_null(i) {
                 self.start_nulls += 1;
             } else {
-                let x = s.value(i);
-                self.min_start = Some(self.min_start.map_or(x, |m| m.min(x)));
-                self.max_start = Some(self.max_start.map_or(x, |m| m.max(x)));
+                widen(&mut self.min_start, &mut self.max_start, s.value(i));
             }
-            let ver = v.value(i) as u64;
-            self.min_version = Some(self.min_version.map_or(ver, |m| m.min(ver)));
-            self.max_version = Some(self.max_version.map_or(ver, |m| m.max(ver)));
+            widen(&mut self.min_version, &mut self.max_version, v.value(i) as u64);
             self.rows += 1;
         }
         Ok(())

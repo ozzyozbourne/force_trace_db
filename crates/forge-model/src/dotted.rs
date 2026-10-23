@@ -71,7 +71,7 @@ mod tests {
     }
 
     fn rollover_us() -> impl Strategy<Value = i64> {
-        let unit = prop_oneof![
+        prop_oneof![
             (-1_000_000_000i64..1_000_000_000).prop_map(|k| k * 1_000_000),
             (-10_000_000i64..10_000_000).prop_map(|k| k * 60_000_000),
             (-100_000i64..100_000).prop_map(|k| k * 86_400_000_000),
@@ -81,8 +81,7 @@ mod tests {
                     .unwrap()
                     .timestamp_micros()
             }),
-        ];
-        unit
+        ]
     }
 
     proptest! {
@@ -120,11 +119,10 @@ mod tests {
             let start: Vec<i64> = nodes.iter().map(|x| x.1).collect();
             let span: Vec<SpanId> =
                 nodes.iter().enumerate().map(|(i, x)| sid((u64::from(x.2) << 32) | i as u64)).collect();
-            let parent: Vec<Option<usize>> =
-                (0..n).map(|i| if i == 0 { None } else { Some(nodes[i].0 % i) }).collect();
+            let parent = |i: usize| nodes[i].0 % i; // only for i >= 1
             let mut dotted: Vec<String> = Vec::with_capacity(n);
             for i in 0..n {
-                let p = parent[i].map(|p| dotted[p].clone());
+                let p = (i > 0).then(|| dotted[parent(i)].clone());
                 dotted.push(dotted_order(p.as_deref(), start[i], span[i]));
             }
             let mut by_dotted: Vec<usize> = (0..n).collect();
@@ -132,7 +130,7 @@ mod tests {
 
             let mut children = vec![Vec::new(); n];
             for i in 1..n {
-                children[parent[i].unwrap_or(0)].push(i);
+                children[parent(i)].push(i);
             }
             for c in &mut children {
                 c.sort_by_key(|&i| (start[i].div_euclid(1000), span[i]));

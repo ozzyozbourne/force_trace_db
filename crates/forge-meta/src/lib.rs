@@ -147,21 +147,23 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
 /// `sqlite::memory:` | `sqlite://<path>` (relative to the cwd unless it starts with `/`) | `postgres://` (later).
 pub async fn open(cfg: &MetastoreConfig) -> MetaResult<Arc<dyn Metastore>> {
     let url = cfg.url.as_str();
-    let m = match split_scheme(url) {
-        _ if url == "sqlite::memory:" => tokio::task::spawn_blocking(SqliteMetastore::open_in_memory).await??,
-        Some(("sqlite", p)) if !p.is_empty() => {
-            let path = PathBuf::from(p);
-            tokio::task::spawn_blocking(move || {
-                if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| MetaError::Config(format!("cannot create {}: {e}", parent.display())))?;
-                }
-                SqliteMetastore::open_path(&path)
-            })
-            .await??
-        }
+    let path = match split_scheme(url) {
+        _ if url == "sqlite::memory:" => None,
+        Some(("sqlite", p)) if !p.is_empty() => Some(PathBuf::from(p)),
         Some(("postgres" | "postgresql", _)) => return Err(Unimplemented("postgres metastore").into()),
         _ => return Err(MetaError::Config(cfg.url.clone())),
     };
+    // All file work (mkdir, open, migrate) happens on the blocking pool.
+    let m = tokio::task::spawn_blocking(move || match path {
+        None => SqliteMetastore::open_in_memory(),
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| MetaError::Config(format!("cannot create {}: {e}", parent.display())))?;
+            }
+            SqliteMetastore::open_path(&path)
+        }
+    })
+    .await??;
     Ok(Arc::new(m))
 }

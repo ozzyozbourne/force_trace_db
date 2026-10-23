@@ -40,17 +40,22 @@ mod tests {
     use super::*;
     use crate::error::ModelError;
 
+    fn round_trip<T>(all: &[T])
+    where
+        T: Copy + PartialEq + std::fmt::Debug + std::fmt::Display + std::str::FromStr<Err = ModelError>,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        for &v in all {
+            assert_eq!(v.to_string().parse::<T>().unwrap(), v);
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{v}\""));
+            assert_eq!(serde_json::from_str::<T>(&format!("\"{v}\"")).unwrap(), v);
+        }
+    }
+
     #[test]
     fn round_trips() {
-        for &r in RunType::ALL {
-            assert_eq!(r.as_str().parse::<RunType>().unwrap(), r);
-            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", r.as_str()));
-            assert_eq!(serde_json::from_str::<RunType>(&format!("\"{r}\"")).unwrap(), r);
-        }
-        for &s in SpanStatus::ALL {
-            assert_eq!(s.as_str().parse::<SpanStatus>().unwrap(), s);
-            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{}\"", s.as_str()));
-        }
+        round_trip(RunType::ALL);
+        round_trip(SpanStatus::ALL);
         assert!(matches!(
             "LLM".parse::<RunType>(),
             Err(ModelError::UnknownEnum { what: "run_type", .. })

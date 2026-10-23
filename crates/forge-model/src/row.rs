@@ -66,7 +66,6 @@ pub struct SpanBatchBuilder {
     outputs: StringBuilder,
     version: Int64Builder,
     deleted: BooleanBuilder,
-    len: usize,
 }
 
 impl Default for SpanBatchBuilder {
@@ -107,14 +106,14 @@ impl SpanBatchBuilder {
             outputs: s(),
             version: Int64Builder::with_capacity(rows),
             deleted: BooleanBuilder::with_capacity(rows),
-            len: 0,
         }
     }
+    /// Rows pushed since the last `finish` (every column builder holds one entry per row).
     pub fn len(&self) -> usize {
-        self.len
+        self.deleted.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     pub fn push(&mut self, r: &SpanRow) -> Result<()> {
@@ -158,12 +157,10 @@ impl SpanBatchBuilder {
         self.outputs.append_option(r.outputs.as_deref());
         self.version.append_value(version);
         self.deleted.append_value(r.deleted);
-        self.len += 1;
         Ok(())
     }
 
     pub fn finish(&mut self) -> Result<RecordBatch> {
-        self.len = 0;
         let cols: Vec<ArrayRef> = vec![
             Arc::new(self.project_id.finish()),
             Arc::new(self.trace_id.finish()),
@@ -206,12 +203,7 @@ pub fn validate_batch(b: &RecordBatch) -> Result<()> {
         (col::SPAN_ID, SpanId::LEN),
         (col::PARENT_SPAN_ID, SpanId::LEN),
     ] {
-        let a = b
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
+        let a = b.column_by_name(name).unwrap().as_binary::<i32>();
         if a.iter().flatten().any(|v| v.len() != len) {
             return Err(ModelError::Schema(format!("{name} must be {len} bytes")));
         }
@@ -283,12 +275,7 @@ mod tests {
             let want = if f.is_nullable() { 2 } else { 0 };
             assert_eq!(batch.column(i).null_count(), want, "{}", f.name());
         }
-        let deleted = batch
-            .column_by_name(col::DELETED)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
+        let deleted = batch.column_by_name(col::DELETED).unwrap().as_boolean();
         assert_eq!(
             deleted.iter().collect::<Vec<_>>(),
             [Some(false), Some(false), Some(true)]

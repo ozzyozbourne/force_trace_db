@@ -8,11 +8,11 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 
 pub struct Forge {
-    pub config: Arc<ForgeConfig>,
+    pub config: ForgeConfig,
     pub meta: Arc<dyn forge_meta::Metastore>,
     /// Built at startup: validates the storage URL and creates the local directory.
     pub segments: Arc<dyn forge_storage::SegmentStore>,
-    pub ready: Arc<AtomicBool>,
+    pub ready: AtomicBool,
     pub shutdown: CancellationToken,
 }
 
@@ -24,10 +24,10 @@ impl Forge {
         let meta = forge_meta::open(&config.metastore).await?;
         let built = forge_storage::build_object_store(&config.storage)?;
         Ok(Arc::new(Self {
-            config: Arc::new(config),
+            config,
             meta,
             segments: Arc::new(forge_storage::VortexSegmentStore::new(built)),
-            ready: Arc::new(AtomicBool::new(false)),
+            ready: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
         }))
     }

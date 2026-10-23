@@ -25,18 +25,19 @@ fn rows(traces: usize, spans_per: usize) -> Vec<SpanRow> {
         let root_dotted = dotted_order(None, t0, root);
         for s in 0..spans_per {
             let n = out.len();
-            let span = SpanId((s as u64 + 1).to_be_bytes());
             let start = t0 + s as i64 * 1_000;
+            let (span, dotted) = if s == 0 {
+                (root, root_dotted.clone())
+            } else {
+                let sp = SpanId((s as u64 + 1).to_be_bytes());
+                (sp, dotted_order(Some(&root_dotted), start, sp))
+            };
             out.push(SpanRow {
                 project_id: Some(pid("p")),
                 trace_id: trace(t),
-                span_id: if s == 0 { root } else { span },
+                span_id: span,
                 parent_span_id: (s > 0).then_some(root),
-                dotted_order: Some(if s == 0 {
-                    root_dotted.clone()
-                } else {
-                    dotted_order(Some(&root_dotted), start, span)
-                }),
+                dotted_order: Some(dotted),
                 name: match n % 3 {
                     0 => None,
                     1 => Some(String::new()),
@@ -238,27 +239,24 @@ fn transient_errors() {
         })
         .is_transient()
     );
-    assert!(
-        !os(E::NotFound {
-            path: "p".into(),
-            source: "x".into()
-        })
-        .is_transient()
-    );
-    assert!(
-        !os(E::PermissionDenied {
-            path: "p".into(),
-            source: "x".into()
-        })
-        .is_transient()
-    );
-    assert!(
-        !os(E::AlreadyExists {
-            path: "p".into(),
-            source: "x".into()
-        })
-        .is_transient()
-    );
+    let path = || "p".to_string();
+    let source = || -> Box<dyn std::error::Error + Send + Sync> { "x".into() };
+    for e in [
+        E::NotFound {
+            path: path(),
+            source: source(),
+        },
+        E::PermissionDenied {
+            path: path(),
+            source: source(),
+        },
+        E::AlreadyExists {
+            path: path(),
+            source: source(),
+        },
+    ] {
+        assert!(!os(e).is_transient());
+    }
     assert!(StorageError::Io(Error::from(ErrorKind::TimedOut)).is_transient());
     assert!(!StorageError::Io(Error::from(ErrorKind::PermissionDenied)).is_transient());
     assert!(!StorageError::EmptySegment.is_transient());

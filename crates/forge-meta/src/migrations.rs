@@ -9,7 +9,7 @@ pub fn migrate(c: &mut Connection) -> MetaResult<u32> {
     apply(c, MIGRATIONS)
 }
 
-fn current_version(c: &Connection) -> rusqlite::Result<u32> {
+pub(crate) fn current_version(c: &Connection) -> rusqlite::Result<u32> {
     c.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_versions", [], |r| {
         r.get(0)
     })

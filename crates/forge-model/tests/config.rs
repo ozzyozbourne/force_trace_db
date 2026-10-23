@@ -7,10 +7,17 @@ use std::time::Duration;
 
 const EXAMPLE: &str = include_str!("../../../forge.example.toml");
 
+/// A figment Jail with every inherited env var cleared first.
+fn jail(f: impl FnOnce(&mut Jail) -> figment::error::Result<()>) {
+    Jail::expect_with(|j| {
+        j.clear_env();
+        f(j)
+    });
+}
+
 #[test]
 fn empty_jail_is_default() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|_| {
         let c = ForgeConfig::load(None)?;
         assert_eq!(c, ForgeConfig::default());
         assert_eq!(c.storage.url, "file://./forge-data/data");
@@ -22,8 +29,7 @@ fn empty_jail_is_default() {
 
 #[test]
 fn example_file_loads_with_spec_values() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.create_file("example.toml", EXAMPLE)?;
         let c = ForgeConfig::load(Some(Path::new("example.toml")))?;
         assert_eq!(c.storage.url, "file:///var/lib/forge/data");
@@ -46,8 +52,7 @@ fn example_file_loads_with_spec_values() {
 
 #[test]
 fn env_overrides_file() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.create_file("forge.toml", EXAMPLE)?;
         jail.set_env("FORGE_STORAGE__URL", "memory://");
         jail.set_env("FORGE_MEMTABLE__FLUSH_BYTES", "128MiB");
@@ -74,8 +79,7 @@ fn env_overrides_file() {
 
 #[test]
 fn cli_env_vars_are_ignored() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.set_env("FORGE_CONFIG", "x");
         jail.set_env("FORGE_LOG", "debug");
         jail.set_env("FORGE_LOG_FORMAT", "json");
@@ -86,16 +90,14 @@ fn cli_env_vars_are_ignored() {
 
 #[test]
 fn string_fields_accept_scalars() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.set_env("FORGE_NODE__ID", "123");
         assert_eq!(ForgeConfig::load(None)?.node.id, "123");
         jail.set_env("FORGE_NODE__ID", "true");
         assert_eq!(ForgeConfig::load(None)?.node.id, "true");
         Ok(())
     });
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.create_file("forge.toml", "[node]\nid = 7\n")?;
         assert_eq!(ForgeConfig::load(None)?.node.id, "7");
         Ok(())
@@ -104,21 +106,18 @@ fn string_fields_accept_scalars() {
 
 #[test]
 fn unknown_and_malformed_values_error() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.create_file("forge.toml", "[cache]\nmemroy = \"1GiB\"\n")?;
         let e = ForgeConfig::load(None).unwrap_err().to_string();
         assert!(e.contains("memroy"), "{e}");
         Ok(())
     });
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.set_env("FORGE_MEMTABLE__FLUSH_BYTEZ", "1");
         assert!(ForgeConfig::load(None).is_err());
         Ok(())
     });
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.set_env("FORGE_MEMTABLE__FLUSH_BYTES", "lots");
         assert!(ForgeConfig::load(None).is_err());
         Ok(())
@@ -127,8 +126,7 @@ fn unknown_and_malformed_values_error() {
 
 #[test]
 fn explicit_missing_file_errors() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|_| {
         assert!(ForgeConfig::load(Some(Path::new("missing.toml"))).is_err());
         Ok(())
     });
@@ -136,8 +134,7 @@ fn explicit_missing_file_errors() {
 
 #[test]
 fn implicit_forge_toml_is_read_from_cwd_only() {
-    Jail::expect_with(|jail| {
-        jail.clear_env();
+    jail(|jail| {
         jail.create_file("forge.toml", "[node]\nid = \"here\"\n")?;
         assert_eq!(ForgeConfig::load(None)?.node.id, "here");
         std::fs::create_dir("sub").expect("mkdir sub");
