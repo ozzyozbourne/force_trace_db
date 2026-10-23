@@ -37,6 +37,7 @@
 pub mod blob;
 pub mod catalog;
 pub mod config;
+pub mod derived;
 pub mod dotted;
 pub mod enums;
 pub mod error;
@@ -51,4 +52,4 @@ pub mod schema;
 pub mod testing;
 pub mod time;
 
-pub use memtable::{EmptyMemtable, MemtableSnapshot, MemtableView};
+pub use memtable::{EmptyMemtable, MemtablePart, MemtableSnapshot, MemtableView};

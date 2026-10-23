@@ -3,7 +3,11 @@
 //! Inserts come ONLY from the WAL writer thread (after fsync, in seq order) and from replay (in seq
 //! order), so every memtable holds a contiguous run of WAL seqs and `Frozen::last_seq` is a valid
 //! watermark (invariant 7). `insert` enforces contiguity instead of trusting it.
+use arrow::array::AsArray;
+use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
+use forge_model::memtable::{AppendLog, MemtablePart};
+use forge_model::schema::{col, col_idx};
 use forge_model::{MemtableSnapshot, MemtableView};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,32 +32,55 @@ pub fn accounted_bytes(b: &RecordBatch) -> usize {
 
 #[derive(Debug)]
 pub struct Frozen {
-    pub batches: Vec<RecordBatch>,
+    pub part: MemtablePart,
     /// Accounted bytes (sum of `accounted_bytes`).
     pub bytes: usize,
-    /// Flush watermark: every seq <= this is in this or an earlier memtable.
-    pub last_seq: u64,
+}
+
+impl Frozen {
+    pub fn last_seq(&self) -> u64 {
+        *self.part.seqs.end()
+    }
 }
 
 #[derive(Debug)]
 struct Active {
-    batches: Vec<RecordBatch>,
+    log: AppendLog,
     bytes: usize,
     /// When the first batch went in; meaningless while `batches` is empty.
     created: Instant,
     /// Due regardless of size and age (`mark_due`); cleared by `freeze` (a fresh `Active`).
     due: bool,
+    first_seq: u64,
+    versions: (u64, u64),
 }
 
 impl Active {
     fn new() -> Self {
         Self {
-            batches: Vec::new(),
+            log: AppendLog::default(),
             bytes: 0,
             created: Instant::now(),
             due: false,
+            first_seq: 0,
+            versions: (u64::MAX, 0),
         }
     }
+    fn part(&self, last_seq: u64, frozen: bool) -> Option<MemtablePart> {
+        (!self.log.is_empty()).then(|| MemtablePart {
+            frozen,
+            seqs: self.first_seq..=last_seq,
+            versions: self.versions.0..=self.versions.1,
+            batches: self.log.view(),
+        })
+    }
+}
+
+fn version_range(b: &RecordBatch) -> (u64, u64) {
+    let v = b.column(col_idx(col::VERSION)).as_primitive::<Int64Type>();
+    let lo = arrow::compute::min(v).unwrap_or(0);
+    let hi = arrow::compute::max(v).unwrap_or(0);
+    (lo.max(0) as u64, hi.max(0) as u64)
 }
 
 #[derive(Debug)]
@@ -62,8 +89,6 @@ struct State {
     frozen: Option<Arc<Frozen>>,
     /// Highest seq inserted (starts at the checkpoint's flushed_seq).
     last_seq: u64,
-    /// Cached `snapshot()`; dropped by every mutation.
-    snapshot: Option<Arc<[RecordBatch]>>,
 }
 
 #[derive(Debug)]
@@ -91,7 +116,6 @@ impl MemtableSet {
                 active: Active::new(),
                 frozen: None,
                 last_seq: flushed_seq,
-                snapshot: None,
             }),
             unflushed: AtomicUsize::new(0),
             flush_bytes,
@@ -106,6 +130,7 @@ impl MemtableSet {
 
     /// `bytes` = `accounted_bytes(&batch)`, computed by the caller off the WAL thread.
     pub fn insert(&self, seq: u64, batch: RecordBatch, bytes: usize) -> Result<(), InsertError> {
+        let (vlo, vhi) = version_range(&batch);
         let mut s = self.lock();
         if seq != s.last_seq + 1 {
             return Err(InsertError::NotContiguous {
@@ -115,13 +140,14 @@ impl MemtableSet {
         }
         s.last_seq = seq;
         let a = &mut s.active;
-        if a.batches.is_empty() {
+        if a.log.is_empty() {
             a.created = Instant::now();
+            a.first_seq = seq;
         }
+        a.versions = (a.versions.0.min(vlo), a.versions.1.max(vhi));
         a.bytes += bytes;
-        a.batches.push(batch);
+        a.log.push(batch);
         let full = a.bytes >= self.flush_bytes;
-        s.snapshot = None;
         // Under the lock: once unlocked, a flush can freeze and `release` this batch, which subtracts its bytes.
         self.unflushed.fetch_add(bytes, Ordering::SeqCst);
         drop(s);
@@ -141,7 +167,7 @@ impl MemtableSet {
         let s = self.lock();
         let a = &s.active;
         s.frozen.is_some()
-            || !a.batches.is_empty()
+            || !a.log.is_empty()
                 && (a.due || a.bytes >= self.flush_bytes || now.duration_since(a.created) >= self.flush_interval)
     }
 
@@ -150,7 +176,7 @@ impl MemtableSet {
     pub fn mark_due(&self) {
         let mut s = self.lock();
         let a = &mut s.active;
-        a.due = !a.batches.is_empty();
+        a.due = !a.log.is_empty();
     }
 
     pub fn flush_interval(&self) -> Duration {
@@ -169,17 +195,10 @@ impl MemtableSet {
         if let Some(f) = &s.frozen {
             return Some(f.clone());
         }
-        if s.active.batches.is_empty() {
-            return None;
-        }
+        let part = s.active.part(s.last_seq, true)?;
         let a = std::mem::replace(&mut s.active, Active::new());
-        let f = Arc::new(Frozen {
-            batches: a.batches,
-            bytes: a.bytes,
-            last_seq: s.last_seq,
-        });
+        let f = Arc::new(Frozen { part, bytes: a.bytes });
         s.frozen = Some(f.clone());
-        // snapshot content is unchanged (same batches), keep the cache
         Some(f)
     }
 
@@ -188,7 +207,6 @@ impl MemtableSet {
         let mut s = self.lock();
         if s.frozen.as_ref().is_some_and(|x| Arc::ptr_eq(x, f)) {
             s.frozen = None;
-            s.snapshot = None;
             self.unflushed.fetch_sub(f.bytes, Ordering::SeqCst); // under the lock, like `insert`'s add
         }
     }
@@ -199,19 +217,12 @@ impl MemtableSet {
 }
 
 impl MemtableView for MemtableSet {
-    /// Frozen first, then active. Cheap when nothing was inserted since the last call.
+    /// Frozen first, then active. O(blocks) Arc clones under the lock (no batch clones).
     fn snapshot(&self) -> MemtableSnapshot {
-        let mut s = self.lock();
-        if let Some(c) = &s.snapshot {
-            return MemtableSnapshot { batches: c.clone() };
-        }
-        let mut v: Vec<RecordBatch> = Vec::new();
-        if let Some(f) = &s.frozen {
-            v.extend(f.batches.iter().cloned());
-        }
-        v.extend(s.active.batches.iter().cloned());
-        let batches: Arc<[RecordBatch]> = v.into();
-        s.snapshot = Some(batches.clone());
-        MemtableSnapshot { batches }
+        let s = self.lock();
+        let mut parts = Vec::with_capacity(2);
+        parts.extend(s.frozen.as_ref().map(|f| f.part.clone()));
+        parts.extend(s.active.part(s.last_seq, false));
+        MemtableSnapshot { parts }
     }
 }

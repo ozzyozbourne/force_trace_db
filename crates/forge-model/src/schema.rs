@@ -46,6 +46,14 @@ pub const FTS_COLUMNS: [&str; 5] = [col::NAME, col::ERROR, col::INPUTS, col::OUT
 /// Columns holding JSON text.
 pub const JSON_COLUMNS: [&str; 5] = [col::METADATA, col::ATTRIBUTES, col::EVENTS, col::INPUTS, col::OUTPUTS];
 
+/// Every column, in spans_schema order (`ScanRequest.projection` needs `&'static str`).
+pub const ALL_COLUMNS: [&str; 26] = [
+    col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID, col::PARENT_SPAN_ID, col::DOTTED_ORDER, col::NAME, col::RUN_TYPE,
+    col::START_TIME, col::END_TIME, col::STATUS, col::ERROR, col::MODEL, col::PROVIDER, col::PROMPT_TOKENS,
+    col::COMPLETION_TOKENS, col::TOTAL_TOKENS, col::COST_USD, col::SESSION_ID, col::TAGS, col::METADATA,
+    col::ATTRIBUTES, col::EVENTS, col::INPUTS, col::OUTPUTS, col::VERSION, col::DELETED,
+];
+
 pub fn timestamp_type() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMEZONE.into()))
 }
@@ -140,6 +148,7 @@ mod tests {
         let s = spans_schema();
         let names: Vec<_> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ORDER);
+        assert_eq!(names, ALL_COLUMNS);
         let not_null: Vec<_> = s
             .fields()
             .iter()

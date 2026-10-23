@@ -288,6 +288,33 @@ impl SqliteMetastore {
         Self::init(Connection::open(path)?)
     }
 
+    /// SQLITE_OPEN_READ_ONLY | NO_MUTEX; busy_timeout only; the schema version must equal the latest.
+    pub fn open_read_only(path: &Path) -> MetaResult<Self> {
+        use rusqlite::OpenFlags;
+        let c = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        c.pragma_update(None, "busy_timeout", 5000)?;
+        let latest = migrations::LATEST;
+        let has: bool = c.query_row(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'schema_versions'",
+            [],
+            |r| r.get(0),
+        )?;
+        let cur = if has { migrations::current_version(&c)? } else { 0 };
+        if cur > latest {
+            return Err(MetaError::SchemaTooNew { db: cur, binary: latest });
+        }
+        if cur < latest {
+            return Err(MetaError::Migration {
+                version: latest,
+                msg: format!("database schema v{cur} is older than v{latest}: run `forge serve` once to migrate"),
+            });
+        }
+        Ok(Self { conn: Arc::new(Mutex::new(c)) })
+    }
+
     pub fn open_in_memory() -> MetaResult<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -504,4 +531,55 @@ impl Metastore for SqliteMetastore {
         })
         .await
     }
+
+    async fn locate_traces(
+        &self,
+        project: &ProjectId,
+        traces: &[TraceId],
+    ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>> {
+        let project = project.clone();
+        let traces = traces.to_vec();
+        self.read(move |c| {
+            let mut out: std::collections::HashMap<TraceId, Vec<TraceLocation>> = Default::default();
+            for chunk in traces.chunks(500) {
+                let n = chunk.len().next_power_of_two();
+                let sql = locate_traces_sql(n);
+                let mut st = c.prepare_cached(&sql)?;
+                let p = project.as_str();
+                let ids: Vec<&[u8]> = (0..n).map(|i| chunk[i.min(chunk.len() - 1)].as_bytes().as_slice()).collect();
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&p];
+                params.extend(ids.iter().map(|b| b as &dyn rusqlite::ToSql));
+                let rows = st.query_map(params.as_slice(), |r| {
+                    Ok((
+                        segment_from_row(r),
+                        r.get::<_, Vec<u8>>("ti_trace")?,
+                        r.get::<_, i64>("ti_start")?,
+                        r.get::<_, i64>("ti_count")?,
+                    ))
+                })?;
+                for r in rows {
+                    let (seg, t, start, count) = r?;
+                    let t = TraceId::from_slice(&t).map_err(|e| corrupt("trace_index", e))?;
+                    out.entry(t).or_default().push(TraceLocation {
+                        segment: seg?,
+                        row_start: to_u64("trace_index", start)?,
+                        row_count: to_u64("trace_index", count)?,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+}
+
+fn locate_traces_sql(n: usize) -> String {
+    let ph: Vec<String> = (0..n).map(|i| format!("?{}", i + 2)).collect();
+    format!(
+        "SELECT {SEGMENT_COLS}, ti_trace, ti_start, ti_count FROM segments JOIN \
+         (SELECT segment_id, trace_id AS ti_trace, row_start AS ti_start, row_count AS ti_count FROM trace_index \
+          WHERE project_id = ?1 AND trace_id IN ({})) ON id = segment_id \
+         WHERE state <> 'deleted' ORDER BY id",
+        ph.join(",")
+    )
 }

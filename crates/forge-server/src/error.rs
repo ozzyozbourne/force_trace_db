@@ -45,6 +45,8 @@ pub(crate) fn http_status(k: ErrorKind) -> StatusCode {
         ErrorKind::Backpressure => StatusCode::TOO_MANY_REQUESTS,
         ErrorKind::Transient => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }
 
@@ -57,6 +59,8 @@ pub(crate) fn grpc_code(k: ErrorKind) -> tonic::Code {
         ErrorKind::Unimplemented => tonic::Code::Unimplemented,
         ErrorKind::Conflict => tonic::Code::Aborted,
         ErrorKind::Internal => tonic::Code::Internal,
+        ErrorKind::NotFound => tonic::Code::NotFound,
+        ErrorKind::Timeout => tonic::Code::DeadlineExceeded,
     }
 }
 

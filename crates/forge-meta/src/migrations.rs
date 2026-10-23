@@ -5,6 +5,9 @@ use rusqlite::{Connection, TransactionBehavior, params};
 
 pub const MIGRATIONS: &[(u32, &str, &str)] = &[(1, "initial", include_str!("sql/0001_initial.sql"))];
 
+/// The binary's schema version.
+pub(crate) const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
+
 pub fn migrate(c: &mut Connection) -> MetaResult<u32> {
     apply(c, MIGRATIONS)
 }

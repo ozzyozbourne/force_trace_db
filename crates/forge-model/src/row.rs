@@ -1,10 +1,11 @@
 use crate::enums::{RunType, SpanStatus};
 use crate::error::{ModelError, Result};
 use crate::ids::{ProjectId, SpanId, TraceId};
-use crate::schema::{TIMEZONE, col, col_idx, spans_schema, tags_item_field};
+use crate::schema::{TIMEZONE, col, spans_schema, tags_item_field};
 use arrow::array::*;
 use arrow::record_batch::RecordBatch;
-use std::sync::{Arc, LazyLock};
+use arrow::datatypes::SchemaRef;
+use std::sync::Arc;
 
 /// One upsert of one span, as produced by normalization. `None` = "this upsert does not set the
 /// field" (latest non-null wins). JSON columns hold already-serialized JSON text.
@@ -208,19 +209,41 @@ impl SpanBatchBuilder {
 
 /// Checks schema equality and id byte lengths. Call on WAL replay, before segment write, and in tests.
 pub fn validate_batch(b: &RecordBatch) -> Result<()> {
-    let schema = b.schema();
-    if !Arc::ptr_eq(&schema, &spans_schema()) && schema != spans_schema() {
-        return Err(ModelError::Schema(format!("schema mismatch: {schema:?}")));
+    validate_projected(&spans_schema(), b)
+}
+
+/// `schema` is a projection of spans_schema (same name/type/nullability per field) containing MERGE_COLUMNS.
+pub fn validate_projection(schema: &SchemaRef) -> Result<()> {
+    if Arc::ptr_eq(schema, &spans_schema()) {
+        return Ok(());
     }
-    static ID_COLS: LazyLock<[(&str, usize, usize); 3]> = LazyLock::new(|| {
-        [
-            (col::TRACE_ID, TraceId::LEN),
-            (col::SPAN_ID, SpanId::LEN),
-            (col::PARENT_SPAN_ID, SpanId::LEN),
-        ]
-        .map(|(name, len)| (name, col_idx(name), len))
-    });
-    for &(name, idx, len) in ID_COLS.iter() {
+    let full = spans_schema();
+    for f in schema.fields() {
+        match full.field_with_name(f.name()) {
+            Ok(g) if g.data_type() == f.data_type() && g.is_nullable() == f.is_nullable() => {}
+            _ => return Err(ModelError::Schema(format!("field {f:?} is not a spans_schema field"))),
+        }
+    }
+    for c in crate::merge::MERGE_COLUMNS {
+        if schema.index_of(c).is_err() {
+            return Err(ModelError::Schema(format!("projection lacks merge column {c}")));
+        }
+    }
+    Ok(())
+}
+
+/// Batch schema == `schema`; ids have their byte length; version >= 0.
+pub fn validate_projected(schema: &SchemaRef, b: &RecordBatch) -> Result<()> {
+    let bs = b.schema();
+    if !Arc::ptr_eq(&bs, schema) && bs != *schema {
+        return Err(ModelError::Schema(format!("schema mismatch: {bs:?}")));
+    }
+    for (name, len) in [
+        (col::TRACE_ID, TraceId::LEN),
+        (col::SPAN_ID, SpanId::LEN),
+        (col::PARENT_SPAN_ID, SpanId::LEN),
+    ] {
+        let Ok(idx) = schema.index_of(name) else { continue };
         let a = b.column(idx).as_binary::<i32>();
         let bad = a
             .value_offsets()
@@ -231,9 +254,8 @@ pub fn validate_batch(b: &RecordBatch) -> Result<()> {
             return Err(ModelError::Schema(format!("{name} must be {len} bytes")));
         }
     }
-    // Versions are u64 in the model; the i64 column must never hold a negative one.
     let version = b
-        .column(col_idx(col::VERSION))
+        .column(schema.index_of(col::VERSION)?)
         .as_primitive::<arrow::datatypes::Int64Type>();
     if arrow::compute::min(version).is_some_and(|m| m < 0) {
         return Err(ModelError::Schema("version must be >= 0".into()));

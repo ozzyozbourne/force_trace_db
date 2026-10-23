@@ -293,3 +293,18 @@ pub fn rows_from_batch(b: &RecordBatch) -> Result<Vec<SpanRow>> {
         })
         .collect()
 }
+
+/// A fixed memtable for query tests.
+#[derive(Debug, Default)]
+pub struct FixedMemtable(pub Vec<RecordBatch>);
+impl crate::memtable::MemtableView for FixedMemtable {
+    fn snapshot(&self) -> crate::memtable::MemtableSnapshot {
+        use crate::memtable::{AppendLog, MemtablePart, MemtableSnapshot};
+        let mut log = AppendLog::default();
+        self.0.iter().cloned().for_each(|b| log.push(b));
+        if log.is_empty() {
+            return MemtableSnapshot::default();
+        }
+        MemtableSnapshot { parts: vec![MemtablePart { frozen: false, seqs: 1..=1, versions: 0..=u64::MAX, batches: log.view() }] }
+    }
+}

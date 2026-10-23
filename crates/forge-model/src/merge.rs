@@ -30,14 +30,50 @@
 //! No `concat_batches`: rows are addressed as `(batch, row)` and gathered with `interleave`, so the
 //! input is never copied twice. The output can still exceed i32 Utf8/Binary offsets (2 GiB per column);
 //! `merge_versions_chunked` bounds every output batch (the flush uses it).
-use crate::error::Result;
+use crate::error::{ModelError, Result};
 use crate::ids::ProjectId;
-use crate::row::validate_batch;
+use crate::row::{validate_projected, validate_projection};
 use crate::schema::{col, col_idx, spans_schema};
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt32Array};
 use arrow::compute::{SortOptions, interleave, take_record_batch};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::row::{RowConverter, SortField};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Always present in a merge input/output: the key, version, deleted.
+pub const MERGE_COLUMNS: [&str; 5] = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID, col::VERSION, col::DELETED];
+
+/// Cooperative cancellation for CPU work on the blocking pool (D8). `never()` costs nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Option<Arc<AtomicBool>>);
+impl Cancel {
+    pub fn never() -> Self {
+        Self(None)
+    }
+    pub fn new() -> Self {
+        Self(Some(Arc::default()))
+    }
+    pub fn cancel(&self) {
+        if let Some(f) = &self.0 {
+            f.store(true, Ordering::Relaxed)
+        }
+    }
+    pub fn check(&self) -> Result<()> {
+        match &self.0 {
+            Some(f) if f.load(Ordering::Relaxed) => Err(ModelError::Cancelled),
+            _ => Ok(()),
+        }
+    }
+}
+/// Sets the flag when dropped: hold it in the future/stream that a timeout drops.
+#[derive(Debug)]
+pub struct CancelOnDrop(pub Cancel);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tombstones {
@@ -69,21 +105,45 @@ pub fn merge_versions_chunked(
     tombstones: Tombstones,
     max_chunk_bytes: usize,
 ) -> Result<Vec<RecordBatch>> {
-    let schema = spans_schema();
+    merge_versions_projected(&spans_schema(), batches, tombstones, max_chunk_bytes, &Cancel::never())
+}
+
+/// One batch (possibly empty) of `schema`; queries over bounded inputs.
+pub fn merge_projected(
+    schema: &SchemaRef,
+    b: &[RecordBatch],
+    t: Tombstones,
+    cancel: &Cancel,
+) -> Result<RecordBatch> {
+    Ok(merge_versions_projected(schema, b, t, usize::MAX, cancel)?
+        .pop()
+        .unwrap_or_else(|| RecordBatch::new_empty(schema.clone())))
+}
+
+/// Per-field "latest non-null wins" over ANY projection of spans_schema that contains MERGE_COLUMNS.
+pub fn merge_versions_projected(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    tombstones: Tombstones,
+    max_chunk_bytes: usize,
+    cancel: &Cancel,
+) -> Result<Vec<RecordBatch>> {
+    validate_projection(schema)?;
     let batches: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
     if batches.is_empty() {
         return Ok(Vec::new());
     }
     for b in &batches {
-        validate_batch(b)?;
+        validate_projected(schema, b)?;
     }
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     let (p, t, s, v) = (
-        col_idx(col::PROJECT_ID),
-        col_idx(col::TRACE_ID),
-        col_idx(col::SPAN_ID),
-        col_idx(col::VERSION),
+        schema.index_of(col::PROJECT_ID)?,
+        schema.index_of(col::TRACE_ID)?,
+        schema.index_of(col::SPAN_ID)?,
+        schema.index_of(col::VERSION)?,
     );
+    let del = schema.index_of(col::DELETED)?;
 
     // 1. Merge order: (project, trace, span, version DESC). One RowConverter, rows appended per batch.
     let conv = RowConverter::new(vec![
@@ -108,6 +168,7 @@ pub fn merge_versions_chunked(
     let mut order: Vec<u32> = (0..total as u32).collect();
     order.sort_unstable_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
     drop(rows);
+    cancel.check()?;
 
     // 2. Groups = runs of equal (project, trace, span); compared on the typed arrays.
     let keys: Vec<_> = batches
@@ -133,6 +194,7 @@ pub fn merge_versions_chunked(
             start = pos;
         }
     }
+    cancel.check()?;
 
     // 3. Per column: for each group, the newest row where the column is non-null (else the newest).
     //    NOT NULL columns (key, version, deleted) always take the newest row.
@@ -163,7 +225,7 @@ pub fn merge_versions_chunked(
     if tombstones == Tombstones::Drop {
         let deleted: Vec<_> = batches
             .iter()
-            .map(|b| b.column(col_idx(col::DELETED)).as_boolean())
+            .map(|b| b.column(del).as_boolean())
             .collect();
         keep.retain(|&g| !deleted[newest[g].0].value(newest[g].1));
     }
@@ -191,24 +253,22 @@ pub fn merge_versions_chunked(
         let idx: Vec<(usize, usize)> = order.iter().map(|&g| pick(c, g)).collect();
         Ok(interleave(&arrays[c], &idx)?)
     };
+    let sort_idx: Vec<usize> = SORT_COLUMNS.iter().filter_map(|c| schema.index_of(c).ok()).collect();
     let sort_chunks = chunks(&keep)
         .into_iter()
-        .map(|r| {
-            SORT_COLUMNS
-                .iter()
-                .map(|c| gather(col_idx(c), &keep[r.clone()]))
-                .collect()
-        })
+        .map(|r| sort_idx.iter().map(|&c| gather(c, &keep[r.clone()])).collect())
         .collect::<Result<Vec<Vec<ArrayRef>>>>()?;
     let order: Vec<usize> = physical_order(&sort_chunks)?
         .into_iter()
         .map(|i| keep[i as usize])
         .collect();
+    cancel.check()?;
 
     // 6. One gather per column and chunk, in physical order.
     chunks(&order)
         .into_iter()
         .map(|r| {
+            cancel.check()?;
             let out = (0..schema.fields().len())
                 .map(|c| gather(c, &order[r.clone()]))
                 .collect::<Result<Vec<_>>>()?;
@@ -252,12 +312,12 @@ fn physical_order(chunks: &[Vec<ArrayRef>]) -> Result<Vec<u32>> {
     if n <= 1 {
         return Ok(idx);
     }
-    let conv = RowConverter::new(vec![
-        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
-        SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
-    ])?;
+    let conv = RowConverter::new(
+        chunks[0]
+            .iter()
+            .map(|a| SortField::new_with_options(a.data_type().clone(), ASC_NULLS_LAST))
+            .collect(),
+    )?;
     let mut rows = conv.empty_rows(n, 0);
     for c in chunks {
         conv.append(&mut rows, c)?;
@@ -495,8 +555,54 @@ mod tests {
         assert!(merge_versions_chunked(&[], Tombstones::Keep, 1).unwrap().is_empty());
     }
 
+    fn proj(b: &RecordBatch, schema: &SchemaRef) -> RecordBatch {
+        let idx: Vec<usize> = schema.fields().iter().map(|f| col_idx(f.name())).collect();
+        b.project(&idx).unwrap()
+    }
+
+    #[test]
+    fn cancelled_merge_returns_cancelled() {
+        let rows = g1(1, 50);
+        let c = Cancel::new();
+        c.cancel();
+        let e = merge_versions_projected(&spans_schema(), &[batch_from_rows(&rows)], Tombstones::Keep, usize::MAX, &c);
+        assert!(matches!(e, Err(ModelError::Cancelled)));
+        let s = crate::schema::projected_schema(&[col::SPAN_ID, col::PROJECT_ID]);
+        assert!(matches!(merge_projected(&s, &[], Tombstones::Keep, &Cancel::never()), Err(ModelError::Schema(_))));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn merge_projected_matches_full_merge(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40,
+                                              mask in 0u32..(1 << 21), drop in proptest::bool::ANY, max in 64usize..100_000) {
+            let rows = generate(g, seed, n);
+            let others: Vec<&str> = crate::schema::ALL_COLUMNS.iter().copied().filter(|c| !MERGE_COLUMNS.contains(c)).collect();
+            let mut cols: Vec<&str> = MERGE_COLUMNS.to_vec();
+            cols.extend(others.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, c)| *c));
+            let full_idx: std::collections::BTreeSet<usize> = cols.iter().map(|c| col_idx(c)).collect();
+            let names: Vec<&str> = full_idx.iter().map(|&i| crate::schema::ALL_COLUMNS[i]).collect();
+            let schema = crate::schema::projected_schema(&names);
+            let t = if drop { Tombstones::Drop } else { Tombstones::Keep };
+            let input = chunked(&rows, chunk);
+            let pin: Vec<RecordBatch> = input.iter().map(|b| proj(b, &schema)).collect();
+            let got = merge_versions_projected(&schema, &pin, t, max, &Cancel::never()).unwrap();
+            let got = arrow::compute::concat_batches(&schema, &got).unwrap();
+            let want = proj(&merge_versions(&input, t).unwrap(), &schema);
+            let sort = |b: &RecordBatch| -> RecordBatch {
+                let cols: Vec<ArrayRef> = [col::PROJECT_ID, col::TRACE_ID, col::SPAN_ID].iter().map(|c| b.column(b.schema().index_of(c).unwrap()).clone()).collect();
+                let conv = RowConverter::new(cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()).unwrap();
+                let r = conv.convert_columns(&cols).unwrap();
+                let mut idx: Vec<u32> = (0..b.num_rows() as u32).collect();
+                idx.sort_by(|&x, &y| r.row(x as usize).cmp(&r.row(y as usize)));
+                take_record_batch(b, &UInt32Array::from(idx)).unwrap()
+            };
+            if names.contains(&col::DOTTED_ORDER) {
+                prop_assert_eq!(got, want);
+            } else {
+                prop_assert_eq!(sort(&got), sort(&want));
+            }
+        }
         #[test]
         fn merge_keep_matches_reference(g in 1u8..=2, seed in 1u64.., n in 1usize..300, chunk in 1usize..40) {
             let rows = generate(g, seed, n);

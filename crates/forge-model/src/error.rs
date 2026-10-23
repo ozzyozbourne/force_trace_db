@@ -22,6 +22,8 @@ pub enum ModelError {
     HourOutOfRange(i64),
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
+    #[error("query cancelled")]
+    Cancelled,
 }
 pub type Result<T, E = ModelError> = std::result::Result<T, E>;
 
@@ -41,6 +43,10 @@ pub enum ErrorKind {
     /// Worth retrying with backoff.
     Transient,
     Internal,
+    /// The addressed entity does not exist.
+    NotFound,
+    /// The request ran past its deadline.
+    Timeout,
 }
 
 /// Implemented once per crate error; wrappers delegate to the wrapped error.
@@ -54,7 +60,10 @@ pub trait Classify: std::fmt::Display {
 
 impl Classify for ModelError {
     fn kind(&self) -> ErrorKind {
-        ErrorKind::InvalidInput
+        match self {
+            Self::Cancelled => ErrorKind::Internal,
+            _ => ErrorKind::InvalidInput,
+        }
     }
 }
 

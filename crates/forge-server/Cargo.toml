@@ -17,6 +17,7 @@ async-trait.workspace = true
 forge-model.workspace = true
 forge-meta.workspace = true
 forge-storage.workspace = true
+forge-query.workspace = true
 axum.workspace = true
 tonic.workspace = true
 opentelemetry-proto.workspace = true

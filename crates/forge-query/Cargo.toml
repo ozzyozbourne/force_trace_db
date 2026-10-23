@@ -14,4 +14,24 @@ forge-model.workspace = true
 forge-meta.workspace = true
 forge-storage.workspace = true
 forge-index.workspace = true
+datafusion.workspace = true
+arrow.workspace = true
+vortex.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+forge-model = { workspace = true, features = ["test-util"] }
+forge-ingest.workspace = true
+arrow = { workspace = true, features = ["prettyprint"] }
+tempfile.workspace = true
+proptest.workspace = true
+bytesize.workspace = true

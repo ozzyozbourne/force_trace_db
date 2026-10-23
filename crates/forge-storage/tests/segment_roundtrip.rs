@@ -488,3 +488,26 @@ async fn random_merge_passes_write_segment() {
         }
     }
 }
+
+#[test]
+fn p3v_cached_footer_scans_on_another_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(store(&format!("file://{}", dir.path().display())).with_footer_cache(64 << 20));
+    let data = rows(5, 1000);
+    let rt_a = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let meta = rt_a.block_on(async {
+        let w = st.write_segment(spec("p"), input(vec![batch_from_rows(&data)])).await.unwrap();
+        let req = ScanRequest { projection: Some(vec![col::TRACE_ID, col::SPAN_ID]), ..Default::default() };
+        let n: usize = st.scan(&w.meta, req).await.unwrap().try_collect::<Vec<_>>().await.unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 5000);
+        w.meta
+    });
+    drop(rt_a);
+    let rt_b = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt_b.block_on(async {
+        let n: usize = st.scan(&meta, ScanRequest::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 5000);
+        let b = scan_range(&st, &meta, 1000..2000).await;
+        assert_eq!(b.num_rows(), 1000);
+    });
+}

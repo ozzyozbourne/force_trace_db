@@ -205,7 +205,7 @@ async fn orphan_upload_before_commit_is_invisible() {
     ingest_spans(&ing, 0, 99, false).await;
     // "Upload then die before commit": write a segment of the memtable's rows, never commit it.
     let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
-    let merged = merge_versions(&snap.batches, Tombstones::Keep).unwrap();
+    let merged = merge_versions(&snap.to_vec(), Tombstones::Keep).unwrap();
     let alpha = forge_model::merge::split_by_project(&merged).unwrap().remove(0);
     let spec = forge_storage::SegmentSpec {
         id: forge_model::catalog::SegmentId::new(),
@@ -336,8 +336,8 @@ async fn acked_is_queryable() {
         .await
         .unwrap();
     let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
-    assert_eq!(count(&snap.batches), 2);
-    let versions: Vec<u64> = rows_from_batch(&snap.batches[0]).iter().map(|r| r.version).collect();
+    assert_eq!(count(&snap.to_vec()), 2);
+    let versions: Vec<u64> = rows_from_batch(&snap.to_vec()[0]).iter().map(|r| r.version).collect();
     assert_eq!(versions, [1, 2]);
 }
 
@@ -350,7 +350,7 @@ async fn blob_offload_through_submit() {
     r.inputs = Some(format!("\"{}\"", "x".repeat(2 << 20)));
     ing.submit(vec![r]).await.unwrap();
     let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
-    let rows = rows_from_batch(&snap.batches[0]);
+    let rows = rows_from_batch(&snap.to_vec()[0]);
     let (path, size) = forge_model::blob::parse_blob_ref(rows[0].inputs.as_deref().unwrap()).unwrap();
     assert_eq!(size, (2 << 20) + 2);
     assert!(tmp.path().join("data").join(path).is_file());
@@ -373,7 +373,7 @@ async fn versions_survive_wiped_wal() {
     assert!(rep.next_version > mv);
     ing.submit(vec![start("alpha", 1, 3)]).await.unwrap();
     let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
-    assert!(rows_from_batch(&snap.batches[0])[0].version > mv);
+    assert!(rows_from_batch(&snap.to_vec()[0])[0].version > mv);
 }
 
 #[tokio::test]
@@ -689,7 +689,7 @@ async fn flush_merges_in_bounded_batches() {
         .await
         .unwrap();
     ingest_spans(&ing, 0, 300, true).await;
-    let want = rows_from_batch(&merge_versions(&ing.memtable().snapshot().batches, Tombstones::Keep).unwrap());
+    let want = rows_from_batch(&merge_versions(&ing.memtable().snapshot().to_vec(), Tombstones::Keep).unwrap());
     let r = ing.flush_now().await.unwrap().unwrap();
     assert!(r.merged_batches > 1, "unbounded merge: {} batch(es)", r.merged_batches);
     assert_eq!(r.segments.len(), 3, "one segment per project");

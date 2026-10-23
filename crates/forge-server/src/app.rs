@@ -13,6 +13,7 @@ pub struct Forge {
     /// Built at startup: validates the storage URL and creates the local directory.
     pub segments: Arc<dyn forge_storage::SegmentStore>,
     pub ingest: Arc<forge_ingest::Pipeline>,
+    pub query: Arc<forge_query::QueryEngine>,
     pub ready: AtomicBool,
     pub shutdown: CancellationToken,
 }
@@ -26,9 +27,11 @@ impl Forge {
         // Directory creation is blocking work, like the metastore open.
         let storage = config.storage.clone();
         let built = tokio::task::spawn_blocking(move || forge_storage::build_object_store(&storage)).await??;
-        let segments: Arc<dyn forge_storage::SegmentStore> = Arc::new(forge_storage::VortexSegmentStore::new(built));
+        let segments: Arc<dyn forge_storage::SegmentStore> = Arc::new(forge_storage::VortexSegmentStore::new(built).with_footer_cache(64 << 20));
         let (ingest, _report) = forge_ingest::Pipeline::open(&config, meta.clone(), segments.clone()).await?;
+        let query = Arc::new(forge_query::QueryEngine::new(meta.clone(), segments.clone(), ingest.memtable_view(), config.query.clone()));
         Ok(Arc::new(Self {
+            query,
             config,
             meta,
             segments,

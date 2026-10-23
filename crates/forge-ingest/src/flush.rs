@@ -67,7 +67,7 @@ pub struct FlushReport {
 pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, IngestError> {
     let internal = |e: &dyn std::fmt::Display| IngestError::Internal(format!("merge: {e}"));
     // 1. Merge + physical sort: CPU work, off the async workers. Bounded output batches (no offset overflow).
-    let (batches, max_chunk) = (f.batches.clone(), cx.merge_chunk_bytes);
+    let (batches, max_chunk) = (f.part.batches.to_vec(), cx.merge_chunk_bytes);
     let merged = tokio::task::spawn_blocking(move || {
         if failpoint::fires("flush_merge_panic") {
             panic!("FORGE_FAILPOINT flush_merge_panic hit");
@@ -115,7 +115,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
     let commit = FlushCommit {
         node_id: cx.node_id.clone(),
         segments: written,
-        flushed_wal_seq: f.last_seq,
+        flushed_wal_seq: f.last_seq(),
         max_version: cx.versions.high_water(),
     };
     retry("commit_flush", cx.backoff, || cx.meta.commit_flush(commit.clone())).await;
@@ -124,7 +124,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
     // 4. Visible as a segment now; drop from the memtable view (invariant 1), then the WAL.
     cx.mem.release(&f);
     let wal = cx.wal.clone();
-    let watermark = f.last_seq;
+    let watermark = f.last_seq();
     let deleted = match tokio::task::spawn_blocking(move || wal.truncate(watermark)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
@@ -141,7 +141,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
         rows_out: commit.segments.iter().map(|s| s.meta.row_count).sum(),
         segments: commit.segments,
         watermark,
-        rows_in: f.batches.iter().map(|b| b.num_rows()).sum(),
+        rows_in: f.part.batches.num_rows(),
         wal_segments_deleted: deleted,
         merged_batches: merged.len(),
     })

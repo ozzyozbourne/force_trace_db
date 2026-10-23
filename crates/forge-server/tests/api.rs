@@ -104,9 +104,36 @@ async fn projects_api() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
 
-    assert_eq!(
-        call(&api, post("/v1/sql", json!({}))).await.0,
-        StatusCode::NOT_IMPLEMENTED
-    );
-    assert_eq!(call(&api, get("/v1/traces/abc")).await.0, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(call(&api, post("/v1/sql", json!({}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&api, get("/v1/traces/abc")).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn p3v_read_api() {
+    use forge_ingest::Ingest;
+    use forge_model::row::SpanRow;
+    use forge_model::testing::{pid, sid, tid};
+    let f = forge().await;
+    let api = api_router(f.clone());
+    let root = SpanRow { project_id: Some(pid("default")), trace_id: tid(1), span_id: sid(1), name: Some("root".into()),
+        start_time_ns: Some(1_700_000_000_123_456_789), inputs: Some("{\"a\":1}".into()), ..Default::default() };
+    let child = SpanRow { span_id: sid(2), parent_span_id: Some(sid(1)), name: Some("child".into()), start_time_ns: Some(1_700_000_000_200_000_000), ..root.clone() };
+    f.ingest.submit(vec![root, child]).await.unwrap();
+    let (st, v) = call(&api, get(&format!("/v1/traces/{}", tid(1)))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    eprintln!("{v}");
+    assert_eq!(v["roots"][0]["children"][0]["name"], "child");
+    assert_eq!(v["roots"][0]["start_time"], "2023-11-14T22:13:20.123456789Z");
+    assert_eq!(v["roots"][0]["inputs"]["a"], 1);
+    let (st, _) = call(&api, get(&format!("/v1/traces/{}", tid(9)))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(&api, post("/v1/sql", json!({"query": "SELECT name, start_time FROM spans ORDER BY name"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    eprintln!("{v}");
+    assert_eq!(v["row_count"], 2);
+    let (st, v) = call(&api, post("/v1/sql", json!({"query": "DROP TABLE spans"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let req = Request::get(format!("/v1/traces/{}", tid(1))).header("accept-encoding", "gzip").body(Body::empty()).unwrap();
+    let resp = api.clone().oneshot(req).await.unwrap();
+    eprintln!("gzip: {:?}", resp.headers().get("content-encoding"));
 }
