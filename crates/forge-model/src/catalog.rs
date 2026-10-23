@@ -87,6 +87,15 @@ str_enum!(SegmentState, "segment_state", {
     Compacting => "compacting",
     Deleted => "deleted",
 });
+// Compaction job kind (plans/phase-4 D1): L0 = an L0 prefix (+ whole folded hours); L1 = a newest version suffix of
+// one hour.
+str_enum!(JobKind, "job_kind", { L0 => "l0", L1 => "l1" });
+str_enum!(JobStatus, "job_status", {
+    Running => "running",
+    Done => "done",
+    Failed => "failed",
+});
+
 impl SegmentState {
     pub fn parse(s: &str) -> Option<Self> {
         s.parse().ok()
@@ -126,6 +135,17 @@ pub struct SegmentMeta {
 }
 
 impl SegmentMeta {
+    /// Retention (plans/phase-4 D10; data clock only). L1: the whole `partition_hour` expires once it ends at or
+    /// before the cutoff. L0: only when it has no null start_time and its newest start is before the cutoff (its
+    /// null-start rows reach an orphan run at compaction and expire with that hour). forge-meta's expire SQL is the
+    /// same rule (pinned by a test); it also skips an L1 hour that has a compacting segment.
+    pub fn expires(&self, cutoff_ns: i64) -> bool {
+        match self.level {
+            Level::L1 => self.partition_hour.0 < cutoff_ns.div_euclid(HourBucket::NANOS),
+            Level::L0 => self.start_time_nulls == 0 && self.max_start_ns.is_some_and(|m| m < cutoff_ns),
+        }
+    }
+
     /// Conservative: true unless the segment provably has no row with start_time in [start, end).
     pub fn may_overlap_time(&self, start_ns: Option<i64>, end_ns: Option<i64>) -> bool {
         if self.start_time_nulls > 0 {

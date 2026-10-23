@@ -1,4 +1,4 @@
-//! The `forge` command line: `serve`, `sql`, `inspect`, plus stubs for the later subcommands.
+//! The `forge` command line: `serve`, `sql`, `inspect`, `compact`, `gc`, plus stubs for the later subcommands.
 mod table;
 
 use anyhow::Context;
@@ -31,15 +31,27 @@ pub enum Cmd {
     /// Inspect files.
     #[command(subcommand)]
     Inspect(InspectCmd),
-    /// Compact a project.
+    /// Compact a project (offline: stop the server first).
     Compact {
         #[arg(long)]
         project: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
     },
-    /// Garbage-collect.
+    /// Retention, purge, orphan GC (offline: stop the server first).
     Gc {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long, value_parser = humantime_serde::re::humantime::parse_duration)]
+        gc_grace: Option<std::time::Duration>,
+        #[arg(long, value_parser = humantime_serde::re::humantime::parse_duration)]
+        orphan_grace: Option<std::time::Duration>,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
     },
     /// Benchmarks.
     Bench(BenchArgs),
@@ -134,8 +146,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Compact { .. } => not_yet("compact", Unimplemented("M3")),
-        Cmd::Gc { .. } => not_yet("gc", Unimplemented("M3")),
+        Cmd::Compact {
+            project,
+            data_dir,
+            format,
+        } => compact(&project, data_dir.as_deref(), format, cli.config.as_deref()).await,
+        Cmd::Gc {
+            dry_run,
+            data_dir,
+            gc_grace,
+            orphan_grace,
+            format,
+        } => {
+            let o = Offline::open(data_dir.as_deref(), cli.config.as_deref()).await?;
+            let c = &o.cfg.compaction;
+            let opts = forge_ingest::lifecycle::GcOptions {
+                gc_grace: gc_grace.unwrap_or(c.gc_grace),
+                orphan_grace: orphan_grace.unwrap_or(c.orphan_grace),
+                sweep_blobs: true,
+                dry_run,
+            };
+            gc(&o, opts, format).await
+        }
         Cmd::Bench(_) => not_yet("bench", Unimplemented("M6")),
     }
 }
@@ -213,6 +245,212 @@ async fn offline_sql(a: &SqlArgs, config: Option<&std::path::Path>) -> anyhow::R
     };
     use forge_model::error::Classify;
     engine.sql_json(&req).await.map_err(|e| anyhow::anyhow!(e.message()))
+}
+
+/// `forge compact`/`forge gc` refuse to run next to a server (exit code 3; plans/phase-4 D12).
+#[derive(Debug)]
+pub struct ServerRunning(pub String);
+impl std::fmt::Display for ServerRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a server is running on this data dir ({}/LOCK is held); stop it first",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ServerRunning {}
+
+/// An offline data dir: every WAL node directory locked (held until drop), metastore read-write, compaction jobs
+/// of an earlier process reset.
+struct Offline {
+    cfg: ForgeConfig,
+    meta: std::sync::Arc<dyn forge_meta::Metastore>,
+    segments: std::sync::Arc<dyn forge_storage::SegmentStore>,
+    /// (node dir name, records past its checkpoint) per locked WAL directory.
+    wal: Vec<(String, u64)>,
+    _locks: Vec<std::fs::File>,
+}
+
+impl Offline {
+    async fn open(data_dir: Option<&std::path::Path>, config: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        use forge_model::config::{DATA_DIR, META_DB};
+        let cfg = match data_dir {
+            Some(d) => {
+                if !d.join(META_DB).is_file() || !d.join(DATA_DIR).is_dir() {
+                    anyhow::bail!("no Forge data at {}", d.display());
+                }
+                ForgeConfig::rooted_at(d)
+            }
+            None => {
+                let cfg = ForgeConfig::load(config).context("loading config")?;
+                // build_object_store and the metastore open create missing data: refuse instead.
+                let root = forge_storage::file_url_path(&cfg.storage.url).ok();
+                let db = cfg
+                    .metastore
+                    .url
+                    .strip_prefix("sqlite://")
+                    .map(std::path::PathBuf::from);
+                if root.as_ref().is_some_and(|r| !r.is_dir()) || db.as_ref().is_some_and(|d| !d.is_file()) {
+                    anyhow::bail!(
+                        "no Forge data at {} (storage.url {})",
+                        cfg.storage.url,
+                        cfg.metastore.url
+                    );
+                }
+                cfg
+            }
+        };
+        // Every node directory (a server may run under another node id) plus our own.
+        let mut dirs = std::collections::BTreeSet::from([cfg.wal.dir.join(&cfg.node.id)]);
+        if let Ok(rd) = std::fs::read_dir(&cfg.wal.dir) {
+            for e in rd {
+                let e = e?;
+                if e.file_type()?.is_dir() {
+                    dirs.insert(e.path());
+                }
+            }
+        }
+        let mut locks = Vec::new();
+        for d in &dirs {
+            match forge_ingest::wal::lock_dir(d) {
+                Ok(l) => locks.push(l),
+                Err(forge_ingest::wal::WalError::Locked(_)) => {
+                    let rel = d
+                        .strip_prefix(cfg.wal.dir.parent().unwrap_or(&cfg.wal.dir))
+                        .unwrap_or(d);
+                    return Err(ServerRunning(rel.display().to_string()).into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let meta = forge_meta::open(&cfg.metastore).await?;
+        let segments: std::sync::Arc<dyn forge_storage::SegmentStore> = std::sync::Arc::new(
+            forge_storage::VortexSegmentStore::new(forge_storage::build_object_store(&cfg.storage)?),
+        );
+        let mut wal = Vec::new();
+        for d in &dirs {
+            let node = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let flushed = meta.wal_checkpoint(&node).await?.map_or(0, |c| c.flushed_seq);
+            let mut n = 0u64;
+            forge_ingest::wal::replay(d, flushed, |_, _| {
+                n += 1;
+                Ok::<_, String>(())
+            })?;
+            wal.push((node, n));
+        }
+        meta.reset_compactions().await?;
+        Ok(Self {
+            cfg,
+            meta,
+            segments,
+            wal,
+            _locks: locks,
+        })
+    }
+}
+
+async fn compact(
+    project: &str,
+    data_dir: Option<&std::path::Path>,
+    format: Format,
+    config: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let o = Offline::open(data_dir, config).await?;
+    let p = forge_model::ids::ProjectId::new(project)?;
+    if o.meta.get_project(&p).await?.is_none() {
+        anyhow::bail!("no project {project:?}");
+    }
+    let cx = forge_ingest::compact::CompactCtx {
+        meta: o.meta.clone(),
+        segments: o.segments.clone(),
+        cfg: o.cfg.compaction.clone(),
+        data_clock: forge_model::time::wall_clock(),
+        next_project: Default::default(),
+        cancel: forge_model::merge::Cancel::new(),
+    };
+    let s = forge_ingest::compact::compact_project(&cx, &p).await?;
+    let mut out = std::io::stdout().lock();
+    match format {
+        Format::Json => writeln!(out, "{}", serde_json::to_string(&s)?)?,
+        Format::Table => {
+            for j in &s.jobs {
+                let rows: u64 = j.outputs.iter().map(|o| o.2).sum();
+                let hours: std::collections::BTreeSet<String> = j
+                    .outputs
+                    .iter()
+                    .map(|o| {
+                        forge_model::catalog::HourBucket(o.0)
+                            .path_component()
+                            .unwrap_or_else(|_| o.0.to_string())
+                    })
+                    .collect();
+                writeln!(
+                    out,
+                    "compacted {} {} job: {} L0 + {} L1 -> {} L1 (hours {}; {rows} rows) in {} ms",
+                    j.project,
+                    j.kind,
+                    j.l0_inputs,
+                    j.l1_inputs,
+                    j.outputs.len(),
+                    hours.into_iter().collect::<Vec<_>>().join(", "),
+                    j.elapsed_ms
+                )?;
+            }
+            writeln!(
+                out,
+                "done: {} jobs, {} skipped, {} failed{}",
+                s.jobs.len(),
+                s.skipped,
+                s.failed.len(),
+                if s.capped { " (capped: run again)" } else { "" }
+            )?;
+        }
+    }
+    if !s.failed.is_empty() {
+        anyhow::bail!("{} compaction job(s) failed: {}", s.failed.len(), s.failed.join("; "));
+    }
+    Ok(())
+}
+
+/// `forge gc`: blobs only when no node directory has WAL records past its own checkpoint (lifecycle.md §4).
+async fn gc(o: &Offline, mut opts: forge_ingest::lifecycle::GcOptions, format: Format) -> anyhow::Result<()> {
+    use std::io::Write;
+    let unflushed: Vec<String> = o
+        .wal
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(node, n)| format!("WAL of {node} has {n} unflushed records"))
+        .collect();
+    opts.sweep_blobs = unflushed.is_empty();
+    let now = forge_model::time::now_ms();
+    let store = o.segments.object_store();
+    let mut r = forge_ingest::lifecycle::run_gc(o.meta.as_ref(), store.as_ref(), now, now, &opts, None).await?;
+    if !unflushed.is_empty() {
+        r.blobs_skipped = Some(format!("{}: run forge serve once", unflushed.join(", ")));
+    }
+    let mut out = std::io::stdout().lock();
+    match format {
+        Format::Json => writeln!(out, "{}", serde_json::to_string(&r)?)?,
+        Format::Table => {
+            writeln!(out, "expired segments:         {}   (retention)", r.expired_segments)?;
+            writeln!(
+                out,
+                "purged segments:          {}   ({} objects, {} bytes)",
+                r.purged_segments, r.deleted_objects, r.freed_bytes
+            )?;
+            writeln!(out, "orphan segment objects:   {}", r.orphan_segment_objects)?;
+            match &r.blobs_skipped {
+                Some(why) => writeln!(out, "orphan blobs:             {}   (skipped: {why})", r.orphan_blobs)?,
+                None => writeln!(out, "orphan blobs:             {}", r.orphan_blobs)?,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn not_yet(cmd: &str, Unimplemented(m): Unimplemented) -> anyhow::Result<()> {

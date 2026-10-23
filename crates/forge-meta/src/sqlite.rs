@@ -1,14 +1,17 @@
 //! SQLite metastore: one connection behind a mutex, used from `spawn_blocking` (master decision 10).
 
 use crate::{
-    FlushCommit, MetaError, MetaResult, Metastore, NewSegment, Project, SegmentFilter, WalCheckpoint, migrations,
+    CompactionCommit, CompactionJob, FlushCommit, JobRequest, MetaError, MetaResult, Metastore, NewSegment, Project,
+    SegmentFilter, WalCheckpoint, migrations,
 };
 use async_trait::async_trait;
-use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, SegmentState, TraceLocation};
+use forge_model::catalog::{
+    HourBucket, JobKind, JobStatus, Level, SegmentId, SegmentMeta, SegmentState, TraceLocation, TraceRange,
+};
 use forge_model::ids::{ProjectId, TraceId};
 use forge_model::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -205,6 +208,34 @@ static LOCATE_TRACE: LazyLock<String> = LazyLock::new(|| {
          WHERE state <> 'deleted' ORDER BY id"
     )
 });
+/// Retention (plans/phase-4 §2.5; `SegmentMeta::expires`, pinned by a test). ?1 project, ?2 cutoff hour,
+/// ?3 cutoff ns, ?4 now_ms (wall), ?5 max hours. L1: whole hours only; an hour with a compacting segment is skipped.
+static EXPIRE_L1: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?4 \
+         WHERE project_id = ?1 AND level = 1 AND state = 'live' AND partition_hour IN ( \
+           SELECT partition_hour FROM segments s WHERE s.project_id = ?1 AND s.level = 1 AND s.state <> 'deleted' \
+             AND s.partition_hour < ?2 \
+           GROUP BY partition_hour HAVING sum(s.state = 'compacting') = 0 \
+           ORDER BY partition_hour LIMIT ?5) \
+         RETURNING {SEGMENT_COLS}"
+    )
+});
+/// ?1 project, ?2 cutoff ns, ?3 now_ms.
+static EXPIRE_L0: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?3 \
+         WHERE project_id = ?1 AND level = 0 AND state = 'live' AND start_time_nulls = 0 AND max_start_ns < ?2 \
+         RETURNING {SEGMENT_COLS}"
+    )
+});
+static PURGE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SEGMENT_COLS} FROM segments WHERE state = 'deleted' AND deleted_at_ms < ?1 \
+         ORDER BY deleted_at_ms LIMIT ?2"
+    )
+});
+
 /// Opens `path` read-only and checks the schema version (the first read).
 fn read_only_conn(path: &Path, immutable: bool) -> MetaResult<Connection> {
     use rusqlite::OpenFlags;
@@ -479,6 +510,214 @@ fn insert_segment(tx: &Transaction<'_>, s: &NewSegment, now: i64) -> MetaResult<
         ])
         .map_err(|e| map_err(e, &format!("trace {} in segment {id}", t.trace_id)))?;
     }
+    let mut st = tx.prepare_cached(
+        "INSERT INTO blob_refs (project_id, path, segment_id) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+    )?;
+    for b in &s.blobs {
+        st.execute(params![m.project_id.as_str(), b, id])?;
+    }
+    Ok(())
+}
+
+/// Inputs of running jobs back to live, then the jobs to failed; `?1` = job id or NULL (every running job).
+const RESET_INPUTS: &str = "UPDATE segments SET state = 'live' WHERE state = 'compacting' AND id IN ( \
+    SELECT ci.segment_id FROM compaction_inputs ci JOIN compaction_jobs j ON j.id = ci.job_id \
+    WHERE j.status = 'running' AND (?1 IS NULL OR j.id = ?1))";
+const RESET_JOBS: &str = "UPDATE compaction_jobs SET status = 'failed', finished_at_ms = ?2, error = ?3 \
+    WHERE status = 'running' AND (?1 IS NULL OR id = ?1)";
+
+fn placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+/// `count(*)` of a dynamic statement: `head` params, then the input ids (`prepare`, not cached: the IN-list length
+/// varies, RA m6).
+fn count_with_ids(
+    tx: &Transaction<'_>,
+    sql: &str,
+    head: Vec<rusqlite::types::Value>,
+    ids: &[String],
+) -> MetaResult<i64> {
+    let mut p = head;
+    p.extend(ids.iter().cloned().map(Into::into));
+    Ok(tx
+        .prepare(sql)?
+        .query_row(rusqlite::params_from_iter(p), |x| x.get(0))?)
+}
+
+/// plans/phase-4 §2.5 begin. Every check runs before the first write.
+fn begin_in_txn(tx: &Transaction<'_>, r: &JobRequest, now: i64) -> MetaResult<Option<CompactionJob>> {
+    let ids: Vec<String> = r.inputs.iter().map(ToString::to_string).collect();
+    let in_list = placeholders(ids.len());
+    let segs: Vec<SegmentMeta> = {
+        let sql = format!("SELECT {SEGMENT_COLS} FROM segments WHERE id IN ({in_list}) ORDER BY min_version");
+        let mut st = tx.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(&ids), |row| Ok(segment_from_row(row)))?;
+        rows.map(|x| x?).collect::<MetaResult<_>>()?
+    };
+    // 1. Every input exists, is live, and belongs to the project.
+    if segs.len() != ids.len()
+        || segs
+            .iter()
+            .any(|s| s.state != SegmentState::Live || s.project_id != r.project_id)
+    {
+        return Ok(None);
+    }
+    let l0: Vec<&SegmentMeta> = segs.iter().filter(|s| s.level == Level::L0).collect();
+    let hours: BTreeSet<i64> = segs
+        .iter()
+        .filter(|s| s.level == Level::L1)
+        .map(|s| s.partition_hour.0)
+        .collect();
+    // 2. Kind A has an L0 input; kind B has none and exactly one hour.
+    match r.kind {
+        JobKind::L0 if l0.is_empty() => return Ok(None),
+        JobKind::L1 if !l0.is_empty() || hours.len() != 1 => return Ok(None),
+        _ => {}
+    }
+    let project: rusqlite::types::Value = r.project_id.as_str().to_string().into();
+    match r.kind {
+        JobKind::L0 => {
+            // 3. D1a: no visible L0 outside the inputs is older than the newest input.
+            let newest = l0.iter().map(|s| s.min_version).max().unwrap_or(0);
+            let sql = format!(
+                "SELECT count(*) FROM segments WHERE project_id = ? AND level = 0 AND state <> 'deleted' \
+                 AND min_version < ? AND id NOT IN ({in_list})"
+            );
+            let head = vec![project.clone(), to_i64("min_version", newest)?.into()];
+            if count_with_ids(tx, &sql, head, &ids)? > 0 {
+                return Ok(None);
+            }
+            // 4. D1b: every visible L1 segment of each input hour is an input.
+            let sql = format!(
+                "SELECT count(*) FROM segments WHERE project_id = ? AND level = 1 AND partition_hour = ? \
+                 AND state <> 'deleted' AND id NOT IN ({in_list})"
+            );
+            for h in &hours {
+                if count_with_ids(tx, &sql, vec![project.clone(), (*h).into()], &ids)? > 0 {
+                    return Ok(None);
+                }
+            }
+        }
+        JobKind::L1 => {
+            // 5. D1c: a newest version suffix: every other visible L1 segment of the hour is older than every input.
+            let min_input = segs.iter().map(|s| s.min_version).min().unwrap_or(0);
+            let sql = format!(
+                "SELECT count(*) FROM segments WHERE project_id = ? AND level = 1 AND partition_hour = ? \
+                 AND state <> 'deleted' AND id NOT IN ({in_list}) AND max_version >= ?"
+            );
+            let mut p = vec![project.clone(), hours.first().copied().unwrap_or(0).into()];
+            p.extend(ids.iter().cloned().map(Into::into));
+            p.push(to_i64("min_version", min_input)?.into());
+            let newer: i64 = tx
+                .prepare(&sql)?
+                .query_row(rusqlite::params_from_iter(p), |x| x.get(0))?;
+            if newer > 0 {
+                return Ok(None);
+            }
+        }
+    }
+    // 6. The job (the partial unique index is a backstop for a second kind A).
+    let job_id = match tx
+        .prepare_cached(
+            "INSERT INTO compaction_jobs (project_id, kind, status, created_at_ms) VALUES (?1, ?2, 'running', ?3)",
+        )?
+        .execute(params![r.project_id.as_str(), r.kind.as_str(), now])
+    {
+        Ok(_) => tx.last_insert_rowid(),
+        Err(e) => match map_err(e, "compaction job") {
+            MetaError::Conflict(_) => return Ok(None),
+            other => return Err(other),
+        },
+    };
+    // 7. Inputs -> compacting.
+    let mut ins = tx.prepare_cached("INSERT INTO compaction_inputs (job_id, segment_id) VALUES (?1, ?2)")?;
+    let mut mark = tx.prepare_cached("UPDATE segments SET state = 'compacting' WHERE id = ?1 AND state = 'live'")?;
+    for id in &ids {
+        ins.execute(params![job_id, id])?;
+        if mark.execute([id])? != 1 {
+            return Err(corrupt("segments", format!("{id} changed state inside the begin txn")));
+        }
+    }
+    forge_model::failpoint::hit("meta_lease_in_txn");
+    Ok(Some(CompactionJob {
+        id: job_id,
+        project_id: r.project_id.clone(),
+        kind: r.kind,
+        inputs: segs
+            .into_iter()
+            .map(|s| SegmentMeta {
+                state: SegmentState::Compacting,
+                ..s
+            })
+            .collect(),
+        created_at_ms: now,
+    }))
+}
+
+fn commit_compaction_in_txn(tx: &Transaction<'_>, c: &CompactionCommit, now: i64) -> MetaResult<()> {
+    let job: Option<(String, String, i64)> = tx
+        .prepare_cached("SELECT project_id, status, created_at_ms FROM compaction_jobs WHERE id = ?1")?
+        .query_row([c.job_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((project, status, created)) = job else {
+        return Err(MetaError::Conflict(format!("no compaction job {}", c.job_id)));
+    };
+    match status.as_str() {
+        "done" => return Ok(()), // a retry after the commit landed
+        "running" => {}
+        other => return Err(MetaError::Conflict(format!("job {} is {other}", c.job_id))),
+    }
+    if now.saturating_sub(created) > c.max_age_ms {
+        return Err(MetaError::Conflict(format!("job {} exceeded max age", c.job_id)));
+    }
+    let (n, compacting, in_rows, in_min_v, in_max_v): (i64, i64, i64, i64, i64) = tx
+        .prepare_cached(
+            "SELECT count(*), COALESCE(sum(s.state = 'compacting'), 0), COALESCE(sum(s.row_count), 0), \
+             COALESCE(min(s.min_version), 0), COALESCE(max(s.max_version), 0) \
+             FROM compaction_inputs ci JOIN segments s ON s.id = ci.segment_id WHERE ci.job_id = ?1",
+        )?
+        .query_row([c.job_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+    if n == 0 || compacting != n {
+        return Err(corrupt(
+            "compaction_inputs",
+            format!("job {}: {compacting}/{n} inputs compacting", c.job_id),
+        ));
+    }
+    let out_rows: u64 = c.outputs.iter().map(|o| o.meta.row_count).sum();
+    for o in &c.outputs {
+        let m = &o.meta;
+        if m.project_id.as_str() != project
+            || m.level != Level::L1
+            || to_i64("min_version", m.min_version)? < in_min_v
+            || to_i64("max_version", m.max_version)? > in_max_v
+        {
+            return Err(MetaError::InvalidInput(format!(
+                "output {} does not match job {}",
+                m.id, c.job_id
+            )));
+        }
+    }
+    if to_i64("row_count", out_rows)? > in_rows {
+        return Err(MetaError::InvalidInput(format!(
+            "job {}: {out_rows} output rows > {in_rows} input rows",
+            c.job_id
+        )));
+    }
+    // D6: the inputs' trace_index rows stay; forget_segments removes them in chunks.
+    tx.prepare_cached(
+        "UPDATE segments SET state = 'deleted', deleted_at_ms = ?2 \
+         WHERE id IN (SELECT segment_id FROM compaction_inputs WHERE job_id = ?1)",
+    )?
+    .execute(params![c.job_id, now])?;
+    for o in &c.outputs {
+        insert_segment(tx, o, now)?;
+    }
+    tx.prepare_cached("UPDATE compaction_jobs SET status = 'done', finished_at_ms = ?2 WHERE id = ?1")?
+        .execute(params![c.job_id, now])?;
+    forge_model::failpoint::hit("meta_compact_in_txn");
     Ok(())
 }
 
@@ -742,6 +981,197 @@ impl Metastore for SqliteMetastore {
             Ok(out)
         })
         .await
+    }
+
+    async fn expire_segments(
+        &self,
+        project: &ProjectId,
+        cutoff_ns: i64,
+        max_hours: usize,
+    ) -> MetaResult<Vec<SegmentMeta>> {
+        self.expire(project, cutoff_ns, max_hours).await
+    }
+
+    async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.read(move |c| {
+            let mut st = c.prepare_cached(&PURGE_CANDIDATES)?;
+            let rows = st.query_map(params![deleted_before_ms, limit], |r| Ok(segment_from_row(r)))?;
+            rows.map(|r| r?).collect()
+        })
+        .await
+    }
+
+    async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
+        self.forget(ids).await
+    }
+
+    async fn segment_paths(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
+        let project = project.clone();
+        self.read(move |c| {
+            let mut st = c.prepare_cached("SELECT path FROM segments WHERE project_id = ?1")?;
+            let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
+        if r.inputs.is_empty() || r.inputs.len() > 64 {
+            return Err(MetaError::InvalidInput(format!("{} compaction inputs", r.inputs.len())));
+        }
+        self.write(move |tx| begin_in_txn(tx, &r, now_ms())).await
+    }
+
+    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
+        let mut ids = HashSet::new();
+        if let Some(s) = c.outputs.iter().find(|s| !ids.insert(s.meta.id)) {
+            return Err(MetaError::InvalidInput(format!(
+                "segment {} is listed twice in one commit",
+                s.meta.id
+            )));
+        }
+        self.write(move |tx| commit_compaction_in_txn(tx, &c, now_ms())).await
+    }
+
+    async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus> {
+        let error = error.to_string();
+        self.write(move |tx| {
+            tx.prepare_cached(RESET_INPUTS)?.execute([job_id])?;
+            tx.prepare_cached(RESET_JOBS)?
+                .execute(params![job_id, now_ms(), error])?;
+            let status: String = tx
+                .prepare_cached("SELECT status FROM compaction_jobs WHERE id = ?1")?
+                .query_row([job_id], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| MetaError::Conflict(format!("no compaction job {job_id}")))?;
+            status
+                .parse()
+                .map_err(|e| corrupt("compaction_jobs", format!("job {job_id}: {e}")))
+        })
+        .await
+    }
+
+    async fn reset_compactions(&self) -> MetaResult<usize> {
+        self.write(move |tx| {
+            tx.prepare_cached(RESET_INPUTS)?.execute([Option::<i64>::None])?;
+            Ok(tx
+                .prepare_cached(RESET_JOBS)?
+                .execute(params![Option::<i64>::None, now_ms(), "reset at startup"])?)
+        })
+        .await
+    }
+
+    async fn segment_traces(&self, id: SegmentId) -> MetaResult<Vec<TraceRange>> {
+        self.read(move |c| {
+            let mut st = c.prepare_cached(
+                "SELECT trace_id, row_start, row_count FROM trace_index WHERE segment_id = ?1 ORDER BY row_start",
+            )?;
+            let rows = st.query_map([id.to_string()], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (t, start, count) = r?;
+                out.push(TraceRange {
+                    trace_id: TraceId::from_slice(&t).map_err(|e| corrupt("trace_index", e))?,
+                    row_start: to_u64("trace_index", start)?,
+                    row_count: to_u64("trace_index", count)?,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn prune_compaction_jobs(&self, finished_before_ms: i64) -> MetaResult<usize> {
+        self.write(move |tx| {
+            Ok(tx
+                .prepare_cached("DELETE FROM compaction_jobs WHERE status <> 'running' AND finished_at_ms < ?1")?
+                .execute([finished_before_ms])?)
+        })
+        .await
+    }
+
+    async fn set_retention_days(&self, project: &ProjectId, days: Option<u32>) -> MetaResult<()> {
+        let p = Project::new(project.clone(), None, days, now_ms())?;
+        self.write(move |tx| {
+            tx.prepare_cached(
+                "INSERT INTO projects (id, name, api_key_hash, retention_days, created_at_ms) VALUES (?1,?2,NULL,?3,?4) \
+                 ON CONFLICT(id) DO UPDATE SET retention_days = excluded.retention_days",
+            )?
+            .execute(params![p.id.as_str(), p.name, p.retention_days, p.created_at_ms])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn blob_refs(&self, project: &ProjectId) -> MetaResult<HashSet<String>> {
+        let project = project.clone();
+        self.read(move |c| {
+            let mut st = c.prepare_cached("SELECT DISTINCT path FROM blob_refs WHERE project_id = ?1")?;
+            let rows = st.query_map([project.as_str()], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+}
+
+impl SqliteMetastore {
+    /// Lifecycle methods (trait impl below delegates here to keep the trait impl block readable).
+    async fn expire(&self, project: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
+        let project = project.clone();
+        let max_hours = i64::try_from(max_hours).unwrap_or(i64::MAX);
+        let cutoff_hour = cutoff_ns.div_euclid(HourBucket::NANOS);
+        self.write(move |tx| {
+            let now = now_ms();
+            let mut out = Vec::new();
+            let mut st = tx.prepare_cached(&EXPIRE_L1)?;
+            for r in st.query_map(params![project.as_str(), cutoff_hour, cutoff_ns, now, max_hours], |r| {
+                Ok(segment_from_row(r))
+            })? {
+                out.push(r??);
+            }
+            let mut st = tx.prepare_cached(&EXPIRE_L0)?;
+            for r in st.query_map(params![project.as_str(), cutoff_ns, now], |r| Ok(segment_from_row(r)))? {
+                out.push(r??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn forget(&self, ids: &[SegmentId]) -> MetaResult<usize> {
+        let mut removed = 0;
+        let chunk = crate::TRACE_INDEX_PURGE_CHUNK as i64;
+        for id in ids.iter().map(SegmentId::to_string) {
+            // Short txns: each deletes <= chunk trace rows of one deleted segment (one project per segment).
+            loop {
+                let id = id.clone();
+                let n = self
+                    .write(move |tx| {
+                        Ok(tx
+                            .prepare_cached(
+                                "DELETE FROM trace_index WHERE segment_id = ?1 AND trace_id IN \
+                                 (SELECT trace_id FROM trace_index WHERE segment_id = ?1 LIMIT ?2) \
+                                 AND EXISTS (SELECT 1 FROM segments WHERE id = ?1 AND state = 'deleted')",
+                            )?
+                            .execute(params![id, chunk])?)
+                    })
+                    .await?;
+                if (n as i64) < chunk {
+                    break;
+                }
+            }
+            removed += self
+                .write(move |tx| {
+                    Ok(tx
+                        .prepare_cached("DELETE FROM segments WHERE id = ?1 AND state = 'deleted'")?
+                        .execute([id])?)
+                })
+                .await?;
+        }
+        Ok(removed)
     }
 }
 

@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod error;
+pub mod lifecycle;
 mod listeners;
 mod ops;
 pub mod otlp;

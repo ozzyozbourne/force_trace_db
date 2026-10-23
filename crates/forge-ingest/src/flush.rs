@@ -107,6 +107,7 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
         written.push(NewSegment {
             meta: w.meta,
             traces: w.traces,
+            blobs: forge_model::blob::blob_refs_in(&rows),
         });
     }
     failpoint::hit("flush_after_upload");

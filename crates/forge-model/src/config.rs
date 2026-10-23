@@ -116,6 +116,27 @@ pub struct CacheConfig {
 pub struct CompactionConfig {
     pub target_segment: ByteSize,
     pub concurrency: usize,
+    /// Compaction picker tick.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    /// Kind-A trigger: this many visible L0 segments.
+    pub l0_trigger: usize,
+    /// Kind-A trigger: the oldest L0 is older than this (wall clock).
+    #[serde(with = "humantime_serde")]
+    pub l0_max_age: Duration,
+    /// Input byte_size per kind-A job.
+    pub max_job_bytes: ByteSize,
+    /// Decoded bytes per merge slice.
+    pub slice_bytes: ByteSize,
+    /// Retention + purge + orphan sweep pass. Zero disables the background pass (`forge gc` still works).
+    #[serde(with = "humantime_serde")]
+    pub gc_interval: Duration,
+    /// Objects of deleted (compacted-away or expired) segments are kept this long for in-flight readers.
+    #[serde(with = "humantime_serde")]
+    pub gc_grace: Duration,
+    /// Objects unknown to the metastore (failed uploads, lost leases) are kept this long (spec: 24 h).
+    #[serde(with = "humantime_serde")]
+    pub orphan_grace: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,6 +316,14 @@ impl Default for CompactionConfig {
         Self {
             target_segment: ByteSize::mib(256),
             concurrency: 2,
+            interval: Duration::from_secs(10),
+            l0_trigger: 4,
+            l0_max_age: Duration::from_secs(600),
+            max_job_bytes: ByteSize::mib(512),
+            slice_bytes: ByteSize::mib(128),
+            gc_interval: Duration::from_secs(600),
+            gc_grace: Duration::from_secs(3600),
+            orphan_grace: Duration::from_secs(86_400),
         }
     }
 }

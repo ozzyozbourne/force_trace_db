@@ -29,6 +29,12 @@ impl Forge {
         let built = tokio::task::spawn_blocking(move || forge_storage::build_object_store(&storage)).await??;
         let segments: Arc<dyn forge_storage::SegmentStore> = Arc::new(forge_storage::VortexSegmentStore::new(built));
         let (ingest, _report) = forge_ingest::Pipeline::open(&config, meta.clone(), segments.clone()).await?;
+        // One process per data dir (the WAL LOCK is held now): no compaction job of an earlier process is still
+        // running (plans/phase-4 D2).
+        let n = meta.reset_compactions().await?;
+        if n > 0 {
+            tracing::info!(jobs = n, "compaction jobs of the previous run reset");
+        }
         let query = Arc::new(forge_query::QueryEngine::new(
             meta.clone(),
             segments.clone(),
@@ -70,6 +76,7 @@ impl Forge {
             std::process::exit(130);
         });
         let tasks = self.ingest.start_background();
+        let lifecycle = crate::lifecycle::start(self.clone()).await?;
 
         // Any listener failure stops the others; join! (not try_join!) lets every listener drain.
         let guard = |r: anyhow::Result<()>| {
@@ -103,8 +110,10 @@ impl Forge {
             }
         };
         tracing::info!("all listeners stopped");
+        // Lifecycle and the final flush stop concurrently, each bounded by the grace.
+        let (_, flushed) = tokio::join!(lifecycle.shutdown(grace), tasks.shutdown(grace));
         // Queued appends are fsynced and in the memtable; new appends get 503.
-        match tasks.shutdown(grace).await {
+        match flushed {
             Ok(Ok(())) => tracing::info!("final flush done"),
             Ok(Err(e)) => tracing::warn!(error = %e, "final flush failed; rows replay from the WAL on start"),
             Err(_) => tracing::warn!(?grace, "final flush timed out; rows replay from the WAL on start"),

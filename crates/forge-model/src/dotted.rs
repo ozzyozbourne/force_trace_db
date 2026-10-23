@@ -104,6 +104,55 @@ fn resolve(
     prefix.flatten()
 }
 
+/// Compaction backfill (CR §4): `nodes` has every known node of one trace slice as (parent, start_ns, existing
+/// dotted). Returns the dotted_order for each key in `want` whose own dotted is null and whose chain resolves.
+#[allow(clippy::type_complexity)]
+pub fn resolve_with_known(
+    nodes: &HashMap<(TraceId, SpanId), (Option<SpanId>, Option<i64>, Option<String>)>,
+    want: impl IntoIterator<Item = (TraceId, SpanId)>,
+) -> HashMap<(TraceId, SpanId), String> {
+    let mut memo: HashMap<(TraceId, SpanId), Option<String>> = nodes
+        .iter()
+        .filter_map(|(k, (_, _, d))| d.clone().map(|d| (*k, Some(d))))
+        .collect();
+    let mut out = HashMap::new();
+    for key in want {
+        if memo.get(&key).is_some_and(Option::is_some) {
+            continue; // already has one
+        }
+        let mut chain = Vec::new();
+        let mut cur = key;
+        let mut prefix: Option<Option<String>> = loop {
+            if let Some(m) = memo.get(&cur) {
+                break m.clone().map(Some);
+            }
+            let Some(&(parent, start, _)) = nodes.get(&cur) else {
+                break None;
+            };
+            chain.push((cur, start));
+            if chain.len() > nodes.len() {
+                break None; // cycle
+            }
+            match parent {
+                None => break Some(None),
+                Some(p) => cur = (cur.0, p),
+            }
+        };
+        for (k, start) in chain.into_iter().rev() {
+            let v = match (&prefix, start) {
+                (Some(p), Some(st)) => Some(dotted_order(p.as_deref(), st, k.1)),
+                _ => None,
+            };
+            memo.insert(k, v.clone());
+            if let Some(d) = &v {
+                out.insert(k, d.clone());
+            }
+            prefix = v.map(Some);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

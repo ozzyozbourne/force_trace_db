@@ -14,7 +14,7 @@ fn help_lists_subcommands() {
 
 #[test]
 fn stubs_fail_with_not_implemented() {
-    let stubs: [&[&str]; 3] = [&["compact", "--project", "p"], &["gc"], &["bench", "ingest"]];
+    let stubs: [&[&str]; 1] = [&["bench", "ingest"]];
     for a in stubs {
         let o = forge(a);
         assert!(!o.status.success(), "{a:?} succeeded");
@@ -117,4 +117,78 @@ fn inspect_missing_file_fails() {
     assert!(!o.status.success(), "{o:?}");
     let e = String::from_utf8_lossy(&o.stderr);
     assert!(e.contains(&format!("inspecting {}", path.display())), "{e}");
+}
+
+/// A data dir with 3 L0 segments of project `p` (flushes 1..=3).
+async fn data_dir_with_l0s() -> tempfile::TempDir {
+    use forge_meta::{FlushCommit, Metastore, NewSegment, SqliteMetastore};
+    use forge_model::catalog::{HourBucket, Level, SegmentId};
+    use forge_model::merge::{Tombstones, merge_versions};
+    use forge_model::testing::{Rng, batch_from_rows, pid, random_row};
+    use forge_storage::{SegmentSpec, SegmentStore};
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("data")).unwrap();
+    let m = SqliteMetastore::open_path(&d.path().join("meta.db")).unwrap();
+    let store = common::segment_store(d.path());
+    let mut r = Rng(7);
+    for f in 1..=3u64 {
+        let rows: Vec<_> = (0..5).map(|s| random_row(&mut r, "p", s % 2, s, f * 10 + s)).collect();
+        let b = merge_versions(&[batch_from_rows(&rows)], Tombstones::Keep).unwrap();
+        let spec = SegmentSpec {
+            id: SegmentId::new(),
+            project_id: pid("p"),
+            level: Level::L0,
+            partition_hour: HourBucket(472_222),
+        };
+        let w = store
+            .write_segment(spec, Box::pin(futures::stream::iter([Ok(b)])))
+            .await
+            .unwrap();
+        m.commit_flush(FlushCommit {
+            node_id: "node-1".into(),
+            segments: vec![NewSegment {
+                meta: w.meta,
+                traces: w.traces,
+                blobs: vec![],
+            }],
+            flushed_wal_seq: f,
+            max_version: 100,
+        })
+        .await
+        .unwrap();
+    }
+    d
+}
+
+#[tokio::test]
+async fn compact_gc() {
+    let d = data_dir_with_l0s().await;
+    let dir = d.path().to_str().unwrap();
+    let o = forge(&["compact", "--project", "nope", "--data-dir", dir]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no project"), "{o:?}");
+    let o = forge(&["compact", "--project", "p", "--data-dir", dir]);
+    assert!(o.status.success(), "{o:?}");
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("3 L0 + 0 L1") && out.contains("done: 1 jobs"), "{out}");
+    let o = forge(&["compact", "--project", "p", "--data-dir", dir, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["jobs"].as_array().unwrap().len(), 0, "{v}");
+    let o = forge(&[
+        "gc",
+        "--data-dir",
+        dir,
+        "--gc-grace",
+        "0s",
+        "--orphan-grace",
+        "0s",
+        "--format",
+        "json",
+    ]);
+    assert!(o.status.success(), "{o:?}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["purged_segments"], 3, "{v}");
+    assert!(v["blobs_skipped"].is_null(), "{v}");
+    let o = forge(&["gc", "--data-dir", dir, "--gc-grace", "bogus"]);
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
 }

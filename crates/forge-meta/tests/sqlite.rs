@@ -55,6 +55,7 @@ fn seg(p: &str, level: Level, start: Option<(i64, i64)>, nulls: u64, max_version
                 row_count: 10,
             },
         ],
+        blobs: vec![],
     }
 }
 
@@ -81,6 +82,15 @@ fn has_table(c: &Connection, name: &str) -> bool {
         == 1
 }
 
+const LATEST: u32 = MIGRATIONS.len() as u32;
+
+/// MIGRATIONS plus one more ("newer"/"broken").
+fn with_next(sql: &'static str) -> Vec<(u32, &'static str, &'static str)> {
+    let mut v = MIGRATIONS.to_vec();
+    v.push((LATEST + 1, "next", sql));
+    v
+}
+
 fn version_rows(c: &Connection) -> i64 {
     c.query_row("SELECT count(*) FROM schema_versions", [], |r| r.get(0))
         .unwrap()
@@ -90,27 +100,33 @@ fn version_rows(c: &Connection) -> i64 {
 async fn migrations_apply_once() {
     let dir = tempfile::tempdir().unwrap();
     let s = db(dir.path());
-    assert_eq!(s.schema_version().await.unwrap(), 1);
-    assert_eq!(s.pragma("user_version").unwrap(), "1");
+    assert_eq!(s.schema_version().await.unwrap(), LATEST);
+    assert_eq!(s.pragma("user_version").unwrap(), LATEST.to_string());
     assert_eq!(s.pragma("journal_mode").unwrap(), "wal");
     assert_eq!(s.pragma("foreign_keys").unwrap(), "1");
     drop(s);
     let s = db(dir.path());
-    assert_eq!(s.schema_version().await.unwrap(), 1);
+    assert_eq!(s.schema_version().await.unwrap(), LATEST);
     drop(s);
-    assert_eq!(version_rows(&Connection::open(dir.path().join("meta.db")).unwrap()), 1);
+    assert_eq!(
+        version_rows(&Connection::open(dir.path().join("meta.db")).unwrap()),
+        i64::from(LATEST)
+    );
 }
 
 #[test]
 fn failed_migration_rolls_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = Connection::open(dir.path().join("m.db")).unwrap();
-    let broken = [MIGRATIONS[0], (2, "broken", "CREATE TABLE t2(x); SELEC broken")];
+    let broken = with_next("CREATE TABLE t2(x); SELEC broken");
     let e = migrate_with(&mut c, &broken).unwrap_err();
-    assert!(matches!(e, MetaError::Migration { version: 2, .. }), "{e:?}");
-    assert_eq!(migrate_with(&mut c, MIGRATIONS).unwrap(), 1);
+    assert!(
+        matches!(e, MetaError::Migration { version, .. } if version == LATEST + 1),
+        "{e:?}"
+    );
+    assert_eq!(migrate_with(&mut c, MIGRATIONS).unwrap(), LATEST);
     assert!(!has_table(&c, "t2"));
-    assert_eq!(version_rows(&c), 1);
+    assert_eq!(version_rows(&c), i64::from(LATEST));
 }
 
 #[test]
@@ -118,11 +134,14 @@ fn newer_database_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = Connection::open(dir.path().join("m.db")).unwrap();
     assert_eq!(
-        migrate_with(&mut c, &[MIGRATIONS[0], (2, "t2", "CREATE TABLE t2(x)")]).unwrap(),
-        2
+        migrate_with(&mut c, &with_next("CREATE TABLE t2(x)")).unwrap(),
+        LATEST + 1
     );
     let e = migrate_with(&mut c, MIGRATIONS).unwrap_err();
-    assert!(matches!(e, MetaError::SchemaTooNew { db: 2, binary: 1 }), "{e:?}");
+    assert!(
+        matches!(e, MetaError::SchemaTooNew { db, binary } if db == LATEST + 1 && binary == LATEST),
+        "{e:?}"
+    );
 }
 
 #[tokio::test]
@@ -138,8 +157,8 @@ async fn concurrent_first_open() {
     for t in threads {
         t.join().unwrap().unwrap();
     }
-    assert_eq!(db(dir.path()).schema_version().await.unwrap(), 1);
-    assert_eq!(version_rows(&Connection::open(&path).unwrap()), 1);
+    assert_eq!(db(dir.path()).schema_version().await.unwrap(), LATEST);
+    assert_eq!(version_rows(&Connection::open(&path).unwrap()), i64::from(LATEST));
 }
 
 #[tokio::test]
@@ -389,7 +408,7 @@ async fn urls() {
     })
     .await
     .unwrap();
-    assert_eq!(m.schema_version().await.unwrap(), 1);
+    assert_eq!(m.schema_version().await.unwrap(), LATEST);
     let dir = tempfile::tempdir().unwrap();
     let url = format!("sqlite://{}/sub/meta.db", dir.path().display());
     assert_eq!(
@@ -399,7 +418,7 @@ async fn urls() {
             .schema_version()
             .await
             .unwrap(),
-        1
+        LATEST
     );
     assert!(dir.path().join("sub/meta.db").is_file());
     assert!(matches!(
@@ -445,13 +464,11 @@ fn busy_and_locked_are_transient() {
 fn upgrade_from_v1_applies_only_v2() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = Connection::open(dir.path().join("m.db")).unwrap();
-    assert_eq!(migrate_with(&mut c, MIGRATIONS).unwrap(), 1);
-    assert_eq!(
-        migrate_with(&mut c, &[MIGRATIONS[0], (2, "t2", "CREATE TABLE t2(x)")]).unwrap(),
-        2
-    );
-    assert_eq!(version_rows(&c), 2);
-    assert!(has_table(&c, "t2"));
+    assert_eq!(migrate_with(&mut c, &MIGRATIONS[..1]).unwrap(), 1);
+    assert!(!has_table(&c, "compaction_jobs"));
+    assert_eq!(migrate_with(&mut c, MIGRATIONS).unwrap(), LATEST);
+    assert_eq!(version_rows(&c), i64::from(LATEST));
+    assert!(has_table(&c, "compaction_jobs") && has_table(&c, "blob_refs"));
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 //! forge-meta: the catalog of projects, segments, trace locations and WAL checkpoints.
 
 use async_trait::async_trait;
-use forge_model::catalog::{Level, SegmentId, SegmentMeta, TraceLocation, TraceRange};
+use forge_model::catalog::{JobKind, JobStatus, Level, SegmentId, SegmentMeta, TraceLocation, TraceRange};
 use forge_model::config::{MetastoreConfig, split_scheme};
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
 use forge_model::ids::{ProjectId, TraceId};
@@ -111,6 +111,39 @@ impl Project {
 pub struct NewSegment {
     pub meta: SegmentMeta,
     pub traces: Vec<TraceRange>,
+    /// Distinct blob paths (`blobs/<project>/<sha256>`) referenced by the segment's rows
+    /// (`forge_model::blob::blob_refs_in`); written to `blob_refs`.
+    pub blobs: Vec<String>,
+}
+
+/// A compaction job request (plans/phase-4 D1).
+#[derive(Clone, Debug)]
+pub struct JobRequest {
+    pub project_id: ProjectId,
+    pub kind: JobKind,
+    /// A: an L0 prefix + every visible L1 segment of each folded hour; B: a newest version suffix of one hour.
+    pub inputs: Vec<SegmentId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactionJob {
+    pub id: i64,
+    pub project_id: ProjectId,
+    pub kind: JobKind,
+    /// state = Compacting, ordered by min_version.
+    pub inputs: Vec<SegmentMeta>,
+    /// Wall clock (the job-age guard, D15).
+    pub created_at_ms: i64,
+}
+
+/// Outputs: L1, same project, any hours.
+#[derive(Clone, Debug)]
+pub struct CompactionCommit {
+    pub job_id: i64,
+    pub outputs: Vec<NewSegment>,
+    /// D15: the commit is refused (Conflict) when the job is older than this, so the orphan sweep
+    /// (`orphan_grace` = 2 x this) never deletes an upload that is about to be committed.
+    pub max_age_ms: i64,
 }
 
 /// One flush = one segment per project in the frozen memtable, one transaction.
@@ -179,7 +212,54 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
         project: &ProjectId,
         traces: &[TraceId],
     ) -> MetaResult<std::collections::HashMap<TraceId, Vec<TraceLocation>>>;
+
+    // ---- lifecycle (M3): retention, purge, orphan GC ----
+
+    /// Retention (plans/phase-4 D10, data clock): one BEGIN IMMEDIATE txn marks `deleted` (deleted_at_ms = now)
+    /// every LIVE L1 segment of the oldest `max_hours` hours of `project` with `partition_hour < floor(cutoff / H)`
+    /// that have no compacting segment, and every LIVE L0 segment with no null start_time and
+    /// `max_start_ns < cutoff_ns` (`SegmentMeta::expires`). Returns them. trace_index rows stay until
+    /// `forget_segments`; queries already ignore deleted segments.
+    async fn expire_segments(
+        &self,
+        project: &ProjectId,
+        cutoff_ns: i64,
+        max_hours: usize,
+    ) -> MetaResult<Vec<SegmentMeta>>;
+    /// Deleted segments with `deleted_at_ms < deleted_before_ms`, oldest deletion first, at most `limit`.
+    async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>>;
+    /// Removes the rows of DELETED segments (others in `ids` are ignored): their trace_index rows in short txns of
+    /// at most `TRACE_INDEX_PURGE_CHUNK` rows, then the segments rows. Call only after their objects are gone.
+    /// Returns the number of segments rows removed.
+    async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize>;
+    /// Object paths (`.vortex`) of every segments row of `project`, any state: the orphan GC's "known" set.
+    async fn segment_paths(&self, project: &ProjectId) -> MetaResult<std::collections::HashSet<String>>;
+    /// Blob paths referenced by any segments row of `project` (any state: a deleted segment's blobs are kept until
+    /// its row is forgotten, i.e. after its objects are gone).
+    async fn blob_refs(&self, project: &ProjectId) -> MetaResult<std::collections::HashSet<String>>;
+    /// Sets (None = keep forever) a project's retention, creating the project if absent. `InvalidInput` for 0.
+    async fn set_retention_days(&self, project: &ProjectId, days: Option<u32>) -> MetaResult<()>;
+
+    // ---- compaction (M3; one process per data dir, plans/phase-4 D2) ----
+
+    /// One IMMEDIATE txn. None when the D1 rules fail or an input is not live; nothing is written then.
+    async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>>;
+    /// The atomic swap (D6). Ok if the job is already done (idempotent retry). Conflict if it is failed, or older
+    /// than `max_age_ms`.
+    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()>;
+    /// running -> failed, inputs -> live. Returns the job's final status (Done if the commit had landed).
+    async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus>;
+    /// Startup (one process per data dir): every running job -> failed, its inputs -> live. Returns the count.
+    async fn reset_compactions(&self) -> MetaResult<usize>;
+    /// trace_index of one segment, by row_start.
+    async fn segment_traces(&self, id: SegmentId) -> MetaResult<Vec<TraceRange>>;
+    /// Deletes done/failed jobs finished before `finished_before_ms`.
+    async fn prune_compaction_jobs(&self, finished_before_ms: i64) -> MetaResult<usize>;
 }
+
+/// `forget_segments` deletes trace_index rows in txns of this many rows, so a flush commit never waits behind
+/// one huge delete (an hour's L1 segment holds ~720k trace rows at 200 traces/s).
+pub const TRACE_INDEX_PURGE_CHUNK: usize = 20_000;
 
 /// Read-only open (`sqlite://path` only): no create, no migrations, no journal_mode change. A missing file is a
 /// `Config` error and nothing is created.

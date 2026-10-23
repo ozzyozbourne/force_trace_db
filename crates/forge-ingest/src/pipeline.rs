@@ -105,6 +105,8 @@ pub struct Pipeline {
     inflight: Arc<AtomicUsize>,
     flush: FlushCtx,
     flush_lock: tokio::sync::Mutex<()>,
+    /// Blob sweep (write) vs reused-blob refresh in `put_blobs` (read).
+    blob_gc: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -117,6 +119,11 @@ impl std::fmt::Debug for Pipeline {
 }
 
 impl Pipeline {
+    /// The lock the blob sweep takes for writing (`lifecycle::run_gc`).
+    pub fn blob_gc(&self) -> Arc<tokio::sync::RwLock<()>> {
+        self.blob_gc.clone()
+    }
+
     pub async fn open(
         cfg: &ForgeConfig,
         meta: Arc<dyn Metastore>,
@@ -237,6 +244,7 @@ impl Pipeline {
                 inflight: Arc::default(),
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
+                blob_gc: Arc::new(tokio::sync::RwLock::new(())),
             }),
             OpenReport {
                 replay,
@@ -311,6 +319,7 @@ impl Ingest for Pipeline {
             Ok(item) => item,
             Err(rows) => {
                 let put = async {
+                    let _sweep = self.blob_gc.read().await;
                     put_blobs(puts, self.blobs.as_ref())
                         .await
                         .map_err(|e| IngestError::from(StorageError::from(e)))

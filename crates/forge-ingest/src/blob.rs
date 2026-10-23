@@ -5,9 +5,13 @@ use forge_model::catalog::paths::blob_path;
 use forge_model::ids::ProjectId;
 use forge_model::row::SpanRow;
 use futures::{StreamExt, TryStreamExt};
-use object_store::{ObjectStore, PutMode, PutOptions, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+
+/// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. Far below the
+/// 24 h orphan grace.
+pub const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
 /// `threshold` bytes with a blob reference and returns the blobs to write (`put_blobs`), keyed by path.
@@ -38,9 +42,22 @@ pub async fn put_blobs(puts: HashMap<String, Bytes>, store: &dyn ObjectStore) ->
     let n = puts.len();
     futures::stream::iter(puts)
         .map(|(path, bytes)| async move {
+            let path = Path::from(path);
             let opts = PutOptions::from(PutMode::Create);
-            match store.put_opts(&Path::from(path), bytes.into(), opts).await {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            match store.put_opts(&path, bytes.clone().into(), opts).await {
+                Ok(_) => Ok(()),
+                // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - 24 h and no
+                // blob_refs row) cannot take it before this row is flushed (lifecycle.md §1.4).
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let stale = store
+                        .head(&path)
+                        .await
+                        .is_ok_and(|m| chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH);
+                    if stale {
+                        store.put(&path, bytes.into()).await?;
+                    }
+                    Ok(())
+                }
                 Err(e) => Err(e),
             }
         })

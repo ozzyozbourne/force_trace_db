@@ -2,8 +2,11 @@
 //! forge-server tests; feature `test-util`).
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use forge_meta::{FlushCommit, MetaResult, Metastore, NewSegment, Project, SegmentFilter, WalCheckpoint};
-use forge_model::catalog::{HourBucket, Level, SegmentId, SegmentMeta, TraceLocation};
+use forge_meta::{
+    CompactionCommit, CompactionJob, FlushCommit, JobRequest, MetaResult, Metastore, NewSegment, Project,
+    SegmentFilter, WalCheckpoint,
+};
+use forge_model::catalog::{HourBucket, JobStatus, Level, SegmentId, SegmentMeta, TraceLocation, TraceRange};
 use forge_model::ids::{ProjectId, TraceId};
 use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
 use forge_storage::{BatchStream, ScanRequest, SegmentSpec, SegmentStore, StorageResult, WrittenSegment};
@@ -33,11 +36,13 @@ pub async fn write_flush(
                 level: Level::L0,
                 partition_hour: hour,
             };
+            let blobs = forge_model::blob::blob_refs_in(&batches);
             let s = futures::stream::iter(batches.into_iter().map(Ok));
             let w = store.write_segment(spec, Box::pin(s)).await.unwrap();
             segments.push(NewSegment {
                 meta: w.meta,
                 traces: w.traces,
+                blobs,
             });
         }
     }
@@ -57,7 +62,11 @@ type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 pub struct HookedMetastore {
     inner: Arc<dyn Metastore>,
     hook: Hook,
+    /// `commit_compaction`: (run the real commit?, map its result to what the caller sees).
+    commit: Option<(bool, CommitHook)>,
 }
+
+pub type CommitHook = Box<dyn Fn(MetaResult<()>) -> MetaResult<()> + Send + Sync>;
 
 impl std::fmt::Debug for HookedMetastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +80,7 @@ impl HookedMetastore {
         Self {
             inner,
             hook: Box::new(move || Box::pin(tokio::time::sleep(d))),
+            commit: None,
         }
     }
     /// The FIRST read runs `f` (e.g. a flush that commits and releases a memtable) before returning its
@@ -81,7 +91,20 @@ impl HookedMetastore {
             Some(f) => f(),
             None => Box::pin(async {}),
         });
-        Self { inner, hook }
+        Self {
+            inner,
+            hook,
+            commit: None,
+        }
+    }
+    /// Every `commit_compaction` runs the real commit if `land`, then returns `f(result)` (e.g. an error after a
+    /// commit that landed; plans/phase-4 D7).
+    pub fn on_commit(inner: Arc<dyn Metastore>, land: bool, f: CommitHook) -> Self {
+        Self {
+            inner,
+            hook: Box::new(|| Box::pin(async {})),
+            commit: Some((land, f)),
+        }
     }
 }
 
@@ -129,6 +152,52 @@ impl Metastore for HookedMetastore {
         let r = self.inner.locate_traces(project, traces).await;
         (self.hook)().await;
         r
+    }
+    async fn expire_segments(&self, p: &ProjectId, cutoff_ns: i64, max_hours: usize) -> MetaResult<Vec<SegmentMeta>> {
+        self.inner.expire_segments(p, cutoff_ns, max_hours).await
+    }
+    async fn purge_candidates(&self, before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>> {
+        self.inner.purge_candidates(before_ms, limit).await
+    }
+    async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
+        self.inner.forget_segments(ids).await
+    }
+    async fn segment_paths(&self, p: &ProjectId) -> MetaResult<std::collections::HashSet<String>> {
+        self.inner.segment_paths(p).await
+    }
+    async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
+        self.inner.begin_compaction(r).await
+    }
+    async fn commit_compaction(&self, c: CompactionCommit) -> MetaResult<()> {
+        match &self.commit {
+            Some((land, f)) => {
+                let r = if *land {
+                    self.inner.commit_compaction(c).await
+                } else {
+                    Ok(())
+                };
+                f(r)
+            }
+            None => self.inner.commit_compaction(c).await,
+        }
+    }
+    async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus> {
+        self.inner.fail_compaction(job_id, error).await
+    }
+    async fn reset_compactions(&self) -> MetaResult<usize> {
+        self.inner.reset_compactions().await
+    }
+    async fn segment_traces(&self, id: SegmentId) -> MetaResult<Vec<TraceRange>> {
+        self.inner.segment_traces(id).await
+    }
+    async fn prune_compaction_jobs(&self, before_ms: i64) -> MetaResult<usize> {
+        self.inner.prune_compaction_jobs(before_ms).await
+    }
+    async fn set_retention_days(&self, p: &ProjectId, days: Option<u32>) -> MetaResult<()> {
+        self.inner.set_retention_days(p, days).await
+    }
+    async fn blob_refs(&self, p: &ProjectId) -> MetaResult<std::collections::HashSet<String>> {
+        self.inner.blob_refs(p).await
     }
 }
 

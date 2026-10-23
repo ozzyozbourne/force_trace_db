@@ -15,6 +15,23 @@ pub fn parse_blob_ref(s: &str) -> Option<(&str, u64)> {
     path.starts_with("blobs/").then_some((path, size))
 }
 
+/// Distinct blob paths referenced by the payload columns of `batches` (spans_schema). Prefix check per value.
+pub fn blob_refs_in(batches: &[arrow::record_batch::RecordBatch]) -> Vec<String> {
+    use arrow::array::AsArray;
+    let mut out = std::collections::BTreeSet::new();
+    for b in batches {
+        for name in crate::schema::PAYLOAD_COLUMNS {
+            let a = b.column(crate::schema::col_idx(name)).as_string::<i32>();
+            for v in a.iter().flatten() {
+                if let Some((path, _)) = parse_blob_ref(v) {
+                    out.insert(path.to_string());
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

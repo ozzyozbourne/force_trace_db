@@ -9,8 +9,9 @@ use arrow::array::{AsArray, RecordBatch};
 use arrow::compute::{concat_batches, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
 use forge_meta::{MetaResult, Metastore, SegmentFilter};
-use forge_model::catalog::{SegmentMeta, TraceLocation};
+use forge_model::catalog::{HourBucket, Level, SegmentMeta, TraceLocation};
 use forge_model::derived::with_effective_total_tokens;
+use forge_model::ids::ProjectId;
 use forge_model::ids::TraceId;
 use forge_model::merge::{Cancel, MERGE_COLUMNS, Tombstones, merge_projected};
 use forge_model::schema::{ALL_COLUMNS, col, col_idx, project_to};
@@ -64,10 +65,39 @@ pub(crate) fn read_columns(out: &[&str]) -> Vec<&'static str> {
     s.into_iter().map(|i| ALL_COLUMNS[i]).collect()
 }
 
-/// The merge-skip rule (D14): ONE segment's rows are already one per key (invariant 3), so without memtable rows
-/// only tombstones must go. M3 extends it to pairwise key-disjoint segments.
+/// The merge-skip rule (D14 + M3). Segment rows are already one per key (invariant 3), so the merge can be skipped
+/// (only tombstones are filtered) when there are no memtable rows, no L0 part, and the L1 parts are pairwise
+/// key-disjoint. Invariant 10 makes L1 segments of different (project, partition_hour) key-disjoint; inside one hour,
+/// segments with disjoint trace-id ranges are too.
 pub(crate) fn needs_merge(parts: &[SegmentPart], mem_rows: bool) -> bool {
-    mem_rows || parts.iter().map(|p| p.seg.id).collect::<BTreeSet<_>>().len() != 1
+    if mem_rows {
+        return true;
+    }
+    let mut segs: Vec<&SegmentMeta> = parts.iter().map(|p| &p.seg).collect();
+    segs.sort_by_key(|s| s.id);
+    segs.dedup_by_key(|s| s.id);
+    if segs.len() <= 1 {
+        return false;
+    }
+    if segs.iter().any(|s| s.level == Level::L0) {
+        return true;
+    }
+    segs.sort_by(|a, b| {
+        (&a.project_id, a.partition_hour, a.min_trace_id).cmp(&(&b.project_id, b.partition_hour, b.min_trace_id))
+    });
+    let mut run_max: Option<(&ProjectId, HourBucket, TraceId)> = None;
+    for s in segs {
+        match run_max {
+            Some((p, h, max)) if p == &s.project_id && h == s.partition_hour => {
+                if s.min_trace_id <= max {
+                    return true;
+                }
+                run_max = Some((p, h, max.max(s.max_trace_id)));
+            }
+            _ => run_max = Some((&s.project_id, s.partition_hour, s.max_trace_id)),
+        }
+    }
+    false
 }
 
 /// Fast paths: the merged rows of `batches` (tombstones dropped; only the tombstone filter when `!merge`), with
@@ -231,5 +261,33 @@ mod tests {
             Err(QueryError::Model(forge_model::error::ModelError::Cancelled))
         ));
         assert_eq!(run(&Cancel::after(u64::MAX)).unwrap().len(), 200);
+    }
+
+    /// Plan §6.3 merge-skip cases.
+    #[test]
+    fn needs_merge_cases() {
+        use forge_model::testing::{segment_meta, tid};
+        let part = |level, hour, lo: u64, hi: u64| SegmentPart {
+            seg: SegmentMeta {
+                min_trace_id: tid(lo),
+                max_trace_id: tid(hi),
+                ..segment_meta("p", level, HourBucket(hour))
+            },
+            rows: RowSelection::All,
+        };
+        // tid(n) puts n % 7 in byte 0: use n = 7k for ordered ids.
+        let (a, b) = (part(Level::L1, 1, 7, 14), part(Level::L1, 2, 7, 14));
+        assert!(!needs_merge(&[a.clone(), b], false), "different hours");
+        assert!(
+            needs_merge(&[a.clone(), part(Level::L1, 1, 14, 21)], false),
+            "overlapping runs"
+        );
+        assert!(
+            !needs_merge(&[a.clone(), part(Level::L1, 1, 21, 28)], false),
+            "disjoint runs"
+        );
+        assert!(needs_merge(&[a.clone(), part(Level::L0, 1, 21, 28)], false), "L1 + L0");
+        assert!(needs_merge(std::slice::from_ref(&a), true), "memtable rows");
+        assert!(!needs_merge(&[a.clone(), a], false), "one segment, two ranges");
     }
 }

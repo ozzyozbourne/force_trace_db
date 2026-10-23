@@ -3,7 +3,9 @@
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
 
 pub mod blob;
+pub mod compact;
 pub mod flush;
+pub mod lifecycle;
 pub mod memtable;
 pub mod normalize;
 pub mod pipeline;

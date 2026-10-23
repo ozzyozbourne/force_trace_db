@@ -22,10 +22,11 @@ forge-query.workspace = true
 forge-meta.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+forge-ingest.workspace = true
+humantime-serde.workspace = true
 
 [dev-dependencies]
 forge-storage.workspace = true
-forge-ingest.workspace = true
 prost.workspace = true
 futures.workspace = true
 forge-model = { workspace = true, features = ["test-util"] }
