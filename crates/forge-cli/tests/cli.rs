@@ -18,12 +18,7 @@ fn help_lists_subcommands() {
 
 #[test]
 fn stubs_fail_with_not_implemented() {
-    let stubs: [&[&str]; 4] = [
-        &["sql", "select 1"],
-        &["compact", "--project", "p"],
-        &["gc"],
-        &["bench", "ingest"],
-    ];
+    let stubs: [&[&str]; 3] = [&["compact", "--project", "p"], &["gc"], &["bench", "ingest"]];
     for a in stubs {
         let o = forge(a);
         assert!(!o.status.success(), "{a:?} succeeded");
@@ -38,6 +33,44 @@ fn sql_target_flags_conflict() {
     assert!(!o.status.success());
     let e = String::from_utf8_lossy(&o.stderr);
     assert!(e.contains("cannot be used with"), "{e}");
+}
+
+#[test]
+fn sql_offline_needs_existing_data() {
+    let o = forge(&["sql", "select 1", "--data-dir", "/nonexistent"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no Forge data"), "{o:?}");
+    // Config mode: a missing file:// storage dir fails and is not created.
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("data");
+    let o = common::forge_cmd()
+        .args(["sql", "select 1"])
+        .env("FORGE_STORAGE__URL", format!("file://{}", missing.display()))
+        .env(
+            "FORGE_METASTORE__URL",
+            format!("sqlite://{}/meta.db", tmp.path().display()),
+        )
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no Forge data"), "{o:?}");
+    assert!(!missing.exists() && !tmp.path().join("meta.db").exists());
+}
+
+#[test]
+fn sql_server_errors_and_formats() {
+    let o = forge(&["sql", "select 1", "--server", "http://127.0.0.1:1"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("error: connecting to"),
+        "{o:?}"
+    );
+    let o = forge(&["sql", "select 1", "--format", "csv"]);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("invalid value 'csv'"),
+        "{o:?}"
+    );
 }
 
 /// One merged L0 segment of random rows under `dir/data`; returns its path.

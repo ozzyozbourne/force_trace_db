@@ -18,18 +18,19 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+forge-query.workspace = true
+forge-meta.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-forge-meta.workspace = true
 forge-storage.workspace = true
 forge-ingest.workspace = true
 prost.workspace = true
 futures.workspace = true
 forge-model = { workspace = true, features = ["test-util"] }
-reqwest.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
-serde_json.workspace = true
 tonic.workspace = true
 opentelemetry-proto.workspace = true
 flate2.workspace = true

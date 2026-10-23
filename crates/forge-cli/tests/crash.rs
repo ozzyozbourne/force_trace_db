@@ -258,7 +258,7 @@ enum Orphans {
 }
 
 /// Checks A–O (see the table in the plan) against the committed state of `dir`. `ctx` goes into every message.
-async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
+async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) -> usize {
     let posts = ledger.lock().unwrap().clone();
     let (segs, rows) = visible(dir).await; // E, T
 
@@ -398,6 +398,7 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
         segs.len(),
         rows.len()
     );
+    got.len()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -450,8 +451,28 @@ async fn crash_case(fp: &str, interval: &str, orphans: Orphans) -> Replay {
     let c = Case::new("5s");
     c.kill_under_load(fp, interval).await;
     let replay = restart_and_post(c.dir(), &c.ledger).await;
-    verify(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
+    verify_with_sql(c.dir(), &c.ledger, orphans, &format!("{fp} {replay:?}")).await;
     replay
+}
+
+/// `verify`, then (once per case) `forge sql --data-dir` counts exactly the merged visible keys, in-doubt
+/// posts included.
+async fn verify_with_sql(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
+    let n = verify(dir, ledger, orphans, ctx).await;
+    let o = common::forge_cmd()
+        .args([
+            "sql",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "SELECT count(*) AS n FROM spans",
+        ])
+        .output()
+        .expect("forge sql");
+    assert!(o.status.success(), "{ctx}: {o:?}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("json");
+    assert_eq!(v["rows"][0]["n"].as_u64(), Some(n as u64), "{ctx}: forge sql count");
 }
 
 async fn timed<T>(f: impl Future<Output = T>) -> T {
@@ -534,7 +555,7 @@ async fn crash_replay_flush() {
         drop(s);
 
         let replay = restart_and_post(c.dir(), &c.ledger).await;
-        verify(c.dir(), &c.ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
+        verify_with_sql(c.dir(), &c.ledger, Orphans::Any, &format!("replay flush {replay:?}")).await;
     })
     .await;
 }
@@ -582,10 +603,10 @@ async fn crash_random_sigkill() {
             let (mut s, _) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
             s.stop_ok(Duration::from_secs(20)).await;
             drop(s);
-            verify(dir, &c.ledger, Orphans::Any, &ctx).await;
+            let _ = verify(dir, &c.ledger, Orphans::Any, &ctx).await;
         }
         let replay = restart_and_post(dir, &c.ledger).await;
-        verify(dir, &c.ledger, Orphans::Any, &format!("seed {seed} final {replay:?}")).await;
+        verify_with_sql(dir, &c.ledger, Orphans::Any, &format!("seed {seed} final {replay:?}")).await;
     })
     .await;
 }
@@ -597,7 +618,7 @@ async fn graceful_stop_under_load() {
         c.sigterm_under_load("300ms", "final flush done").await;
         let replay = restart_and_post(c.dir(), &c.ledger).await;
         assert_eq!(replay.applied, 0, "{replay:?}");
-        verify(c.dir(), &c.ledger, Orphans::Zero, &format!("graceful {replay:?}")).await;
+        verify_with_sql(c.dir(), &c.ledger, Orphans::Zero, &format!("graceful {replay:?}")).await;
     })
     .await;
 }
@@ -609,7 +630,7 @@ async fn final_flush_timeout_replays() {
         c.sigterm_under_load("1h", "final flush timed out").await;
         let replay = restart_and_post(c.dir(), &c.ledger).await; // rewrites the config with a 5 s grace
         assert!(replay.applied > 0, "{replay:?}");
-        verify(
+        verify_with_sql(
             c.dir(),
             &c.ledger,
             Orphans::Any,
