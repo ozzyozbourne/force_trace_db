@@ -1343,7 +1343,11 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
-            .filter(|n| n.to_string_lossy().starts_with(COPY_PREFIX))
+            // This process's copies only: other test processes (nextest, offline `forge sql`) copy concurrently.
+            .filter(|n| {
+                n.to_string_lossy()
+                    .starts_with(&format!("{COPY_PREFIX}{}-", std::process::id()))
+            })
             .collect()
     }
 
