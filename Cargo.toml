@@ -107,6 +107,10 @@ debug = "line-tables-only"
 debug = false
 opt-level = 1
 
+# The analyzer / matcher loops of the E1 / E2 property tests (and brute force in debug tests).
+[profile.dev.package.forge-index]
+opt-level = 1
+
 [profile.release]
 debug = "line-tables-only"
 
