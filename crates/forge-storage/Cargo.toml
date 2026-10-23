@@ -10,6 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
+tracing.workspace = true
 forge-model.workspace = true
 arrow.workspace = true
 vortex.workspace = true

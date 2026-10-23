@@ -10,6 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+forge-ingest.workspace = true
+tower-http.workspace = true
+prost.workspace = true
+async-trait.workspace = true
 forge-model.workspace = true
 forge-meta.workspace = true
 forge-storage.workspace = true
@@ -25,5 +29,10 @@ anyhow.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+forge-model = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 http.workspace = true

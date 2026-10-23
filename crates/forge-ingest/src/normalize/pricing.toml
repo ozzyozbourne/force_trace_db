@@ -1,0 +1,121 @@
+# Model list prices in USD per 1M tokens.
+# UNVERIFIED: written from memory (research/phase-2/normalize.md §2.5). Check every price before a release.
+# Siblings (gpt-4, o3-mini, claude-3-haiku, ...) must exist so that boundary-prefix lookup never borrows a parent's price.
+
+[models."gpt-4o"]
+input = 2.50
+output = 10.00
+cached_input = 1.25
+
+[models."gpt-4o-mini"]
+input = 0.15
+output = 0.60
+cached_input = 0.075
+
+[models."gpt-4.1"]
+input = 2.00
+output = 8.00
+cached_input = 0.50
+
+[models."gpt-4.1-mini"]
+input = 0.40
+output = 1.60
+cached_input = 0.10
+
+[models."gpt-4.1-nano"]
+input = 0.10
+output = 0.40
+cached_input = 0.025
+
+[models."gpt-4-turbo"]
+input = 10.00
+output = 30.00
+
+[models."gpt-4"]
+input = 30.00
+output = 60.00
+
+[models."gpt-3.5-turbo"]
+input = 0.50
+output = 1.50
+
+[models."o1"]
+input = 15.00
+output = 60.00
+cached_input = 7.50
+
+[models."o1-mini"]
+input = 1.10
+output = 4.40
+cached_input = 0.55
+
+[models."o3"]
+input = 2.00
+output = 8.00
+cached_input = 0.50
+
+[models."o3-mini"]
+input = 1.10
+output = 4.40
+cached_input = 0.55
+
+[models."o4-mini"]
+input = 1.10
+output = 4.40
+cached_input = 0.275
+
+[models."text-embedding-3-small"]
+input = 0.02
+output = 0.0
+
+[models."text-embedding-3-large"]
+input = 0.13
+output = 0.0
+
+[models."text-embedding-ada-002"]
+input = 0.10
+output = 0.0
+
+[models."claude-opus-4"]
+input = 15.00
+output = 75.00
+cached_input = 1.50
+cache_write = 18.75
+
+[models."claude-sonnet-4"]
+input = 3.00
+output = 15.00
+cached_input = 0.30
+cache_write = 3.75
+
+[models."claude-3-7-sonnet"]
+input = 3.00
+output = 15.00
+cached_input = 0.30
+cache_write = 3.75
+
+[models."claude-3-5-sonnet"]
+input = 3.00
+output = 15.00
+cached_input = 0.30
+cache_write = 3.75
+
+[models."claude-3-5-haiku"]
+input = 0.80
+output = 4.00
+cached_input = 0.08
+cache_write = 1.00
+
+[models."claude-3-haiku"]
+input = 0.25
+output = 1.25
+cached_input = 0.03
+cache_write = 0.30
+
+[models."gemini-2.5-pro"]
+input = 1.25
+output = 10.00
+
+[models."gemini-2.5-flash"]
+input = 0.30
+output = 2.50

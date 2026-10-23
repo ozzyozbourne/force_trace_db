@@ -18,9 +18,8 @@ fn help_lists_subcommands() {
 
 #[test]
 fn stubs_fail_with_not_implemented() {
-    let stubs: [&[&str]; 5] = [
+    let stubs: [&[&str]; 4] = [
         &["sql", "select 1"],
-        &["inspect", "segment", "x.vortex"],
         &["compact", "--project", "p"],
         &["gc"],
         &["bench", "ingest"],

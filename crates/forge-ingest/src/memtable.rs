@@ -1,0 +1,203 @@
+//! Memtable set: one active + at most one frozen memtable (paste target: forge-ingest/src/memtable.rs).
+//!
+//! Inserts come ONLY from the WAL writer thread (after fsync, in seq order) and from replay (in seq
+//! order), so every memtable holds a contiguous run of WAL seqs and `Frozen::last_seq` is a valid
+//! watermark (invariant 7). `insert` enforces contiguity instead of trusting it.
+use arrow::record_batch::RecordBatch;
+use forge_model::{MemtableSnapshot, MemtableView};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// Memory charged for one batch: the bytes its arrays actually reference
+/// (`get_slice_memory_size`) + a fixed per-batch overhead. Identical for a freshly built batch and
+/// the same batch decoded from IPC on replay. NOT `get_array_memory_size`, which charges every
+/// column of an IPC-decoded batch the whole shared message buffer (58x over-count measured).
+pub fn accounted_bytes(b: &RecordBatch) -> usize {
+    const PER_BATCH: usize = 512;
+    PER_BATCH
+        + b.columns()
+            .iter()
+            .map(|c| {
+                c.to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or_else(|_| c.get_array_memory_size())
+            })
+            .sum::<usize>()
+}
+
+#[derive(Debug)]
+pub struct Frozen {
+    pub batches: Vec<RecordBatch>,
+    /// Accounted bytes (sum of `accounted_bytes`).
+    pub bytes: usize,
+    pub rows: usize,
+    pub first_seq: u64,
+    /// Flush watermark: every seq <= this is in this or an earlier memtable.
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct Active {
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    rows: usize,
+    first_seq: u64,
+    created: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct State {
+    active: Active,
+    frozen: Option<Arc<Frozen>>,
+    /// Highest seq inserted (starts at the checkpoint's flushed_seq).
+    last_seq: u64,
+    /// Cached `snapshot()`; dropped by every mutation.
+    snapshot: Option<Arc<[RecordBatch]>>,
+}
+
+#[derive(Debug)]
+pub struct MemtableSet {
+    state: Mutex<State>,
+    /// active + frozen accounted bytes; read lock-free by receivers for backpressure.
+    unflushed: AtomicUsize,
+    flush_bytes: usize,
+    flush_interval: Duration,
+    /// Woken when the active memtable crosses `flush_bytes`.
+    pub flush_wanted: tokio::sync::Notify,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertError {
+    /// seq is not last_seq + 1: a hole would make the flush watermark lie (invariant 7).
+    NotContiguous { expected: u64, got: u64 },
+}
+impl std::fmt::Display for InsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotContiguous { expected, got } => {
+                write!(f, "WAL seq {got} inserted, expected {expected} (hole in the WAL)")
+            }
+        }
+    }
+}
+
+impl MemtableSet {
+    pub fn new(flushed_seq: u64, flush_bytes: usize, flush_interval: Duration) -> Self {
+        Self {
+            state: Mutex::new(State {
+                active: Active::default(),
+                frozen: None,
+                last_seq: flushed_seq,
+                snapshot: None,
+            }),
+            unflushed: AtomicUsize::new(0),
+            flush_bytes,
+            flush_interval,
+            flush_wanted: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `bytes` = `accounted_bytes(&batch)`, computed by the caller off the WAL thread.
+    pub fn insert(&self, seq: u64, batch: RecordBatch, bytes: usize) -> Result<(), InsertError> {
+        let mut s = self.lock();
+        if seq != s.last_seq + 1 {
+            return Err(InsertError::NotContiguous {
+                expected: s.last_seq + 1,
+                got: seq,
+            });
+        }
+        s.last_seq = seq;
+        let a = &mut s.active;
+        if a.batches.is_empty() {
+            a.first_seq = seq;
+            a.created = Some(Instant::now());
+        }
+        a.bytes += bytes;
+        a.rows += batch.num_rows();
+        a.batches.push(batch);
+        let full = a.bytes >= self.flush_bytes;
+        s.snapshot = None;
+        drop(s);
+        self.unflushed.fetch_add(bytes, Ordering::Relaxed);
+        if full {
+            self.flush_wanted.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Bytes not yet in a committed segment (active + frozen). Backpressure: > memory_budget -> 429.
+    pub fn unflushed_bytes(&self) -> usize {
+        self.unflushed.load(Ordering::Relaxed)
+    }
+
+    /// Size or age trigger on the active memtable.
+    pub fn flush_due(&self, now: Instant) -> bool {
+        let s = self.lock();
+        let a = &s.active;
+        !a.batches.is_empty()
+            && (a.bytes >= self.flush_bytes || a.created.is_some_and(|c| now.duration_since(c) >= self.flush_interval))
+    }
+
+    /// Freezes the active memtable. Returns the pending frozen one instead if a flush has not
+    /// committed yet (at most one frozen memtable: flushes commit in seq order, and memory stays
+    /// bounded by backpressure). None when there is nothing to flush.
+    pub fn freeze(&self) -> Option<Arc<Frozen>> {
+        let mut s = self.lock();
+        if let Some(f) = &s.frozen {
+            return Some(f.clone());
+        }
+        if s.active.batches.is_empty() {
+            return None;
+        }
+        let a = std::mem::take(&mut s.active);
+        let f = Arc::new(Frozen {
+            batches: a.batches,
+            bytes: a.bytes,
+            rows: a.rows,
+            first_seq: a.first_seq,
+            last_seq: s.last_seq,
+        });
+        debug_assert_eq!(f.last_seq - f.first_seq + 1, f.batches.len() as u64);
+        s.frozen = Some(f.clone());
+        // snapshot content is unchanged (same batches), keep the cache
+        Some(f)
+    }
+
+    /// After `commit_flush` returned Ok (invariant 1): the segment is now visible, drop the rows.
+    pub fn release(&self, f: &Arc<Frozen>) {
+        let mut s = self.lock();
+        if s.frozen.as_ref().is_some_and(|x| Arc::ptr_eq(x, f)) {
+            s.frozen = None;
+            s.snapshot = None;
+            drop(s);
+            self.unflushed.fetch_sub(f.bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn last_seq(&self) -> u64 {
+        self.lock().last_seq
+    }
+}
+
+impl MemtableView for MemtableSet {
+    /// Frozen first, then active. Cheap when nothing was inserted since the last call.
+    fn snapshot(&self) -> MemtableSnapshot {
+        let mut s = self.lock();
+        if let Some(c) = &s.snapshot {
+            return MemtableSnapshot { batches: c.clone() };
+        }
+        let mut v: Vec<RecordBatch> = Vec::new();
+        if let Some(f) = &s.frozen {
+            v.extend(f.batches.iter().cloned());
+        }
+        v.extend(s.active.batches.iter().cloned());
+        let batches: Arc<[RecordBatch]> = v.into();
+        s.snapshot = Some(batches.clone());
+        MemtableSnapshot { batches }
+    }
+}

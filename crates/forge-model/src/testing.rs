@@ -1,7 +1,9 @@
 //! Fixtures shared by tests in other crates (feature `test-util`).
 
 use crate::catalog::{HourBucket, Level, SegmentId, SegmentMeta, SegmentState, paths};
-use crate::ids::{ProjectId, TraceId};
+use crate::enums::{RunType, SpanStatus};
+use crate::ids::{ProjectId, SpanId, TraceId};
+use crate::row::SpanRow;
 
 pub fn pid(s: &str) -> ProjectId {
     ProjectId::new(s).expect("valid test project id")
@@ -32,4 +34,137 @@ pub fn segment_meta(project: &str, level: Level, hour: HourBucket) -> SegmentMet
         state: SegmentState::Live,
         deleted_at_ms: None,
     }
+}
+
+pub fn fixture_path(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/")).join(name)
+}
+
+pub struct Rng(pub u64);
+impl Rng {
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+    pub fn chance(&mut self, pct: u64) -> bool {
+        self.below(100) < pct
+    }
+    pub fn opt<T>(&mut self, pct: u64, v: T) -> Option<T> {
+        self.chance(pct).then_some(v)
+    }
+}
+
+pub fn tid(n: u64) -> TraceId {
+    let mut b = [0u8; 16];
+    b[8..].copy_from_slice(&n.to_be_bytes());
+    b[0] = 0xA0 | (n % 7) as u8; // not monotonic in n
+    TraceId(b)
+}
+pub fn sid(n: u64) -> SpanId {
+    SpanId(n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes())
+}
+
+/// A random partial upsert of span (project, trace, span) with the given version.
+pub fn random_row(r: &mut Rng, project: &str, trace: u64, span: u64, version: u64) -> SpanRow {
+    let n = r.below(1000) as i64;
+    let (d, ntags) = (r.below(50), r.below(3));
+    SpanRow {
+        project_id: Some(pid(project)),
+        trace_id: tid(trace),
+        span_id: sid(span),
+        parent_span_id: r.opt(40, sid(span + 1000)),
+        dotted_order: r.opt(50, format!("d{d:03}")),
+        name: r.opt(50, format!("name-{n}")),
+        run_type: r.opt(30, RunType::Llm),
+        start_time_ns: r.opt(50, 1_700_000_000_000_000_000 + n),
+        end_time_ns: r.opt(30, 1_700_000_000_000_000_000 + n + 5),
+        status: r.opt(30, if n % 2 == 0 { SpanStatus::Ok } else { SpanStatus::Error }),
+        error: r.opt(10, format!("err {n}")),
+        model: r.opt(20, "gpt".into()),
+        provider: r.opt(20, "openai".into()),
+        prompt_tokens: r.opt(30, n),
+        completion_tokens: r.opt(30, n + 1),
+        total_tokens: r.opt(30, 2 * n + 1),
+        cost_usd: r.opt(30, n as f64 / 100.0),
+        session_id: r.opt(20, format!("s{}", n % 5)),
+        tags: r.opt(30, (0..ntags).map(|i| format!("t{i}")).collect()),
+        metadata: r.opt(30, format!("{{\"k\":{n}}}")),
+        attributes: r.opt(30, format!("{{\"a\":{n}}}")),
+        events: r.opt(20, "[]".into()),
+        inputs: r.opt(
+            40,
+            format!("{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi {n}\"}}]}}"),
+        ),
+        outputs: r.opt(40, format!("{{\"text\":\"out {n}\"}}")),
+        version,
+        deleted: r.chance(5),
+    }
+}
+
+/// Naive reference: per key, versions DESC, each field = first Some.
+pub fn reference_merge(rows: &[SpanRow]) -> Vec<SpanRow> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, TraceId, SpanId), Vec<&SpanRow>> = BTreeMap::new();
+    for r in rows {
+        by_key
+            .entry((r.project_id.as_ref().unwrap().to_string(), r.trace_id, r.span_id))
+            .or_default()
+            .push(r);
+    }
+    let mut out = Vec::new();
+    for (_, mut v) in by_key {
+        v.sort_by_key(|r| std::cmp::Reverse(r.version));
+        macro_rules! pick {
+            ($f:ident) => {
+                v.iter().find_map(|r| r.$f.clone())
+            };
+        }
+        out.push(SpanRow {
+            project_id: v[0].project_id.clone(),
+            trace_id: v[0].trace_id,
+            span_id: v[0].span_id,
+            parent_span_id: pick!(parent_span_id),
+            dotted_order: pick!(dotted_order),
+            name: pick!(name),
+            run_type: pick!(run_type),
+            start_time_ns: pick!(start_time_ns),
+            end_time_ns: pick!(end_time_ns),
+            status: pick!(status),
+            error: pick!(error),
+            model: pick!(model),
+            provider: pick!(provider),
+            prompt_tokens: pick!(prompt_tokens),
+            completion_tokens: pick!(completion_tokens),
+            total_tokens: pick!(total_tokens),
+            cost_usd: pick!(cost_usd),
+            session_id: pick!(session_id),
+            tags: pick!(tags),
+            metadata: pick!(metadata),
+            attributes: pick!(attributes),
+            events: pick!(events),
+            inputs: pick!(inputs),
+            outputs: pick!(outputs),
+            version: v[0].version,
+            deleted: v[0].deleted,
+        });
+    }
+    // physical order: project, trace, dotted NULLS LAST, span
+    out.sort_by(|a, b| {
+        let k = |r: &SpanRow| {
+            (
+                r.project_id.as_ref().unwrap().to_string(),
+                r.trace_id,
+                r.dotted_order.is_none(),
+                r.dotted_order.clone().unwrap_or_default(),
+                r.span_id,
+            )
+        };
+        k(a).cmp(&k(b))
+    });
+    out
 }

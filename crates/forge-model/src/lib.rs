@@ -26,14 +26,19 @@
 //!    below its max. Either insert into the memtable in seq order (for example, the WAL writer thread performs or
 //!    orders the inserts), or track the lowest in-flight seq and flush with `min_inflight − 1`. Otherwise, a crash
 //!    after the flush loses acknowledged writes on replay (`seq > flushed_seq`).
+//! 8. **A flush future is never dropped and then retried in the same process.** A second attempt could commit a
+//!    frozen memtable again under new segment ids, which duplicates `(key, version)`.
 
+pub mod blob;
 pub mod catalog;
 pub mod config;
 pub mod dotted;
 pub mod enums;
 pub mod error;
+pub mod failpoint;
 pub mod ids;
 pub mod memtable;
+pub mod merge;
 pub mod row;
 pub mod schema;
 #[cfg(any(test, feature = "test-util"))]

@@ -248,18 +248,16 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
         let mut grpc = TraceServiceClient::connect(format!("http://{}", p.otlp_grpc))
             .await
             .expect("grpc connect");
-        let err = grpc
-            .export(ExportTraceServiceRequest::default())
+        grpc.export(ExportTraceServiceRequest::default())
             .await
-            .expect_err("export must fail in M0");
-        assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
+            .expect("empty export is OK");
 
         let r = c
             .post(format!("http://{}/v1/traces", p.otlp_http))
             .send()
             .await
             .expect("otlp http");
-        assert_eq!(r.status(), 501, "{}", s.logs());
+        assert_eq!(r.status(), 415, "{}", s.logs());
     }
     assert!(
         s.child.try_wait().expect("try_wait").is_none(),
@@ -273,6 +271,8 @@ async fn serve_starts_healthz_200_and_sigterm_exits_0() {
     assert!(logs.contains("shutdown signal received"), "{logs}");
     assert!(logs.contains("all listeners stopped"), "{logs}");
     assert!(!logs.contains("drain deadline exceeded"), "{logs}");
+    assert!(logs.contains("final flush done"), "{logs}");
+    assert!(logs.contains("wal replay done"), "{logs}");
     assert!(
         !tmp.path().join("meta.db-wal").exists(),
         "metastore not closed cleanly\n{logs}"

@@ -1,0 +1,399 @@
+mod common;
+use bytesize::ByteSize;
+use common::*;
+use forge_ingest::{Ingest, IngestError, OpenReport, Pipeline};
+use forge_meta::{Metastore, SegmentFilter, SqliteMetastore};
+use forge_model::config::ForgeConfig;
+use forge_model::merge::{Tombstones, merge_versions};
+use forge_model::row::SpanRow;
+use forge_storage::DurableLocalFs;
+use forge_storage::{BuiltStore, ScanRequest, SegmentStore, VortexSegmentStore};
+use futures::TryStreamExt;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+struct Stack {
+    meta: Arc<dyn Metastore>,
+    segs: Arc<VortexSegmentStore>,
+}
+
+fn stack(root: &Path) -> Stack {
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    Stack {
+        meta: Arc::new(SqliteMetastore::open_path(&root.join("meta.db")).unwrap()),
+        segs: Arc::new(VortexSegmentStore::new(BuiltStore {
+            store: Arc::new(DurableLocalFs::new(data.clone()).unwrap()),
+            local_root: Some(data),
+        })),
+    }
+}
+
+fn options(root: &Path, flush_bytes: usize, seg: u64) -> ForgeConfig {
+    let mut c = ForgeConfig::default();
+    c.node.id = "node-1".into();
+    c.wal.dir = root.join("wal");
+    c.wal.segment_bytes = ByteSize::b(seg);
+    c.memtable.flush_bytes = ByteSize::b(flush_bytes as u64);
+    c.memtable.flush_interval = Duration::from_secs(3600);
+    c.memtable.memory_budget = ByteSize::gib(1);
+    c
+}
+
+async fn open(root: &Path, s: &Stack, flush_bytes: usize, seg: u64) -> (Arc<Pipeline>, OpenReport) {
+    Pipeline::open(&options(root, flush_bytes, seg), s.meta.clone(), s.segs.clone())
+        .await
+        .unwrap()
+}
+
+/// Every row of every visible segment (raw, unmerged across segments).
+async fn visible_raw(s: &Stack) -> Vec<arrow::array::RecordBatch> {
+    let mut out = Vec::new();
+    for seg in s.meta.list_segments(&SegmentFilter::default()).await.unwrap() {
+        let b: Vec<_> = s
+            .segs
+            .scan(&seg, ScanRequest::default())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        out.extend(b);
+    }
+    out
+}
+fn count(b: &[arrow::array::RecordBatch]) -> usize {
+    b.iter().map(|b| b.num_rows()).sum()
+}
+
+fn start(project: &str, trace: u64, span: u64) -> SpanRow {
+    SpanRow {
+        project_id: Some(pid(project)),
+        trace_id: tid(trace),
+        span_id: sid(span),
+        name: Some(format!("span-{span}")),
+        start_time_ns: Some(1_700_000_000_000_000_000 + span as i64),
+        inputs: Some(format!("{{\"q\":{span}}}")),
+        ..Default::default()
+    }
+}
+fn end(project: &str, trace: u64, span: u64) -> SpanRow {
+    SpanRow {
+        project_id: Some(pid(project)),
+        trace_id: tid(trace),
+        span_id: sid(span),
+        end_time_ns: Some(1_700_000_000_000_000_999 + span as i64),
+        outputs: Some(format!("{{\"a\":{span}}}")),
+        ..Default::default()
+    }
+}
+fn project_of(span: u64) -> &'static str {
+    ["alpha", "beta", "gamma"][(span % 3) as usize]
+}
+
+/// `n` spans [from, from+n): 8 concurrent clients, each span = one start post + one end post
+/// (separate requests, so versions differ and they may land in different memtables).
+async fn ingest_spans(ing: &Arc<Pipeline>, from: u64, n: u64, with_end: bool) {
+    let mut tasks = Vec::new();
+    for c in 0..8 {
+        let ing = ing.clone();
+        tasks.push(tokio::spawn(async move {
+            for s in (from + c..from + n).step_by(8) {
+                ing.submit(vec![start(project_of(s), s / 10, s)]).await.unwrap();
+                if with_end {
+                    ing.submit(vec![end(project_of(s), s / 10, s)]).await.unwrap();
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_commit_truncate_restart_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let (ing, rep) = open(root, &s, 1 << 30, 16 << 10).await;
+    assert_eq!((rep.replay.applied, rep.next_version), (0, 1));
+    ingest_spans(&ing, 0, 400, true).await;
+    let r = ing.flush_now().await.unwrap().unwrap();
+    assert_eq!(r.segments.len(), 3, "one L0 segment per project");
+    assert_eq!(
+        (r.rows_in, r.rows_out),
+        (800, 400),
+        "start+end merged into one row per span"
+    );
+    assert_eq!(r.watermark, 800);
+    assert!(r.wal_segments_deleted > 0);
+    let cp = s.meta.wal_checkpoint("node-1").await.unwrap().unwrap();
+    assert_eq!((cp.flushed_seq, cp.max_version), (800, 800));
+    let rows = rows_from_batch(&merge_versions(&visible_raw(&s).await, Tombstones::Keep).unwrap());
+    assert_eq!(rows.len(), 400);
+    assert!(
+        rows.iter()
+            .all(|r| r.name.is_some() && r.end_time_ns.is_some() && r.outputs.is_some())
+    );
+
+    // 100 new spans (start only) + end posts for 50 spans already flushed; then "crash" (no flush).
+    ingest_spans(&ing, 400, 100, false).await;
+    for sp in 0..50 {
+        ing.submit(vec![end(project_of(sp), sp / 10, sp)]).await.unwrap();
+    }
+    drop(ing);
+
+    let (ing, rep) = open(root, &s, 1 << 30, 16 << 10).await;
+    assert_eq!(
+        (rep.replay.applied, rep.replay.next_seq, rep.next_version),
+        (150, 951, 951)
+    );
+    assert_eq!(ing.memtable().last_seq(), 950);
+    ing.flush_now().await.unwrap().unwrap();
+    let raw = visible_raw(&s).await;
+    assert_eq!(count(&raw), 400 + 100 + 50, "no WAL record flushed twice");
+    let merged = merge_versions(&raw, Tombstones::Keep).unwrap();
+    assert_eq!(merged.num_rows(), 500);
+    assert_eq!(s.meta.wal_checkpoint("node-1").await.unwrap().unwrap().flushed_seq, 950);
+    // versions continue after restart: the new writes got 801..950, next is 951
+    assert_eq!(s.meta.max_version().await.unwrap(), 950);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_commit_before_truncate_skips_by_watermark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let (ing, _) = open(root, &s, 1 << 30, 8 << 10).await;
+    ingest_spans(&ing, 0, 200, false).await;
+    let wal = root.join("wal/node-1");
+    let saved = root.join("wal-copy");
+    std::fs::create_dir_all(&saved).unwrap();
+    for e in std::fs::read_dir(&wal).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "wal") {
+            std::fs::copy(&p, saved.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let r = ing.flush_now().await.unwrap().unwrap();
+    assert!(r.wal_segments_deleted > 0);
+    drop(ing);
+    // Undo the truncation = the process died between commit_flush and truncate.
+    for e in std::fs::read_dir(&saved).unwrap() {
+        let p = e.unwrap().path();
+        std::fs::copy(&p, wal.join(p.file_name().unwrap())).unwrap();
+    }
+    let (ing, rep) = open(root, &s, 1 << 30, 8 << 10).await;
+    assert_eq!((rep.replay.applied, rep.replay.skipped), (0, 200));
+    assert!(ing.flush_now().await.unwrap().is_none());
+    assert_eq!(count(&visible_raw(&s).await), 200);
+    // startup truncation removed the stale sealed files
+    assert_eq!(forge_ingest::wal::list_segments(&wal).unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orphan_upload_before_commit_is_invisible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let (ing, _) = open(root, &s, 1 << 30, 1 << 20).await;
+    ingest_spans(&ing, 0, 99, false).await;
+    // "Upload then die before commit": write a segment of the memtable's rows, never commit it.
+    let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
+    let merged = merge_versions(&snap.batches, Tombstones::Keep).unwrap();
+    let alpha = forge_model::merge::split_by_project(&merged).unwrap().remove(0);
+    let spec = forge_storage::SegmentSpec {
+        id: forge_model::catalog::SegmentId::new(),
+        project_id: alpha.0,
+        level: forge_model::catalog::Level::L0,
+        partition_hour: forge_model::catalog::HourBucket(0),
+    };
+    use futures::StreamExt;
+    s.segs
+        .write_segment(spec, futures::stream::iter([Ok(alpha.1)]).boxed())
+        .await
+        .unwrap();
+    drop(ing);
+    let (ing, rep) = open(root, &s, 1 << 30, 1 << 20).await;
+    assert_eq!(rep.replay.applied, 99);
+    ing.flush_now().await.unwrap().unwrap();
+    assert_eq!(
+        count(&visible_raw(&s).await),
+        99,
+        "orphan not visible, rows exactly once"
+    );
+    let files = walk(&root.join("data"));
+    assert_eq!(
+        files.iter().filter(|p| p.ends_with(".vortex")).count(),
+        4,
+        "3 committed + 1 orphan for GC"
+    );
+}
+
+fn walk(d: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(d).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p.display().to_string());
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_flushes_when_over_flush_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let (ing, _) = open(root, &s, 1 << 30, 64 << 10).await;
+    ingest_spans(&ing, 0, 600, true).await;
+    drop(ing);
+    // Restart with a small flush_bytes: replay must flush as it goes (bounded memory).
+    let (ing, rep) = open(root, &s, 128 << 10, 64 << 10).await;
+    assert_eq!(rep.replay.applied, 1200);
+    assert!(rep.replay_flushes >= 2, "{rep:?}");
+    ing.flush_now().await.unwrap();
+    let raw = visible_raw(&s).await;
+    let merged = merge_versions(&raw, Tombstones::Keep).unwrap();
+    assert_eq!(merged.num_rows(), 600);
+    assert!(count(&raw) <= 1200);
+    assert_eq!(
+        s.meta.wal_checkpoint("node-1").await.unwrap().unwrap().flushed_seq,
+        1200
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_flushes_keep_the_watermark_honest() {
+    // Invariant 7 under load: flushes freeze while 8 writers are mid-append.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let (ing, _) = open(root, &s, 1 << 30, 32 << 10).await;
+    let w = {
+        let ing = ing.clone();
+        tokio::spawn(async move { ingest_spans(&ing, 0, 2000, false).await })
+    };
+    let mut flushes = 0;
+    while !w.is_finished() {
+        if ing.flush_now().await.unwrap().is_some() {
+            flushes += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    w.await.unwrap();
+    drop(ing); // crash: whatever is unflushed must come back from the WAL, and nothing twice
+    let (ing, rep) = open(root, &s, 1 << 30, 32 << 10).await;
+    ing.flush_now().await.unwrap();
+    let raw = visible_raw(&s).await;
+    eprintln!(
+        "flushes during load: {flushes}; replayed after crash: {}",
+        rep.replay.applied
+    );
+    assert!(flushes >= 2);
+    assert_eq!(count(&raw), 2000, "every acked span exactly once");
+    assert_eq!(merge_versions(&raw, Tombstones::Keep).unwrap().num_rows(), 2000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backpressure_over_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let mut o = options(root, 1 << 30, 1 << 20);
+    o.memtable.memory_budget = ByteSize::kib(20);
+    let (ing, _) = Pipeline::open(&o, s.meta.clone(), s.segs.clone()).await.unwrap();
+    let mut n = 0;
+    let err = loop {
+        match ing.submit(vec![start("alpha", 1, n)]).await {
+            Ok(_) => n += 1,
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(err, IngestError::Backpressure) && n >= 2, "{err} after {n}");
+    eprintln!(
+        "backpressure after {n} one-row writes ({} B accounted)",
+        ing.memtable().unflushed_bytes()
+    );
+    ing.flush_now().await.unwrap();
+    ing.submit(vec![start("alpha", 1, 999)]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acked_is_queryable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
+    let ack = ing
+        .submit(vec![start("alpha", 1, 1), end("alpha", 1, 1)])
+        .await
+        .unwrap();
+    assert_eq!((ack.rows, ack.versions.clone()), (2, 1..3));
+    let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
+    assert_eq!(count(&snap.batches), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_offload_through_submit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
+    let mut r = start("default", 1, 1);
+    r.inputs = Some(format!("\"{}\"", "x".repeat(2 << 20)));
+    ing.submit(vec![r]).await.unwrap();
+    let snap = forge_model::MemtableView::snapshot(&*ing.memtable());
+    let rows = rows_from_batch(&snap.batches[0]);
+    let (path, size) = forge_model::blob::parse_blob_ref(rows[0].inputs.as_deref().unwrap()).unwrap();
+    assert_eq!(size, (2 << 20) + 2);
+    assert!(tmp.path().join("data").join(path).is_file());
+    assert!(path.starts_with("blobs/default/"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn versions_survive_wiped_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
+    ing.submit(vec![start("alpha", 1, 1), start("alpha", 1, 2)])
+        .await
+        .unwrap();
+    ing.flush_now().await.unwrap().unwrap();
+    let mv = s.meta.max_version().await.unwrap();
+    drop(ing);
+    std::fs::remove_dir_all(tmp.path().join("wal")).unwrap();
+    let (ing, rep) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
+    assert!(rep.next_version > mv);
+    let ack = ing.submit(vec![start("alpha", 1, 3)]).await.unwrap();
+    assert!(ack.versions.start > mv);
+}
+
+#[tokio::test]
+async fn object_store_wal_mode_is_unimplemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let mut o = options(tmp.path(), 1 << 30, 1 << 20);
+    o.wal.mode = forge_model::config::WalMode::ObjectStore;
+    let e = Pipeline::open(&o, s.meta.clone(), s.segs.clone()).await.unwrap_err();
+    assert!(matches!(e, IngestError::Unimplemented(_)), "{e}");
+}
+
+#[tokio::test]
+async fn close_wal_and_flush_all_on_current_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 1 << 30, 1 << 20).await;
+    ing.submit(vec![start("alpha", 1, 1)]).await.unwrap();
+    ing.close_wal().await;
+    let e = ing.submit(vec![start("alpha", 1, 2)]).await.unwrap_err();
+    assert!(
+        matches!(e, IngestError::Wal(forge_ingest::wal::WalError::Closed)),
+        "{e}"
+    );
+    ing.flush_all().await.unwrap();
+    assert_eq!(count(&visible_raw(&s).await), 1);
+}

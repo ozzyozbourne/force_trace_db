@@ -1,0 +1,522 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "rag-service"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.38.0"
+            }
+          },
+          {
+            "key": "openinference.project.name",
+            "value": {
+              "stringValue": "support-bot"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "openinference.instrumentation.langchain",
+            "version": "0.1.50"
+          },
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "parentSpanId": "",
+              "name": "RunnableSequence",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200000000000",
+              "attributes": [
+                {
+                  "key": "openinference.span.kind",
+                  "value": {
+                    "stringValue": "CHAIN"
+                  }
+                },
+                {
+                  "key": "input.value",
+                  "value": {
+                    "stringValue": "What is the refund policy?"
+                  }
+                },
+                {
+                  "key": "input.mime_type",
+                  "value": {
+                    "stringValue": "text/plain"
+                  }
+                },
+                {
+                  "key": "output.value",
+                  "value": {
+                    "stringValue": "You can request a refund within 30 days of purchase."
+                  }
+                },
+                {
+                  "key": "output.mime_type",
+                  "value": {
+                    "stringValue": "text/plain"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-7f3a"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "user-123"
+                  }
+                },
+                {
+                  "key": "metadata",
+                  "value": {
+                    "stringValue": "{\"env\": \"prod\", \"customer_tier\": \"gold\"}"
+                  }
+                },
+                {
+                  "key": "tag.tags",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "rag"
+                        },
+                        {
+                          "stringValue": "prod"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663202300000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "1111111111111111",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "VectorStoreRetriever",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200005000000",
+              "attributes": [
+                {
+                  "key": "openinference.span.kind",
+                  "value": {
+                    "stringValue": "RETRIEVER"
+                  }
+                },
+                {
+                  "key": "input.value",
+                  "value": {
+                    "stringValue": "What is the refund policy?"
+                  }
+                },
+                {
+                  "key": "retrieval.documents.0.document.id",
+                  "value": {
+                    "stringValue": "doc-17"
+                  }
+                },
+                {
+                  "key": "retrieval.documents.0.document.score",
+                  "value": {
+                    "doubleValue": 0.91
+                  }
+                },
+                {
+                  "key": "retrieval.documents.0.document.content",
+                  "value": {
+                    "stringValue": "Refunds are accepted within 30 days of purchase."
+                  }
+                },
+                {
+                  "key": "retrieval.documents.0.document.metadata",
+                  "value": {
+                    "stringValue": "{\"source\": \"policy.md\"}"
+                  }
+                },
+                {
+                  "key": "retrieval.documents.1.document.id",
+                  "value": {
+                    "stringValue": "doc-4"
+                  }
+                },
+                {
+                  "key": "retrieval.documents.1.document.score",
+                  "value": {
+                    "doubleValue": 0.62
+                  }
+                },
+                {
+                  "key": "retrieval.documents.1.document.content",
+                  "value": {
+                    "stringValue": "Shipping takes 3-5 business days."
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-7f3a"
+                  }
+                },
+                {
+                  "key": "metadata",
+                  "value": {
+                    "stringValue": "{\"env\": \"prod\"}"
+                  }
+                },
+                {
+                  "key": "tag.tags",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "rag"
+                        },
+                        {
+                          "stringValue": "prod"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200300000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "2222222222222222",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "ChatPromptTemplate",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200310000000",
+              "attributes": [
+                {
+                  "key": "openinference.span.kind",
+                  "value": {
+                    "stringValue": "CHAIN"
+                  }
+                },
+                {
+                  "key": "input.value",
+                  "value": {
+                    "stringValue": "{\"question\": \"What is the refund policy?\", \"context\": \"Refunds are accepted within 30 days of purchase.\"}"
+                  }
+                },
+                {
+                  "key": "input.mime_type",
+                  "value": {
+                    "stringValue": "application/json"
+                  }
+                },
+                {
+                  "key": "llm.prompt_template.template",
+                  "value": {
+                    "stringValue": "Answer using the context.\n\nContext: {context}"
+                  }
+                },
+                {
+                  "key": "llm.prompt_template.variables",
+                  "value": {
+                    "stringValue": "{\"context\": \"Refunds are accepted within 30 days of purchase.\"}"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-7f3a"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200320000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "3333333333333333",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "ChatOpenAI",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200330000000",
+              "attributes": [
+                {
+                  "key": "openinference.span.kind",
+                  "value": {
+                    "stringValue": "LLM"
+                  }
+                },
+                {
+                  "key": "llm.model_name",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "llm.provider",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "llm.system",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "llm.invocation_parameters",
+                  "value": {
+                    "stringValue": "{\"model\": \"gpt-4o-mini\", \"temperature\": 0.0, \"stream\": false}"
+                  }
+                },
+                {
+                  "key": "llm.input_messages.0.message.role",
+                  "value": {
+                    "stringValue": "system"
+                  }
+                },
+                {
+                  "key": "llm.input_messages.0.message.content",
+                  "value": {
+                    "stringValue": "Answer using the context.\n\nContext: Refunds are accepted within 30 days of purchase."
+                  }
+                },
+                {
+                  "key": "llm.input_messages.1.message.role",
+                  "value": {
+                    "stringValue": "user"
+                  }
+                },
+                {
+                  "key": "llm.input_messages.1.message.content",
+                  "value": {
+                    "stringValue": "What is the refund policy?"
+                  }
+                },
+                {
+                  "key": "llm.output_messages.0.message.role",
+                  "value": {
+                    "stringValue": "assistant"
+                  }
+                },
+                {
+                  "key": "llm.output_messages.0.message.content",
+                  "value": {
+                    "stringValue": "You can request a refund within 30 days of purchase."
+                  }
+                },
+                {
+                  "key": "llm.token_count.prompt",
+                  "value": {
+                    "intValue": "52"
+                  }
+                },
+                {
+                  "key": "llm.token_count.completion",
+                  "value": {
+                    "intValue": "12"
+                  }
+                },
+                {
+                  "key": "llm.token_count.total",
+                  "value": {
+                    "intValue": "64"
+                  }
+                },
+                {
+                  "key": "llm.token_count.prompt_details.cache_read",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "input.value",
+                  "value": {
+                    "stringValue": "{\"messages\": [[{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"SystemMessage\"], \"kwargs\": {\"content\": \"Answer using the context.\\n\\nContext: Refunds are accepted within 30 days of purchase.\"}}, {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"HumanMessage\"], \"kwargs\": {\"content\": \"What is the refund policy?\"}}]]}"
+                  }
+                },
+                {
+                  "key": "input.mime_type",
+                  "value": {
+                    "stringValue": "application/json"
+                  }
+                },
+                {
+                  "key": "output.value",
+                  "value": {
+                    "stringValue": "{\"generations\": [[{\"text\": \"You can request a refund within 30 days of purchase.\", \"type\": \"ChatGeneration\"}]], \"llm_output\": {\"model_name\": \"gpt-4o-mini-2024-07-18\"}}"
+                  }
+                },
+                {
+                  "key": "output.mime_type",
+                  "value": {
+                    "stringValue": "application/json"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-7f3a"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "user-123"
+                  }
+                },
+                {
+                  "key": "metadata",
+                  "value": {
+                    "stringValue": "{\"ls_provider\": \"openai\", \"ls_model_name\": \"gpt-4o-mini\", \"env\": \"prod\"}"
+                  }
+                },
+                {
+                  "key": "tag.tags",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "rag"
+                        },
+                        {
+                          "stringValue": "prod"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663202200000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "4444444444444444",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "lookup_order",
+              "kind": 1,
+              "startTimeUnixNano": "1792663202210000000",
+              "attributes": [
+                {
+                  "key": "openinference.span.kind",
+                  "value": {
+                    "stringValue": "TOOL"
+                  }
+                },
+                {
+                  "key": "tool.name",
+                  "value": {
+                    "stringValue": "lookup_order"
+                  }
+                },
+                {
+                  "key": "tool.description",
+                  "value": {
+                    "stringValue": "Look up an order by id"
+                  }
+                },
+                {
+                  "key": "tool.parameters",
+                  "value": {
+                    "stringValue": "{\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\"}}}"
+                  }
+                },
+                {
+                  "key": "input.value",
+                  "value": {
+                    "stringValue": "{\"order_id\": \"A-1001\"}"
+                  }
+                },
+                {
+                  "key": "input.mime_type",
+                  "value": {
+                    "stringValue": "application/json"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "sess-7f3a"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663202290000000",
+              "status": {
+                "code": 2,
+                "message": "KeyError: 'A-1001'"
+              },
+              "events": [
+                {
+                  "timeUnixNano": "1792663202289000000",
+                  "name": "exception",
+                  "attributes": [
+                    {
+                      "key": "exception.type",
+                      "value": {
+                        "stringValue": "KeyError"
+                      }
+                    },
+                    {
+                      "key": "exception.message",
+                      "value": {
+                        "stringValue": "'A-1001'"
+                      }
+                    },
+                    {
+                      "key": "exception.stacktrace",
+                      "value": {
+                        "stringValue": "Traceback (most recent call last):\n  File \"tools.py\", line 12, in lookup_order\nKeyError: 'A-1001'"
+                      }
+                    },
+                    {
+                      "key": "exception.escaped",
+                      "value": {
+                        "stringValue": "False"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

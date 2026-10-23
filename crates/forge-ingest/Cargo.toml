@@ -10,8 +10,30 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+arrow.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+crc32fast.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+opentelemetry-proto.workspace = true
 forge-model.workspace = true
 forge-meta.workspace = true
 forge-storage.workspace = true
 forge-index.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+forge-model = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+bytesize.workspace = true
+proptest.workspace = true

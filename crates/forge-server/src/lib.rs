@@ -5,7 +5,8 @@ mod app;
 mod error;
 mod listeners;
 mod ops;
-mod otlp;
+pub mod otlp;
+mod tasks;
 
 pub use api::api_router;
 pub use app::{AppState, Forge};

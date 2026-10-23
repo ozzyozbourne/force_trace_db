@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+forge-storage.workspace = true
 forge-model.workspace = true
 forge-server.workspace = true
 clap.workspace = true
@@ -19,6 +20,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+forge-meta.workspace = true
+forge-storage.workspace = true
+forge-ingest.workspace = true
+prost.workspace = true
+futures.workspace = true
+forge-model = { workspace = true, features = ["test-util"] }
 reqwest.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true

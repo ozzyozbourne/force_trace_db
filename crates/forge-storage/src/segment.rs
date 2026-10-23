@@ -13,6 +13,7 @@ use forge_model::catalog::{SegmentMeta, SegmentState, TraceRange, paths};
 use forge_model::error::ModelError;
 use forge_model::ids::TraceId;
 use forge_model::row::validate_batch;
+use forge_model::schema::PAYLOAD_COLUMNS;
 use forge_model::schema::{SPANS_SCHEMA_VERSION, col, projected_schema, spans_schema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
@@ -25,20 +26,33 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ArrowSessionExt;
+use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::dtype::DType;
+use vortex::dtype::FieldPath;
 use vortex::error::VortexResult;
 use vortex::expr::{root, select};
+use vortex::file::WriteStrategyBuilder;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::session::RuntimeSessionExt;
+use vortex::layout::LayoutStrategy;
 use vortex::session::VortexSession;
 
-#[derive(Debug)]
 pub struct VortexSegmentStore {
     store: Arc<dyn ObjectStore>,
     local_root: Option<PathBuf>,
     session: VortexSession,
     /// spans_schema as a Vortex dtype, converted once.
     dtype: DType,
+    strategy: Arc<dyn LayoutStrategy>,
+}
+
+impl std::fmt::Debug for VortexSegmentStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VortexSegmentStore")
+            .field("store", &self.store)
+            .field("local_root", &self.local_root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VortexSegmentStore {
@@ -48,11 +62,13 @@ impl VortexSegmentStore {
             .arrow()
             .from_arrow_schema(&spans_schema())
             .expect("the static spans schema converts to a Vortex dtype");
+        let strategy = segment_strategy(&session);
         Self {
             store: built.store,
             local_root: built.local_root,
             session,
             dtype,
+            strategy,
         }
     }
     /// Some(absolute root) for file:// stores.
@@ -224,6 +240,8 @@ impl SegmentStore for VortexSegmentStore {
         let written = self
             .session
             .write_options()
+            .with_strategy(self.strategy.clone())
+            .with_metadata_segment(crate::inspect::FORGE_META_KEY, spec_json(&spec).into_bytes())
             .write(&mut buf, ArrayStreamAdapter::new(dtype, stream))
             .await
             .map(drop)
@@ -311,6 +329,36 @@ impl SegmentStore for VortexSegmentStore {
     fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
     }
+}
+
+/// Scalar columns: 1024-row blocks (zone maps + chunks), default BtrBlocks (fast decode).
+/// Payload columns (inputs, outputs, events, attributes): 64-row chunks, compact preset (Zstd).
+fn segment_strategy(session: &VortexSession) -> Arc<dyn LayoutStrategy> {
+    let mut b = WriteStrategyBuilder::from_session(session)
+        .with_row_block_size(1024)
+        .with_data_block_target_bytes(None);
+    for c in PAYLOAD_COLUMNS {
+        let payload = WriteStrategyBuilder::from_session(session)
+            .with_row_block_size(64)
+            .with_data_block_target_bytes(None)
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact())
+            .build();
+        b = b.with_field_writer(FieldPath::from_name(c), payload);
+    }
+    b.build()
+}
+
+/// The `forge.segment` metadata: every value is from a safe charset, so no serde.
+fn spec_json(spec: &SegmentSpec) -> String {
+    format!(
+        r#"{{"segment_id":"{}","project_id":"{}","level":"{:?}","partition_hour":{},"schema_version":{},"created_at_ms":{}}}"#,
+        spec.id,
+        spec.project_id,
+        spec.level,
+        spec.partition_hour.0,
+        SPANS_SCHEMA_VERSION,
+        forge_model::time::now_ms()
+    )
 }
 
 #[cfg(test)]

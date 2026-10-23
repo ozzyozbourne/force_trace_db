@@ -7,6 +7,9 @@ url = "sqlite:///var/lib/forge/meta.db"   # or postgres://…
 [wal]
 mode = "local"   # local | object_store
 dir = "/var/lib/forge/wal"
+segment_bytes = "64MiB"
+group_commit_max_bytes = "1MiB"
+group_commit_max_delay = "10ms"
 
 [memtable]
 flush_bytes = "64MiB"
@@ -25,3 +28,8 @@ concurrency = 2
 [query]
 memory_limit = "2GiB"
 timeout = "30s"
+
+[ingest]
+default_project = "default"
+blob_threshold = "1MiB"
+max_request_bytes = "64MiB"

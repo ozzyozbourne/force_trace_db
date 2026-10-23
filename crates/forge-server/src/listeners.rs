@@ -36,10 +36,16 @@ pub async fn serve_axum(name: &'static str, l: TcpListener, app: Router, tok: Ca
     Ok(())
 }
 
-pub async fn serve_grpc(inc: TcpIncoming, tok: CancellationToken) -> anyhow::Result<()> {
+pub async fn serve_grpc(
+    inc: TcpIncoming,
+    svc: opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer<
+        crate::otlp::OtlpReceiver,
+    >,
+    tok: CancellationToken,
+) -> anyhow::Result<()> {
     tracing::info!(name = "otlp-grpc", addr = %inc.local_addr()?, "listening");
     tonic::transport::Server::builder()
-        .add_service(crate::otlp::grpc_service())
+        .add_service(svc)
         .serve_with_incoming_shutdown(inc, tok.cancelled_owned())
         .await?;
     tracing::info!(name = "otlp-grpc", "stopped");

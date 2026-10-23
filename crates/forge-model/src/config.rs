@@ -23,6 +23,7 @@ pub struct ForgeConfig {
     pub cache: CacheConfig,
     pub compaction: CompactionConfig,
     pub query: QueryConfig,
+    pub ingest: IngestConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +75,23 @@ pub enum WalMode {
 pub struct WalConfig {
     pub mode: WalMode,
     pub dir: PathBuf,
+    /// Rotate WAL files at this size.
+    pub segment_bytes: ByteSize,
+    pub group_commit_max_bytes: ByteSize,
+    #[serde(with = "humantime_serde")]
+    pub group_commit_max_delay: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IngestConfig {
+    /// Project for spans with no x-forge-project header and no project resource attribute.
+    #[serde(deserialize_with = "string_or_scalar")]
+    pub default_project: String,
+    /// Payload columns longer than this go to blobs/<project>/<sha256>.
+    pub blob_threshold: ByteSize,
+    /// Wire and decoded body cap for OTLP gRPC and HTTP.
+    pub max_request_bytes: ByteSize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,15 +182,28 @@ impl ForgeConfig {
         }
         let cfg: Self = fig.extract()?;
         // node.id names the WAL prefix and the checkpoint owner (M1).
-        if cfg.node.id.trim().is_empty() {
-            return Err(figment::Error::from("node.id must not be empty".to_string()));
+        use crate::ids::ProjectId;
+        ProjectId::new(cfg.node.id.clone()).map_err(|e| figment::Error::from(format!("node.id: {e}")))?;
+        ProjectId::new(cfg.ingest.default_project.clone())
+            .map_err(|e| figment::Error::from(format!("ingest.default_project: {e}")))?;
+        if cfg.memtable.flush_bytes > cfg.memtable.memory_budget {
+            return Err(figment::Error::from(
+                "memtable.flush_bytes must be <= memtable.memory_budget".to_string(),
+            ));
         }
         Ok(cfg)
     }
 }
 
 /// Config keys whose type is String or PathBuf: env overrides keep their exact text.
-const RAW_ENV_KEYS: [&str; 5] = ["node.id", "storage.url", "metastore.url", "wal.dir", "cache.disk_dir"];
+const RAW_ENV_KEYS: [&str; 6] = [
+    "node.id",
+    "storage.url",
+    "metastore.url",
+    "wal.dir",
+    "cache.disk_dir",
+    "ingest.default_project",
+];
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -213,6 +244,9 @@ impl Default for WalConfig {
         Self {
             mode: WalMode::Local,
             dir: "./forge-data/wal".into(),
+            segment_bytes: ByteSize::mib(64),
+            group_commit_max_bytes: ByteSize::mib(1),
+            group_commit_max_delay: Duration::from_millis(10),
         }
     }
 }
@@ -251,6 +285,16 @@ impl Default for QueryConfig {
         Self {
             memory_limit: ByteSize::gib(2),
             timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            default_project: "default".into(),
+            blob_threshold: ByteSize::mib(1),
+            max_request_bytes: ByteSize::mib(64),
         }
     }
 }

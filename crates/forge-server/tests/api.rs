@@ -12,6 +12,8 @@ async fn forge() -> Arc<Forge> {
     let mut cfg = ForgeConfig::default();
     cfg.metastore.url = "sqlite::memory:".into();
     cfg.storage.url = "memory://".into();
+    // leaked tempdir: the WAL lock must be per test
+    cfg.wal.dir = tempfile::tempdir().unwrap().keep();
     Forge::open(cfg).await.unwrap()
 }
 

@@ -9,10 +9,11 @@ use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use std::sync::Arc;
 
+pub mod inspect;
 pub mod segment;
 pub mod store;
 pub use segment::VortexSegmentStore;
-pub use store::{BuiltStore, build_object_store, file_url_path};
+pub use store::{BuiltStore, DurableLocalFs, build_object_store, file_url_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {

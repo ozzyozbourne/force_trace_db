@@ -1,0 +1,352 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "langgraph-calculator"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.38.0"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.langchain",
+            "version": "0.47.3"
+          },
+          "spans": [
+            {
+              "traceId": "0af7651916cd43dd8448eb211c80319c",
+              "spanId": "b7ad6b7169203331",
+              "parentSpanId": "c1d2e3f4a5b6c7d8",
+              "name": "openai.chat",
+              "kind": 3,
+              "startTimeUnixNano": "1792663200040000000",
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "llm.request.type",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-4o"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-2024-08-06"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.id",
+                  "value": {
+                    "stringValue": "chatcmpl-AbC123"
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"system\", \"parts\": [{\"type\": \"text\", \"content\": \"You are a mathematician.\"}]}, {\"role\": \"user\", \"parts\": [{\"type\": \"text\", \"content\": \"What's 5 + 5?\"}]}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"assistant\", \"parts\": [{\"type\": \"text\", \"content\": \"5 + 5 = 10.\"}], \"finish_reason\": \"stop\"}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "stop"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "24"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "11"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.total_tokens",
+                  "value": {
+                    "intValue": "35"
+                  }
+                },
+                {
+                  "key": "traceloop.workflow.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.path",
+                  "value": {
+                    "stringValue": "LangGraph.calculate"
+                  }
+                },
+                {
+                  "key": "traceloop.association.properties.thread_id",
+                  "value": {
+                    "stringValue": "thread-42"
+                  }
+                },
+                {
+                  "key": "traceloop.association.properties.langgraph_node",
+                  "value": {
+                    "stringValue": "calculate"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200900000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "0af7651916cd43dd8448eb211c80319c",
+              "spanId": "c1d2e3f4a5b6c7d8",
+              "parentSpanId": "a1a2a3a4a5a6a7a8",
+              "name": "execute_task calculate",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200020000000",
+              "attributes": [
+                {
+                  "key": "traceloop.span.kind",
+                  "value": {
+                    "stringValue": "task"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.name",
+                  "value": {
+                    "stringValue": "calculate"
+                  }
+                },
+                {
+                  "key": "traceloop.workflow.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.path",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "langgraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_task"
+                  }
+                },
+                {
+                  "key": "gen_ai.task.name",
+                  "value": {
+                    "stringValue": "calculate"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.input",
+                  "value": {
+                    "stringValue": "{\"inputs\": {\"request\": \"What's 5 + 5?\"}, \"tags\": [\"graph:step:1\"], \"metadata\": {\"langgraph_step\": 1, \"langgraph_node\": \"calculate\", \"thread_id\": \"thread-42\"}, \"kwargs\": {\"name\": \"calculate\"}}"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.output",
+                  "value": {
+                    "stringValue": "{\"outputs\": {\"result\": \"5 + 5 = 10.\"}, \"kwargs\": {\"tags\": [\"graph:step:1\"]}}"
+                  }
+                },
+                {
+                  "key": "traceloop.association.properties.thread_id",
+                  "value": {
+                    "stringValue": "thread-42"
+                  }
+                },
+                {
+                  "key": "traceloop.association.properties.langgraph_node",
+                  "value": {
+                    "stringValue": "calculate"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200920000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "0af7651916cd43dd8448eb211c80319c",
+              "spanId": "a1a2a3a4a5a6a7a8",
+              "parentSpanId": "f0e1d2c3b4a59687",
+              "name": "LangGraph.workflow",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200010000000",
+              "attributes": [
+                {
+                  "key": "traceloop.span.kind",
+                  "value": {
+                    "stringValue": "workflow"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "traceloop.workflow.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "langgraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "invoke_agent"
+                  }
+                },
+                {
+                  "key": "gen_ai.agent.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.input",
+                  "value": {
+                    "stringValue": "{\"inputs\": {\"request\": \"What's 5 + 5?\"}, \"tags\": [], \"metadata\": {\"thread_id\": \"thread-42\"}, \"kwargs\": {\"name\": \"LangGraph\"}}"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.output",
+                  "value": {
+                    "stringValue": "{\"outputs\": {\"request\": \"What's 5 + 5?\", \"result\": \"5 + 5 = 10.\"}, \"kwargs\": {\"tags\": []}}"
+                  }
+                },
+                {
+                  "key": "traceloop.association.properties.thread_id",
+                  "value": {
+                    "stringValue": "thread-42"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200940000000",
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "0af7651916cd43dd8448eb211c80319c",
+              "spanId": "f0e1d2c3b4a59687",
+              "parentSpanId": "",
+              "name": "invoke_agent LangGraph",
+              "kind": 1,
+              "startTimeUnixNano": "1792663200000000000",
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "invoke_agent"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "langgraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.agent.name",
+                  "value": {
+                    "stringValue": "LangGraph"
+                  }
+                },
+                {
+                  "key": "gen_ai.workflow.nodes",
+                  "value": {
+                    "stringValue": "[\"calculate\"]"
+                  }
+                },
+                {
+                  "key": "gen_ai.workflow.edges",
+                  "value": {
+                    "stringValue": "[[\"__start__\", \"calculate\"], [\"calculate\", \"__end__\"]]"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1792663200950000000",
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

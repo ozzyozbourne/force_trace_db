@@ -229,6 +229,87 @@ pub fn validate_batch(b: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+/// Inverse of `SpanBatchBuilder`: a spans_schema batch -> rows.
+pub fn rows_from_batch(b: &RecordBatch) -> Result<Vec<SpanRow>> {
+    use arrow::datatypes::{Float64Type, Int64Type, TimestampNanosecondType};
+    validate_batch(b)?;
+    let s = |c: &str| b.column(col_idx(c)).as_string::<i32>().clone();
+    let bin = |c: &str| b.column(col_idx(c)).as_binary::<i32>().clone();
+    let i64c = |c: &str| b.column(col_idx(c)).as_primitive::<Int64Type>().clone();
+    let ts = |c: &str| b.column(col_idx(c)).as_primitive::<TimestampNanosecondType>().clone();
+    let (p, t, sp, par) = (
+        s(col::PROJECT_ID),
+        bin(col::TRACE_ID),
+        bin(col::SPAN_ID),
+        bin(col::PARENT_SPAN_ID),
+    );
+    let (dot, name, rt, st, et) = (
+        s(col::DOTTED_ORDER),
+        s(col::NAME),
+        s(col::RUN_TYPE),
+        ts(col::START_TIME),
+        ts(col::END_TIME),
+    );
+    let (stat, err, model, prov) = (s(col::STATUS), s(col::ERROR), s(col::MODEL), s(col::PROVIDER));
+    let (pt, ct, tt) = (
+        i64c(col::PROMPT_TOKENS),
+        i64c(col::COMPLETION_TOKENS),
+        i64c(col::TOTAL_TOKENS),
+    );
+    let cost = b.column(col_idx(col::COST_USD)).as_primitive::<Float64Type>().clone();
+    let sess = s(col::SESSION_ID);
+    let tags = b.column(col_idx(col::TAGS)).as_list::<i32>().clone();
+    let (md, at, ev, inp, outp) = (
+        s(col::METADATA),
+        s(col::ATTRIBUTES),
+        s(col::EVENTS),
+        s(col::INPUTS),
+        s(col::OUTPUTS),
+    );
+    let ver = i64c(col::VERSION);
+    let del = b.column(col_idx(col::DELETED)).as_boolean().clone();
+    fn o<T>(a: &dyn Array, i: usize, f: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        if a.is_valid(i) { f().map(Some) } else { Ok(None) }
+    }
+    let txt = |a: &StringArray, i: usize| -> Option<String> { a.is_valid(i).then(|| a.value(i).to_string()) };
+    (0..b.num_rows())
+        .map(|i| {
+            Ok(SpanRow {
+                project_id: Some(ProjectId::new(p.value(i))?),
+                trace_id: TraceId::from_slice(t.value(i))?,
+                span_id: SpanId::from_slice(sp.value(i))?,
+                parent_span_id: o(&par, i, || SpanId::from_slice(par.value(i)))?,
+                dotted_order: txt(&dot, i),
+                name: txt(&name, i),
+                run_type: o(&rt, i, || rt.value(i).parse())?,
+                start_time_ns: st.is_valid(i).then(|| st.value(i)),
+                end_time_ns: et.is_valid(i).then(|| et.value(i)),
+                status: o(&stat, i, || stat.value(i).parse())?,
+                error: txt(&err, i),
+                model: txt(&model, i),
+                provider: txt(&prov, i),
+                prompt_tokens: pt.is_valid(i).then(|| pt.value(i)),
+                completion_tokens: ct.is_valid(i).then(|| ct.value(i)),
+                total_tokens: tt.is_valid(i).then(|| tt.value(i)),
+                cost_usd: cost.is_valid(i).then(|| cost.value(i)),
+                session_id: txt(&sess, i),
+                tags: tags.is_valid(i).then(|| {
+                    let v = tags.value(i);
+                    let v = v.as_string::<i32>();
+                    (0..v.len()).map(|j| v.value(j).to_string()).collect()
+                }),
+                metadata: txt(&md, i),
+                attributes: txt(&at, i),
+                events: txt(&ev, i),
+                inputs: txt(&inp, i),
+                outputs: txt(&outp, i),
+                version: u64::try_from(ver.value(i)).map_err(|_| ModelError::Schema("version must be >= 0".into()))?,
+                deleted: del.value(i),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +379,7 @@ mod tests {
             deleted.iter().collect::<Vec<_>>(),
             [Some(false), Some(false), Some(true)]
         );
+        assert_eq!(rows_from_batch(&batch).unwrap(), vec![full, patch, tomb]);
     }
 
     #[test]

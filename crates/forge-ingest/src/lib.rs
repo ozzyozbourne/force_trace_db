@@ -2,6 +2,28 @@
 
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
 
+pub mod blob;
+pub mod flush;
+pub mod memtable;
+pub mod normalize;
+pub mod pipeline;
+pub mod version;
+pub mod wal;
+pub use pipeline::{OpenReport, Pipeline, run_flusher};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IngestAck {
+    pub rows: usize,
+    pub versions: std::ops::Range<u64>,
+    pub wal_seq: u64,
+}
+
+#[async_trait::async_trait]
+pub trait Ingest: Send + Sync + std::fmt::Debug + 'static {
+    /// Rows already normalized (version 0).
+    async fn submit(&self, rows: Vec<forge_model::row::SpanRow>) -> Result<IngestAck, IngestError>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error(transparent)]
@@ -18,6 +40,10 @@ pub enum IngestError {
     Backpressure,
     #[error(transparent)]
     Unimplemented(#[from] Unimplemented),
+    #[error(transparent)]
+    Wal(#[from] wal::WalError),
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 impl Classify for IngestError {
@@ -30,6 +56,8 @@ impl Classify for IngestError {
             Self::Invalid(_) => ErrorKind::InvalidInput,
             Self::Backpressure => ErrorKind::Backpressure,
             Self::Unimplemented(e) => e.kind(),
+            Self::Wal(wal::WalError::Closed | wal::WalError::Io(_)) => ErrorKind::Transient,
+            Self::Wal(_) | Self::Internal(_) => ErrorKind::Internal,
         }
     }
     fn message(&self) -> String {

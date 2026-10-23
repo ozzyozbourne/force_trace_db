@@ -108,13 +108,17 @@ fn string_fields_accept_scalars() {
 fn string_and_path_env_values_keep_their_text() {
     for raw in ["007", "1.0", "+5", "-0", "1e3", "true", "123"] {
         jail(|jail| {
-            jail.set_env("FORGE_NODE__ID", raw);
+            if raw != "+5" {
+                jail.set_env("FORGE_NODE__ID", raw);
+            }
             jail.set_env("FORGE_STORAGE__URL", raw);
             jail.set_env("FORGE_METASTORE__URL", raw);
             jail.set_env("FORGE_WAL__DIR", raw);
             jail.set_env("FORGE_CACHE__DISK_DIR", raw);
             let c = ForgeConfig::load(None)?;
-            assert_eq!(c.node.id, raw);
+            if raw != "+5" {
+                assert_eq!(c.node.id, raw);
+            }
             assert_eq!(c.storage.url, raw);
             assert_eq!(c.metastore.url, raw);
             assert_eq!(c.wal.dir, Path::new(raw));
@@ -135,13 +139,13 @@ fn empty_node_id_is_rejected() {
     jail(|jail| {
         jail.set_env("FORGE_NODE__ID", "");
         let e = ForgeConfig::load(None).unwrap_err().to_string();
-        assert!(e.contains("node.id must not be empty"), "{e}");
+        assert!(e.contains("node.id: invalid project id"), "{e}");
         Ok(())
     });
     jail(|jail| {
         jail.create_file("forge.toml", "[node]\nid = \"  \"\n")?;
         let e = ForgeConfig::load(None).unwrap_err().to_string();
-        assert!(e.contains("node.id must not be empty"), "{e}");
+        assert!(e.contains("node.id: invalid project id"), "{e}");
         Ok(())
     });
 }
@@ -182,6 +186,37 @@ fn implicit_forge_toml_is_read_from_cwd_only() {
         std::fs::create_dir("sub").expect("mkdir sub");
         jail.change_dir("sub")?;
         assert_eq!(ForgeConfig::load(None)?.node.id, "node-1");
+        Ok(())
+    });
+}
+
+#[test]
+fn m1_keys() {
+    use forge_model::config::IngestConfig;
+    jail(|jail| {
+        let c = ForgeConfig::load(None)?;
+        assert_eq!(c.ingest, IngestConfig::default());
+        assert_eq!(c.ingest.default_project, "default");
+        assert_eq!(c.wal.segment_bytes, ByteSize::mib(64));
+        jail.create_file("example.toml", EXAMPLE)?;
+        let c = ForgeConfig::load(Some(Path::new("example.toml")))?;
+        assert_eq!(c.ingest.blob_threshold, ByteSize::mib(1));
+        assert_eq!(c.wal.group_commit_max_delay, Duration::from_millis(10));
+        jail.set_env("FORGE_INGEST__DEFAULT_PROJECT", "007");
+        jail.set_env("FORGE_WAL__GROUP_COMMIT_MAX_DELAY", "5ms");
+        let c = ForgeConfig::load(None)?;
+        assert_eq!(c.ingest.default_project, "007");
+        assert_eq!(c.wal.group_commit_max_delay, Duration::from_millis(5));
+        Ok(())
+    });
+    jail(|jail| {
+        jail.set_env("FORGE_NODE__ID", "a/b");
+        assert!(ForgeConfig::load(None).is_err());
+        Ok(())
+    });
+    jail(|jail| {
+        jail.set_env("FORGE_MEMTABLE__FLUSH_BYTES", "2GiB");
+        assert!(ForgeConfig::load(None).is_err());
         Ok(())
     });
 }

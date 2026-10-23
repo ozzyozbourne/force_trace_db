@@ -63,7 +63,16 @@ pub enum Format {
 
 #[derive(Subcommand, Debug)]
 pub enum InspectCmd {
-    Segment { path: PathBuf },
+    /// Print a segment's footer, column stats and forge metadata.
+    Segment {
+        path: PathBuf,
+        /// Append the Vortex layout tree.
+        #[arg(long)]
+        layout: bool,
+        /// Scan key columns and re-check the segment contract (sort order, one row per span).
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -100,7 +109,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             Forge::open(cfg).await?.serve(signals).await
         }
         Cmd::Sql(_) => not_yet("sql", Unimplemented("M2")),
-        Cmd::Inspect(_) => not_yet("inspect segment", Unimplemented("M1")),
+        Cmd::Inspect(InspectCmd::Segment { path, layout, verify }) => {
+            let path = resolve_segment_path(&path, cli.config.as_deref())?;
+            let out = forge_storage::inspect::inspect_segment(
+                &path,
+                &forge_storage::inspect::InspectOptions { layout, verify },
+            )
+            .await
+            .with_context(|| format!("inspecting {}", path.display()))?;
+            use std::io::Write;
+            writeln!(std::io::stdout().lock(), "{out}")?;
+            if verify && out.contains("contract:  VIOLATED") {
+                anyhow::bail!("segment contract violated")
+            }
+            Ok(())
+        }
         Cmd::Compact { .. } => not_yet("compact", Unimplemented("M3")),
         Cmd::Gc { .. } => not_yet("gc", Unimplemented("M3")),
         Cmd::Bench(_) => not_yet("bench", Unimplemented("M6")),
@@ -108,4 +131,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 fn not_yet(cmd: &str, Unimplemented(m): Unimplemented) -> anyhow::Result<()> {
     anyhow::bail!("`forge {cmd}` is not implemented yet (lands in {m})")
+}
+
+/// A missing relative path is retried under the configured file:// storage root.
+fn resolve_segment_path(p: &std::path::Path, config: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    if p.exists() || p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    let cfg = ForgeConfig::load(config).context("loading config")?;
+    match forge_storage::file_url_path(&cfg.storage.url) {
+        Ok(root) if root.join(p).exists() => Ok(root.join(p)),
+        _ => Ok(p.to_path_buf()),
+    }
 }
