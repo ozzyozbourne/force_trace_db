@@ -108,32 +108,384 @@ async fn projects_api() {
     assert_eq!(call(&api, get("/v1/traces/abc")).await.0, StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
-async fn p3v_read_api() {
-    use forge_ingest::Ingest;
-    use forge_model::row::SpanRow;
-    use forge_model::testing::{pid, sid, tid};
+// ---------------------------------------------------------------- read API (M2)
+
+use forge_ingest::Ingest;
+use forge_model::row::SpanRow;
+use forge_model::testing::{pid, sid, tid};
+
+/// The same Forge with its query engine over `store` and `cfg`.
+fn with_engine(
+    f: &Arc<Forge>,
+    store: Arc<dyn forge_storage::SegmentStore>,
+    cfg: forge_model::config::QueryConfig,
+) -> Arc<Forge> {
+    let query = forge_query::QueryEngine::new(f.meta.clone(), store, f.ingest.memtable_view(), cfg);
+    Arc::new(Forge {
+        config: f.config.clone(),
+        meta: f.meta.clone(),
+        segments: f.segments.clone(),
+        ingest: f.ingest.clone(),
+        query: Arc::new(query),
+        ready: std::sync::atomic::AtomicBool::new(true),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    })
+}
+
+const T0: i64 = 1_700_000_000_123_456_789;
+
+fn span(project: &str, trace: u64, s: u64, parent: Option<u64>) -> SpanRow {
+    SpanRow {
+        project_id: Some(pid(project)),
+        trace_id: tid(trace),
+        span_id: sid(s),
+        parent_span_id: parent.map(sid),
+        name: Some(format!("span-{s}")),
+        start_time_ns: Some(T0 + s as i64 * 1_000_000),
+        tags: Some(vec![]),
+        metadata: Some("{\"k\":1}".into()),
+        inputs: Some(format!("{{\"a\":{s}}}")),
+        ..Default::default()
+    }
+}
+
+async fn body(r: &Router, req: Request<Body>) -> (StatusCode, http::HeaderMap, Vec<u8>) {
+    let resp = r.clone().oneshot(req).await.unwrap();
+    let (parts, b) = resp.into_parts();
+    (
+        parts.status,
+        parts.headers,
+        to_bytes(b, usize::MAX).await.unwrap().to_vec(),
+    )
+}
+
+fn get_h(uri: &str, h: &[(&str, &str)]) -> Request<Body> {
+    let mut r = Request::get(uri);
+    for (k, v) in h {
+        r = r.header(*k, *v);
+    }
+    r.body(Body::empty()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traces_api() {
     let f = forge().await;
     let api = api_router(f.clone());
-    let root = SpanRow { project_id: Some(pid("default")), trace_id: tid(1), span_id: sid(1), name: Some("root".into()),
-        start_time_ns: Some(1_700_000_000_123_456_789), inputs: Some("{\"a\":1}".into()), ..Default::default() };
-    let child = SpanRow { span_id: sid(2), parent_span_id: Some(sid(1)), name: Some("child".into()), start_time_ns: Some(1_700_000_000_200_000_000), ..root.clone() };
-    f.ingest.submit(vec![root, child]).await.unwrap();
-    let (st, v) = call(&api, get(&format!("/v1/traces/{}", tid(1)))).await;
+    f.ingest
+        .submit(vec![span("default", 1, 1, None), span("default", 1, 2, Some(1))])
+        .await
+        .unwrap();
+    f.ingest
+        .submit(vec![SpanRow {
+            end_time_ns: Some(T0 + 3_000_000),
+            ..span("default", 1, 2, None)
+        }])
+        .await
+        .unwrap();
+    f.ingest.submit(vec![span("other", 7, 1, None)]).await.unwrap();
+    let id = tid(1).to_string();
+    let (st, v) = call(&api, get(&format!("/v1/traces/{id}"))).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    eprintln!("{v}");
-    assert_eq!(v["roots"][0]["children"][0]["name"], "child");
-    assert_eq!(v["roots"][0]["start_time"], "2023-11-14T22:13:20.123456789Z");
-    assert_eq!(v["roots"][0]["inputs"]["a"], 1);
-    let (st, _) = call(&api, get(&format!("/v1/traces/{}", tid(9)))).await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-    let (st, v) = call(&api, post("/v1/sql", json!({"query": "SELECT name, start_time FROM spans ORDER BY name"}))).await;
+    let root = &v["roots"][0];
+    let child = &root["children"][0];
+    assert_eq!(
+        (v["project"].as_str(), v["trace_id"].as_str(), v["span_count"].as_u64()),
+        (Some("default"), Some(id.as_str()), Some(2))
+    );
+    assert_eq!(root["span_id"], sid(1).to_string());
+    assert_eq!(root["start_time"], "2023-11-14T22:13:20.124456789Z");
+    assert_eq!(root["latency_ms"], Value::Null);
+    assert_eq!(
+        (&root["tags"], &root["metadata"], &root["inputs"]),
+        (&json!([]), &json!({"k": 1}), &json!({"a": 1}))
+    );
+    assert_eq!(root["children"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (&child["name"], &child["parent_span_id"], &child["latency_ms"]),
+        (&json!("span-2"), &json!(sid(1).to_string()), &json!(1.0))
+    );
+    assert_eq!(child["children"], json!([]));
+    // Uppercase hex and a dashed UUID.
+    let upper = id.to_uppercase();
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &id[..8],
+        &id[8..12],
+        &id[12..16],
+        &id[16..20],
+        &id[20..]
+    );
+    for alt in [upper, dashed] {
+        assert_eq!(
+            call(&api, get(&format!("/v1/traces/{alt}"))).await,
+            (StatusCode::OK, v.clone())
+        );
+    }
+    let (_, flat) = call(&api, get(&format!("/v1/traces/{id}?format=flat&payloads=false"))).await;
+    let spans = flat["spans"].as_array().unwrap();
+    assert_eq!((spans.len(), &spans[1]["depth"]), (2, &json!(1)));
+    assert!(
+        spans
+            .iter()
+            .all(|s| s.get("inputs").is_none() && s.get("children").is_none())
+    );
+    for (uri, want) in [
+        ("/v1/traces/xyz".to_string(), StatusCode::BAD_REQUEST),
+        (format!("/v1/traces/{id}?format=nested"), StatusCode::BAD_REQUEST),
+        (format!("/v1/traces/{id}?payloads=maybe"), StatusCode::BAD_REQUEST),
+        (format!("/v1/traces/{}", tid(2)), StatusCode::NOT_FOUND),
+        (format!("/v1/traces/{id}?project=Bad%20Id"), StatusCode::BAD_REQUEST),
+    ] {
+        let (st, v) = call(&api, get(&uri)).await;
+        assert_eq!(st, want, "{uri}: {v}");
+        assert!(v["error"].is_string(), "{uri}: {v}");
+    }
+    // Project: param, then header, then the default.
+    let other = format!("/v1/traces/{}", tid(7));
+    assert_eq!(call(&api, get(&other)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        call(&api, get(&format!("{other}?project=other"))).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&api, get_h(&other, &[("x-forge-project", "other")])).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &api,
+            get_h(&format!("{other}?project=default"), &[("x-forge-project", "other")])
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // gzip.
+    let (st, h, gz) = body(&api, get_h(&format!("/v1/traces/{id}"), &[("accept-encoding", "gzip")])).await;
+    assert_eq!((st, h["content-encoding"].to_str().unwrap()), (StatusCode::OK, "gzip"));
+    let mut plain = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut plain).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&plain).unwrap(), v);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_api() {
+    let f = forge().await;
+    let api = api_router(f.clone());
+    for t in 0..5 {
+        f.ingest
+            .submit(vec![span("default", t, 1, None), span("default", t, 2, Some(1))])
+            .await
+            .unwrap();
+    }
+    f.ingest
+        .submit(vec![SpanRow {
+            start_time_ns: Some(T0 + 10_000_000),
+            ..span("default", 3, 3, None)
+        }])
+        .await
+        .unwrap();
+    let (st, v) = call(&api, get("/v1/runs")).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    eprintln!("{v}");
-    assert_eq!(v["row_count"], 2);
-    let (st, v) = call(&api, post("/v1/sql", json!({"query": "DROP TABLE spans"}))).await;
+    let all: Vec<(String, String)> = v["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["start_time"].to_string(), r["trace_id"].to_string()))
+        .collect();
+    assert_eq!(all.len(), 6);
+    assert!(all.windows(2).all(|w| w[0] >= w[1]), "newest first: {all:?}");
+    assert_eq!(v["runs"][0]["span_id"], sid(3).to_string());
+    assert_eq!(v["next_cursor"], Value::Null);
+    // Paging with limit 4.
+    let (_, p1) = call(&api, get("/v1/runs?limit=4")).await;
+    let cursor = p1["next_cursor"].as_str().unwrap().to_string();
+    let (_, p2) = call(&api, get(&format!("/v1/runs?limit=4&cursor={cursor}"))).await;
+    let pages: Vec<Value> = p1["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(p2["runs"].as_array().unwrap())
+        .cloned()
+        .collect();
+    assert_eq!(
+        (pages, &p2["next_cursor"]),
+        (v["runs"].as_array().unwrap().clone(), &Value::Null)
+    );
+    for bad in [
+        "/v1/runs?limit=0".to_string(),
+        "/v1/runs?limit=1001".into(),
+        "/v1/runs?status=bogus".into(),
+        "/v1/runs?run_type=llm,nope".into(),
+        "/v1/runs?start=yesterday".into(),
+        "/v1/runs?cursor=00ff".into(),
+        format!("/v1/runs?limit=4&status=ok&cursor={cursor}"),
+    ] {
+        let (st, v) = call(&api, get(&bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    assert_eq!(
+        call(&api, get("/v1/runs?project=nobody")).await,
+        (StatusCode::OK, json!({"runs": [], "next_cursor": null}))
+    );
+    let (_, w) = call(
+        &api,
+        get("/v1/runs?start=2023-11-14T22:13:20.130Z&end=2023-11-14T22:13:21Z"),
+    )
+    .await;
+    assert_eq!(w["runs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_api() {
+    let f = forge().await;
+    let api = api_router(f.clone());
+    f.ingest
+        .submit(vec![span("default", 1, 1, None), span("default", 1, 2, Some(1))])
+        .await
+        .unwrap();
+    let q = |query: &str, extra: Value| {
+        let mut b = json!({"query": query});
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        post("/v1/sql", b)
+    };
+    let (st, v) = call(
+        &api,
+        q(
+            "SELECT trace_id, name, start_time, tags, metadata FROM spans ORDER BY name",
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["columns"][0], json!({"name": "trace_id", "type": "Binary"}));
+    assert_eq!(v["columns"][2]["type"], "Timestamp(ns, \"UTC\")");
+    let r0 = &v["rows"][0];
+    assert_eq!(r0["trace_id"], tid(1).to_string());
+    assert!(
+        r0["start_time"]
+            .as_str()
+            .unwrap()
+            .starts_with("2023-11-14T22:13:20.124456789"),
+        "{r0}"
+    );
+    assert_eq!((&r0["tags"], &r0["metadata"]), (&json!([]), &json!("{\"k\":1}")));
+    assert_eq!((&v["row_count"], &v["truncated"]), (&json!(2), &json!(false)));
+    assert!(v["elapsed_ms"].as_f64().unwrap() >= 0.0);
+    let (_, v) = call(&api, q("SELECT name FROM spans", json!({"max_rows": 2}))).await;
+    assert_eq!((&v["row_count"], &v["truncated"]), (&json!(2), &json!(false)));
+    let (_, v) = call(&api, q("SELECT name FROM spans", json!({"max_rows": 1}))).await;
+    assert_eq!(
+        (&v["row_count"], &v["truncated"], v["rows"].as_array().unwrap().len()),
+        (&json!(1), &json!(true), 1)
+    );
+    for (req, what) in [
+        (q("SELECT 1", json!({"max_rows": 100_001})), "max_rows"),
+        (q("DROP TABLE spans", json!({})), "DDL"),
+        (q("SELEC 1", json!({})), "syntax"),
+        (
+            Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .body(Body::from("{nope"))
+                .unwrap(),
+            "json",
+        ),
+    ] {
+        let (st, v) = call(&api, req).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+}
+
+/// Timeouts (504, clamped by the engine timeout), the memory limit (400), the concurrency limit (503), the body cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_api_limits() {
+    use forge_model::config::QueryConfig;
+    use forge_query::testing::RecordingSegmentStore;
+    let f = forge().await;
+    let rows: Vec<SpanRow> = (0..300).map(|s| span("default", s % 7, s, None)).collect();
+    f.ingest.submit(rows[..150].to_vec()).await.unwrap();
+    f.ingest.flush_all().await.unwrap();
+    f.ingest.submit(rows[150..].to_vec()).await.unwrap();
+    let slow = Arc::new(RecordingSegmentStore::slow(
+        f.segments.clone(),
+        std::time::Duration::from_secs(3),
+    ));
+    // Timeouts.
+    let api = api_router(with_engine(
+        &f,
+        slow.clone(),
+        QueryConfig {
+            timeout: std::time::Duration::from_millis(300),
+            ..Default::default()
+        },
+    ));
+    for ms in [50, 600_000] {
+        let t = std::time::Instant::now();
+        let (st, v) = call(
+            &api,
+            post("/v1/sql", json!({"query": "SELECT name FROM spans", "timeout_ms": ms})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GATEWAY_TIMEOUT, "{v}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{ms}: {:?}",
+            t.elapsed()
+        );
+    }
+    // Memory: a sort that cannot fit in 16 KiB over a merge; the default limit succeeds.
+    let order = json!({"query": "SELECT * FROM spans ORDER BY name, inputs"});
+    let small = api_router(with_engine(
+        &f,
+        f.segments.clone(),
+        QueryConfig {
+            memory_limit: bytesize::ByteSize::kib(16),
+            ..Default::default()
+        },
+    ));
+    let (st, v) = call(&small, post("/v1/sql", order.clone())).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    let req = Request::get(format!("/v1/traces/{}", tid(1))).header("accept-encoding", "gzip").body(Body::empty()).unwrap();
-    let resp = api.clone().oneshot(req).await.unwrap();
-    eprintln!("gzip: {:?}", resp.headers().get("content-encoding"));
+    assert!(v["error"].as_str().unwrap().contains("memory limit"), "{v}");
+    let (st, v) = call(&api_router(f.clone()), post("/v1/sql", order)).await;
+    assert_eq!((st, &v["row_count"]), (StatusCode::OK, &json!(300)));
+    // Concurrency: one slot, held by a slow query; the second waits 50 ms, then 503 + Retry-After.
+    let one = api_router(with_engine(
+        &f,
+        slow,
+        QueryConfig {
+            sql_concurrency: 1,
+            ..Default::default()
+        },
+    ));
+    let held = tokio::spawn({
+        let one = one.clone();
+        async move { call(&one, post("/v1/sql", json!({"query": "SELECT name FROM spans"}))).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (st, h, _) = body(&one, post("/v1/sql", json!({"query": "SELECT 1", "timeout_ms": 50}))).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.contains_key("retry-after"));
+    assert_eq!(held.await.unwrap().0, StatusCode::OK);
+    // Body cap: 1 KiB.
+    let capped = api_router(with_engine(
+        &f,
+        f.segments.clone(),
+        QueryConfig {
+            max_response_bytes: bytesize::ByteSize::kib(1),
+            ..Default::default()
+        },
+    ));
+    let (st, _, b) = body(
+        &capped,
+        post("/v1/sql", json!({"query": "SELECT name, inputs FROM spans"})),
+    )
+    .await;
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!((st, &v["truncated"]), (StatusCode::OK, &json!(true)));
+    let n = v["row_count"].as_u64().unwrap();
+    assert!(
+        n > 0 && n < 300 && b.len() < 1024 + 64 * 64,
+        "{n} rows, {} bytes",
+        b.len()
+    );
 }

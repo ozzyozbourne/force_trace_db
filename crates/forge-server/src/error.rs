@@ -31,7 +31,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (http_status(self.kind), Json(serde_json::json!({ "error": self.msg }))).into_response()
+        let mut r = (http_status(self.kind), Json(serde_json::json!({ "error": self.msg }))).into_response();
+        if let Some(v) = retry_after(self.kind) {
+            r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+        r
     }
 }
 
@@ -67,4 +71,31 @@ pub(crate) fn grpc_code(k: ErrorKind) -> tonic::Code {
 /// `Retry-After` for retryable kinds (sent by the OTLP/HTTP receiver).
 pub(crate) fn retry_after(k: ErrorKind) -> Option<HeaderValue> {
     matches!(k, ErrorKind::Backpressure | ErrorKind::Transient).then(|| HeaderValue::from_static("1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind's HTTP status, gRPC code and Retry-After (NotFound / Timeout get none).
+    #[test]
+    fn wire_mapping() {
+        use ErrorKind as K;
+        use tonic::Code as C;
+        let table = [
+            (K::InvalidInput, 400, C::InvalidArgument, false),
+            (K::Conflict, 409, C::Aborted, false),
+            (K::Unimplemented, 501, C::Unimplemented, false),
+            (K::Backpressure, 429, C::ResourceExhausted, true),
+            (K::Transient, 503, C::Unavailable, true),
+            (K::Internal, 500, C::Internal, false),
+            (K::NotFound, 404, C::NotFound, false),
+            (K::Timeout, 504, C::DeadlineExceeded, false),
+        ];
+        for (k, status, code, retry) in table {
+            assert_eq!(http_status(k).as_u16(), status, "{k:?}");
+            assert_eq!(grpc_code(k), code, "{k:?}");
+            assert_eq!(retry_after(k).is_some(), retry, "{k:?}");
+        }
+    }
 }

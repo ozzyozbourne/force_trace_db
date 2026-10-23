@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 forge-ingest.workspace = true
 tower-http.workspace = true
+arrow.workspace = true
+bytesize.workspace = true
+futures.workspace = true
 prost.workspace = true
 async-trait.workspace = true
 forge-model.workspace = true
@@ -38,3 +41,6 @@ zstd.workspace = true
 forge-model = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 http.workspace = true
+arrow.workspace = true
+bytesize.workspace = true
+futures.workspace = true
