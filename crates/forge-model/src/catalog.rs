@@ -1,0 +1,278 @@
+//! Catalog types shared by meta, storage, index, ingest and query.
+use crate::ids::{ProjectId, TraceId};
+use std::{fmt, str::FromStr};
+
+/// Segment identity = ULID (time-sortable; Crockford base32, 26 chars, used in object paths).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentId(pub ulid::Ulid);
+impl SegmentId {
+    pub fn new() -> Self {
+        Self(ulid::Ulid::new())
+    }
+}
+impl Default for SegmentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+impl fmt::Debug for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SegmentId({})", self.0)
+    }
+}
+impl FromStr for SegmentId {
+    type Err = ulid::DecodeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ulid::Ulid::from_string(s).map(Self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Level {
+    L0 = 0,
+    L1 = 1,
+}
+impl Level {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::L0),
+            1 => Some(Self::L1),
+            _ => None,
+        }
+    }
+    pub fn dir(self) -> &'static str {
+        match self {
+            Self::L0 => "L0",
+            Self::L1 => "L1",
+        }
+    }
+}
+
+/// Hours since the Unix epoch (UTC). L1: the (project, hour) partition. L0: hour of the flush
+/// (path placement only; pruning uses min/max_start_ns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HourBucket(pub i64);
+impl HourBucket {
+    pub const NANOS: i64 = 3_600_000_000_000;
+    pub fn from_nanos(ns: i64) -> Self {
+        Self(ns.div_euclid(Self::NANOS))
+    }
+    pub fn start_nanos(self) -> i64 {
+        self.0 * Self::NANOS
+    }
+    /// `yyyy-mm-dd/hh` (object layout).
+    pub fn path_component(self) -> String {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(self.0 * 3600, 0)
+            .expect("hour in range")
+            .format("%Y-%m-%d/%H")
+            .to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SegmentState {
+    Live,
+    Compacting,
+    Deleted,
+}
+impl SegmentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Compacting => "compacting",
+            Self::Deleted => "deleted",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "live" => Some(Self::Live),
+            "compacting" => Some(Self::Compacting),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+    /// Live and compacting segments are both visible to queries.
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::Deleted)
+    }
+}
+
+/// One row of `segments`. Times: `*_ns` = data time (unix ns), `*_ms` = wall-clock bookkeeping (unix ms).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentMeta {
+    pub id: SegmentId,
+    pub project_id: ProjectId,
+    pub level: Level,
+    pub partition_hour: HourBucket,
+    /// Object key of the .vortex file relative to the store root (see paths::segment_path).
+    pub path: String,
+    pub row_count: u64,
+    pub byte_size: u64,
+    /// Size of the .fts sidecar (`paths::fts_path(&path)`); None = no sidecar (search falls back to scan).
+    pub fts_byte_size: Option<u64>,
+    /// None when every row has a null start_time.
+    pub min_start_ns: Option<i64>,
+    pub max_start_ns: Option<i64>,
+    /// Rows with null start_time. Segment-level time pruning is allowed only when 0 (decision 5).
+    pub start_time_nulls: u64,
+    pub min_trace_id: TraceId,
+    pub max_trace_id: TraceId,
+    pub min_version: u64,
+    pub max_version: u64,
+    pub schema_version: u32,
+    pub created_at_ms: i64,
+    pub state: SegmentState,
+    pub deleted_at_ms: Option<i64>,
+}
+
+impl SegmentMeta {
+    /// Conservative: true unless the segment provably has no row with start_time in [start, end).
+    pub fn may_overlap_time(&self, start_ns: Option<i64>, end_ns: Option<i64>) -> bool {
+        if self.start_time_nulls > 0 {
+            return true;
+        }
+        let (Some(lo), Some(hi)) = (self.min_start_ns, self.max_start_ns) else {
+            return true;
+        };
+        start_ns.is_none_or(|s| hi >= s) && end_ns.is_none_or(|e| lo < e)
+    }
+}
+
+/// A trace's contiguous rows inside one segment (rows are sorted by trace).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceRange {
+    pub trace_id: TraceId,
+    pub row_start: u64,
+    pub row_count: u64,
+}
+
+/// trace_index lookup result: where a trace lives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceLocation {
+    pub segment: SegmentMeta,
+    pub row_start: u64,
+    pub row_count: u64,
+}
+
+impl TraceLocation {
+    pub fn rows(&self) -> std::ops::Range<u64> {
+        self.row_start..self.row_start + self.row_count
+    }
+}
+
+pub mod paths {
+    use super::{HourBucket, Level, SegmentId};
+    use crate::ids::ProjectId;
+    pub fn segment_path(p: &ProjectId, level: Level, hour: HourBucket, id: SegmentId) -> String {
+        format!("segments/{p}/{}/{}/{id}.vortex", level.dir(), hour.path_component())
+    }
+    pub fn fts_path(segment_path: &str) -> String {
+        format!("{}.fts", segment_path.strip_suffix(".vortex").unwrap_or(segment_path))
+    }
+    pub fn blob_path(p: &ProjectId, sha256_hex: &str) -> String {
+        format!("blobs/{p}/{sha256_hex}")
+    }
+    pub fn wal_object_path(node_id: &str, first_seq: u64) -> String {
+        format!("wal/{node_id}/{first_seq:020}.wal")
+    }
+    pub const SEGMENTS_PREFIX: &str = "segments/";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn meta(min: Option<i64>, max: Option<i64>, nulls: u64) -> SegmentMeta {
+        let id = SegmentId::new();
+        let p = ProjectId::new("p").unwrap();
+        SegmentMeta {
+            id,
+            path: paths::segment_path(&p, Level::L0, HourBucket(0), id),
+            project_id: p,
+            level: Level::L0,
+            partition_hour: HourBucket(0),
+            row_count: 1,
+            byte_size: 1,
+            fts_byte_size: None,
+            min_start_ns: min,
+            max_start_ns: max,
+            start_time_nulls: nulls,
+            min_trace_id: TraceId::default(),
+            max_trace_id: TraceId::default(),
+            min_version: 1,
+            max_version: 1,
+            schema_version: 1,
+            created_at_ms: 0,
+            state: SegmentState::Live,
+            deleted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn hour_bucket() {
+        assert_eq!(HourBucket::from_nanos(-1), HourBucket(-1));
+        assert_eq!(HourBucket::from_nanos(HourBucket::NANOS - 1), HourBucket(0));
+        assert_eq!(HourBucket::from_nanos(HourBucket::NANOS), HourBucket(1));
+        let ns = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 22, 10, 30, 0)
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let h = HourBucket::from_nanos(ns);
+        assert_eq!(h.path_component(), "2026-10-22/10");
+        assert_eq!(HourBucket::from_nanos(h.start_nanos()), h);
+    }
+
+    #[test]
+    fn paths_and_ids() {
+        let id: SegmentId = "01JAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+        assert_eq!(id.to_string().parse::<SegmentId>().unwrap(), id);
+        assert!("nope".parse::<SegmentId>().is_err());
+        let p = ProjectId::new("p").unwrap();
+        let path = paths::segment_path(&p, Level::L1, HourBucket(0), id);
+        assert_eq!(path, "segments/p/L1/1970-01-01/00/01JAAAAAAAAAAAAAAAAAAAAAAA.vortex");
+        assert_eq!(
+            paths::fts_path(&path),
+            "segments/p/L1/1970-01-01/00/01JAAAAAAAAAAAAAAAAAAAAAAA.fts"
+        );
+        for l in [Level::L0, Level::L1] {
+            assert_eq!(Level::from_u8(l.as_u8()), Some(l));
+        }
+        assert_eq!(Level::from_u8(2), None);
+        for s in [SegmentState::Live, SegmentState::Compacting, SegmentState::Deleted] {
+            assert_eq!(SegmentState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(SegmentState::parse("x"), None);
+        assert_ne!(SegmentId::default(), SegmentId::default());
+    }
+
+    #[test]
+    fn may_overlap_time() {
+        assert!(meta(None, None, 1).may_overlap_time(Some(0), Some(1)));
+        assert!(meta(Some(100), Some(200), 1).may_overlap_time(Some(500), Some(600)));
+        let m = meta(Some(100), Some(200), 0);
+        assert!(!m.may_overlap_time(Some(300), Some(400)));
+        assert!(!m.may_overlap_time(Some(0), Some(50)));
+        assert!(
+            m.may_overlap_time(Some(200), Some(300)),
+            "max == start is inside (inclusive)"
+        );
+        assert!(
+            !m.may_overlap_time(Some(0), Some(100)),
+            "min == end is outside (exclusive)"
+        );
+        assert!(m.may_overlap_time(None, None));
+        assert!(m.may_overlap_time(Some(150), None));
+        assert!(m.may_overlap_time(None, Some(150)));
+    }
+}
