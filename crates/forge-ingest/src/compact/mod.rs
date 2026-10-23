@@ -7,16 +7,16 @@ use forge_model::ids::ProjectId;
 use forge_model::merge::Cancel;
 use forge_model::time::Clocks;
 use forge_storage::SegmentStore;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod job;
 pub mod pick;
 
-/// The picker's input cap (begin_compaction's own cap, `forge_meta::MAX_JOB_INPUTS`, is higher).
-pub const MAX_INPUTS: usize = 16;
-const _: () = assert!(MAX_INPUTS <= forge_meta::MAX_JOB_INPUTS);
+/// The picker's input cap: begin_compaction's own cap.
+pub use forge_meta::MAX_JOB_INPUTS as MAX_INPUTS;
 pub const L1_MAX_RUNS: usize = 4;
 pub const MAX_OPEN_WRITERS: usize = 4;
 /// Jobs per `compact_project` run (a guard; the summary reports `capped`).
@@ -35,6 +35,40 @@ pub struct CompactCtx {
     pub next_project: AtomicUsize,
     /// Shutdown: checked between slices, never during the commit (D7).
     pub cancel: Cancel,
+    /// The jobs this process runs (review 1 #4).
+    pub running: RunningJobs,
+}
+
+/// Ids of the jobs this process runs: added by `one` right after the begin, removed when the job's future ends, also
+/// by panic or abort. `reset_dead_jobs` fails every other running job.
+#[derive(Default)]
+pub struct RunningJobs {
+    ids: std::sync::Mutex<HashSet<i64>>,
+    /// Held (read) from a begin until its id is in `ids`; `reset_dead_jobs` holds it (write) so it never sees a
+    /// begun job that is not registered yet.
+    begin_lock: tokio::sync::RwLock<()>,
+    /// Review 1 #10: input sets whose job failed -> (consecutive failures, not picked again before). Server ticks
+    /// skip such a set until then (`forge compact` does not: it stops after 3 failures).
+    backoff: std::sync::Mutex<HashMap<Vec<SegmentId>, (u32, Instant)>>,
+}
+
+impl RunningJobs {
+    /// Jobs running now.
+    pub fn count(&self) -> usize {
+        self.ids.lock().unwrap().len()
+    }
+}
+
+/// The longest failure backoff of one input set.
+const MAX_BACKOFF: Duration = Duration::from_secs(3600);
+
+/// Removes a job from `RunningJobs` when dropped.
+struct Registered<'a>(&'a RunningJobs, i64);
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.0.ids.lock().unwrap().remove(&self.1);
+    }
 }
 
 impl CompactCtx {
@@ -52,8 +86,21 @@ impl CompactCtx {
             merge_chunk_bytes: crate::flush::MERGE_CHUNK_BYTES,
             next_project: AtomicUsize::new(0),
             cancel: Cancel::new(),
+            running: RunningJobs::default(),
         }
     }
+}
+
+/// Fails every running job of the metastore that no task of this process runs (its task panicked or was aborted,
+/// or its `fail_compaction` failed). One process owns the data dir (D2). Returns the count.
+pub async fn reset_dead_jobs(cx: &CompactCtx) -> Result<usize, IngestError> {
+    let _no_begin = cx.running.begin_lock.write().await;
+    let keep: Vec<i64> = cx.running.ids.lock().unwrap().iter().copied().collect();
+    let n = cx.meta.reset_compactions(&keep).await?;
+    if n > 0 {
+        tracing::warn!(jobs = n, "compaction: reset running jobs that no task runs");
+    }
+    Ok(n)
 }
 
 /// Coverage counters of one job (tests, logs).
@@ -128,31 +175,69 @@ async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Outcome, Ing
     let Some((kind, inputs)) = pick_for(cx, p, force).await? else {
         return Ok(Outcome::Idle);
     };
+    let backoff = &cx.running.backoff;
+    if !force
+        && backoff
+            .lock()
+            .unwrap()
+            .get(&inputs)
+            .is_some_and(|(_, until)| Instant::now() < *until)
+    {
+        return Ok(Outcome::Idle);
+    }
     let req = JobRequest {
         project_id: p.clone(),
         kind,
-        inputs,
+        inputs: inputs.clone(),
     };
+    let begin = cx.running.begin_lock.read().await;
     let Some(job) = cx.meta.begin_compaction(req).await? else {
         return Ok(Outcome::Refused);
     };
-    Ok(Outcome::Ran(job::run_job(cx, job).await?))
+    let _registered = Registered(&cx.running, job.id);
+    cx.running.ids.lock().unwrap().insert(job.id);
+    drop(begin);
+    let r = job::run_job(cx, job).await;
+    let mut b = backoff.lock().unwrap();
+    if r.is_ok() {
+        b.remove(&inputs);
+    } else {
+        let n = b.get(&inputs).map_or(0, |e| e.0) + 1;
+        // Bounded: entries whose backoff is over go (this set keeps its count, read above).
+        let now = Instant::now();
+        b.retain(|_, (_, until)| *until > now);
+        let wait = cx
+            .cfg
+            .interval
+            .max(Duration::from_secs(1))
+            .saturating_mul(1 << n.min(16))
+            .min(MAX_BACKOFF);
+        b.insert(inputs, (n, Instant::now() + wait));
+    }
+    Ok(Outcome::Ran(r?))
 }
 
-/// Server slot: projects in rotating order; the first that yields a job. None = nothing due or all raced.
+/// Server slot: projects in rotating order; the first that yields a job. None = nothing due or all raced. A
+/// project's error is logged and the next project is tried; the first error is returned if no job ran.
 pub async fn run_next(cx: &CompactCtx) -> Result<Option<JobReport>, IngestError> {
     let projects = cx.meta.list_projects().await?;
     if projects.is_empty() {
         return Ok(None);
     }
     let start = cx.next_project.fetch_add(1, Ordering::Relaxed);
+    let mut first_err = None;
     for i in 0..projects.len() {
         let p = &projects[(start + i) % projects.len()].id;
-        if let Outcome::Ran(r) = one(cx, p, false).await? {
-            return Ok(Some(r));
+        match one(cx, p, false).await {
+            Ok(Outcome::Ran(r)) => return Ok(Some(r)),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(project = %p, error = %e, "compaction failed; trying the next project");
+                first_err.get_or_insert(e);
+            }
         }
     }
-    Ok(None)
+    first_err.map_or(Ok(None), Err)
 }
 
 /// `forge compact`: triggers off; pick + run on one project until the picker returns None. A rejected begin counts
@@ -176,6 +261,6 @@ pub async fn compact_project(cx: &CompactCtx, p: &ProjectId) -> Result<CompactSu
             }
         }
     }
-    s.capped = true;
+    s.capped = pick_for(cx, p, true).await?.is_some();
     Ok(s)
 }

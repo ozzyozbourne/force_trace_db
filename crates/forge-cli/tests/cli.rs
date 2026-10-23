@@ -462,3 +462,38 @@ async fn gc_skips_blobs_with_unflushed_wal() {
     assert!(!orphan.exists(), "unreferenced blob swept");
     assert!(referenced[0].exists(), "the replayed row's blob is referenced");
 }
+
+/// Review 1 #7: offline `gc --dry-run` and `compact` never write the WAL: a missing wal dir is not created, and a
+/// torn tail is neither cut nor is any node dir added.
+#[tokio::test]
+async fn offline_commands_leave_the_wal_alone() {
+    let d = data_dir_with_l0s().await;
+    let dir = d.path().to_str().unwrap();
+    let wal = d.path().join("wal");
+    for args in [
+        &["gc", "--dry-run", "--data-dir", dir][..],
+        &["compact", "--project", "p", "--data-dir", dir],
+    ] {
+        let o = forge(args);
+        assert!(o.status.success(), "{o:?}");
+        assert!(!wal.exists(), "{args:?} created the wal dir");
+    }
+    let seg = wal.join("node-x/00000000000000000001.wal");
+    std::fs::create_dir_all(seg.parent().unwrap()).unwrap();
+    let mut torn = forge_ingest::wal::MAGIC.to_vec();
+    torn.extend_from_slice(&[1, 2, 3, 4, 5]);
+    std::fs::write(&seg, &torn).unwrap();
+    for args in [
+        &["gc", "--dry-run", "--data-dir", dir][..],
+        &["compact", "--project", "p", "--data-dir", dir],
+    ] {
+        let o = forge(args);
+        assert!(o.status.success(), "{o:?}");
+        assert_eq!(std::fs::read(&seg).unwrap(), torn, "{args:?} changed the torn tail");
+        let nodes: Vec<_> = std::fs::read_dir(&wal)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(nodes, ["node-x"], "{args:?}");
+    }
+}

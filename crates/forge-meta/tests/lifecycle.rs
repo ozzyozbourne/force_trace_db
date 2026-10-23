@@ -111,7 +111,7 @@ async fn expire_whole_l1_hours_and_l0_rules() {
         "idempotent"
     );
     // The hour expires on the next pass once the job ends.
-    m.reset_compactions().await.unwrap();
+    m.reset_compactions(&[]).await.unwrap();
     assert_eq!(m.expire_segments(&pid("p"), cutoff, 100).await.unwrap().len(), 2);
     // max_hours bounds the L1 hours per call.
     let m2 = SqliteMetastore::open_in_memory().unwrap();

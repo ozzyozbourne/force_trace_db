@@ -1,10 +1,10 @@
 //! plans/phase-4 §8: the scaled soak, the single-run substitute for the spec's 24 h x 20k spans/s exit. In process:
-//! a data clock running 192x the wall clock (15 wall minutes = 48 data hours), sizes scaled by the same factor,
+//! a data clock running 192x the wall clock (20 wall minutes = 64 data hours), sizes scaled by the same factor,
 //! retention on `soak` (1 day) and none on `ctl`. Manual, one run:
 //!
 //! cargo test -p forge-server --profile quick-release --test soak -- --ignored --nocapture
 //!
-//! Env: FORGE_SOAK_SECS (default 900), FORGE_SOAK_RATE (spans/s of first posts, default 20000).
+//! Env: FORGE_SOAK_SECS (default 1200, the least that fits two steady-state windows), FORGE_SOAK_RATE (spans/s of first posts, default 20000).
 #![allow(clippy::print_stdout)]
 use bytesize::ByteSize;
 
@@ -291,6 +291,7 @@ struct Row {
     objects: u64,
     meta_bytes: u64,
     trace_index_soak: i64,
+    trace_index_ctl: i64,
     data_bytes: u64,
     spans_per_s: f64,
     backpressure: u64,
@@ -305,13 +306,13 @@ struct Row {
 }
 
 const CSV_HEADER: &str = "t_s,rss_mib,soak_l0,soak_l1,ctl_l0,ctl_l1,compacting,deleted,deleted_recent,max_segs_per_hour,\
-objects,meta_mib,trace_index_soak,data_mib,spans_per_s,backpressure,jobs_done,jobs_failed,jobs_a,jobs_b,b_suffix,b_whole,\
+objects,meta_mib,trace_index_soak,trace_index_ctl,data_mib,spans_per_s,backpressure,jobs_done,jobs_failed,jobs_a,jobs_b,b_suffix,b_whole,\
 l0_mib,l1_mib,write_amp";
 
 impl Row {
     fn csv(&self) -> String {
         format!(
-            "{:.0},{:.1},{},{},{},{},{},{},{},{},{},{:.2},{},{:.1},{:.0},{},{},{},{},{},{},{},{:.1},{:.1},{:.2}",
+            "{:.0},{:.1},{},{},{},{},{},{},{},{},{},{:.2},{},{},{:.1},{:.0},{},{},{},{},{},{},{},{:.1},{:.1},{:.2}",
             self.t,
             self.rss as f64 / MIB,
             self.soak_l0,
@@ -325,6 +326,7 @@ impl Row {
             self.objects,
             self.meta_bytes as f64 / MIB,
             self.trace_index_soak,
+            self.trace_index_ctl,
             self.data_bytes as f64 / MIB,
             self.spans_per_s,
             self.backpressure,
@@ -378,6 +380,7 @@ impl Probe {
             now_ms() - window
         ));
         row.trace_index_soak = q("SELECT count(*) FROM trace_index WHERE project_id = 'soak'");
+        row.trace_index_ctl = q("SELECT count(*) FROM trace_index WHERE project_id = 'ctl'");
         row.jobs_done = q("SELECT count(*) FROM compaction_jobs WHERE status = 'done'");
         row.jobs_failed = q("SELECT count(*) FROM compaction_jobs WHERE status = 'failed'");
         row.jobs_a = q("SELECT count(*) FROM compaction_jobs WHERE status = 'done' AND kind = 'l0'");
@@ -493,7 +496,7 @@ async fn count(f: &forge_server::Forge, sql: &str) -> i64 {
 #[ignore = "manual soak (plans/phase-4 §8): run once in quick-release"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_scaled_48_data_hours() {
-    let secs = env_u64("FORGE_SOAK_SECS", 900);
+    let secs = env_u64("FORGE_SOAK_SECS", 1200);
     let rate = env_u64("FORGE_SOAK_RATE", 20_000);
     let baseline_secs = 60;
     let logs = Arc::new(Logs::default());
@@ -511,7 +514,14 @@ async fn soak_scaled_48_data_hours() {
     c.l0_max_age = Duration::from_secs(10);
     c.gc_interval = Duration::from_secs(15);
     c.gc_grace = Duration::from_secs(120);
-    c.orphan_grace = Duration::from_secs(600);
+    c.orphan_grace = Duration::from_secs(600); // below the 1 h load-time floor: built in code, and no blobs here
+    // Retention steady state (review 1 #8): the first data hour expires at 25 data hours (data starts 24 h back),
+    // and its deleted rows are purged within gc_grace + gc_interval; plus 10 s of slack.
+    let steady = (25 * 3600) as f64 / SPEED as f64 + (c.gc_grace + c.gc_interval).as_secs_f64() + 10.0;
+    assert!(
+        secs as f64 >= steady + 240.0,
+        "FORGE_SOAK_SECS {secs} leaves no two steady-state windows (steady from {steady:.0} s)"
+    );
 
     let f = forge_server::Forge::open(cfg.clone()).await.expect("open");
     for (p, days) in [("soak", Some(1)), ("ctl", None)] {
@@ -785,8 +795,10 @@ async fn soak_scaled_48_data_hours() {
         failures.push(format!("lifecycle warn/error events: {lifecycle_problems:?}"));
     }
 
-    // Windowed medians (scaled to FORGE_SOAK_SECS; 900 s: warm-up 3 min, minutes 5-7.5 vs the last 2.5 min).
+    // Windowed medians. RSS (scaled to FORGE_SOAK_SECS; 1200 s: t 400-600 s vs the last 200 s). The retention-bound
+    // series compare two steady-state windows: [steady, half) vs [half, end] (review 1 #8).
     let s = secs as f64;
+    let half = steady + (s - steady) / 2.0;
     let rss_all = rss.lock().unwrap().clone();
     let (mid_lo, mid_hi, last_lo) = (s / 3.0, s / 2.0, s * 5.0 / 6.0);
     let rss_mid = median(&window(&rss_all, mid_lo, mid_hi));
@@ -809,28 +821,43 @@ async fn soak_scaled_48_data_hours() {
         ));
     }
     let mut medians = Vec::new();
-    for (name, v) in [
+    // meta.db is mostly trace_index; `ctl` (no retention) grows by design, so the bound applies to the file size
+    // scaled by `soak`'s share of the trace_index rows; `ctl` is reported on its own.
+    let soak_share = |r: &Row| r.trace_index_soak as f64 / (r.trace_index_soak + r.trace_index_ctl).max(1) as f64;
+    for (name, v, bounded) in [
         (
             "soak live L1",
             rows.iter().map(|r| (r.t, r.soak_l1 as f64)).collect::<Vec<_>>(),
+            true,
         ),
         (
             "soak trace_index rows",
             rows.iter().map(|r| (r.t, r.trace_index_soak as f64)).collect(),
+            true,
         ),
         (
-            "meta.db + -wal bytes",
+            "meta.db + -wal bytes x soak share",
+            rows.iter()
+                .map(|r| (r.t, r.meta_bytes as f64 * soak_share(r)))
+                .collect(),
+            true,
+        ),
+        (
+            "meta.db + -wal bytes (both projects)",
             rows.iter().map(|r| (r.t, r.meta_bytes as f64)).collect(),
+            false,
+        ),
+        (
+            "ctl trace_index rows (no retention: grows)",
+            rows.iter().map(|r| (r.t, r.trace_index_ctl as f64)).collect(),
+            false,
         ),
     ] {
-        let (mid, last) = (
-            median(&window(&v, mid_lo, mid_hi)),
-            median(&window(&v, last_lo, s + 60.0)),
-        );
+        let (mid, last) = (median(&window(&v, steady, half)), median(&window(&v, half, s + 60.0)));
         medians.push(format!(
-            "{name}: median {mid:.0} (t {mid_lo:.0}-{mid_hi:.0} s) -> {last:.0} (last)"
+            "{name}: median {mid:.0} (t {steady:.0}-{half:.0} s) -> {last:.0} (t {half:.0}-{s:.0} s)"
         ));
-        if last > 1.1 * mid {
+        if bounded && last > 1.1 * mid {
             failures.push(format!("{name}: last-window median {last:.0} > 1.1 x {mid:.0}"));
         }
     }

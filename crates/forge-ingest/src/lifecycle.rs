@@ -116,19 +116,24 @@ async fn purge(
     r: &mut GcReport,
 ) -> Result<(), GcError> {
     let before = now_ms.saturating_sub(o.gc_grace.as_millis() as i64);
+    if o.dry_run {
+        let (n, bytes) = meta.purge_stats(before).await?;
+        r.purged_segments += n;
+        r.freed_bytes += bytes;
+        return Ok(());
+    }
     loop {
         let segs = meta.purge_candidates(before, BATCH).await?;
         r.freed_bytes += segs
             .iter()
             .map(|s| s.byte_size + s.fts_byte_size.unwrap_or(0))
             .sum::<u64>();
-        if o.dry_run {
-            r.purged_segments += segs.len();
-            return Ok(());
-        }
         let objects = segs.iter().flat_map(segment_objects).collect();
         r.deleted_objects += delete_all(store, objects).await?;
-        forge_model::failpoint::hit("gc_after_object_delete");
+        if !segs.is_empty() {
+            // Review T1: only a batch that deleted objects exercises "forgotten after the object delete".
+            forge_model::failpoint::hit("gc_after_object_delete");
+        }
         let ids: Vec<_> = segs.iter().map(|s| s.id).collect();
         r.purged_segments += meta.forget_segments(&ids).await?;
         if segs.len() < BATCH {
@@ -194,7 +199,7 @@ async fn sweep_orphans(
     if !o.sweep_blobs {
         return Ok(());
     }
-    blobs.clear_recent();
+    let _recording = blobs.begin_sweep().await;
     for p in projects_under(store, "blobs").await? {
         let old = old_objects(store, &format!("blobs/{p}"), cutoff).await?;
         if old.is_empty() {

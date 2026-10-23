@@ -247,6 +247,8 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     ) -> MetaResult<Vec<SegmentMeta>>;
     /// Deleted segments with `deleted_at_ms < deleted_before_ms`, oldest deletion first, at most `limit`.
     async fn purge_candidates(&self, deleted_before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>>;
+    /// Every purge candidate (no limit): (count, sum of `byte_size + fts_byte_size`). The GC dry run.
+    async fn purge_stats(&self, deleted_before_ms: i64) -> MetaResult<(usize, u64)>;
     /// Removes the rows of DELETED segments (others in `ids` are ignored): their trace_index rows in short chunked
     /// txns, then the segments rows. Call only after their objects are gone.
     /// Returns the number of segments rows removed.
@@ -273,16 +275,18 @@ pub trait Metastore: Send + Sync + std::fmt::Debug + 'static {
     async fn commit_compaction(&self, c: Arc<CompactionCommit>) -> MetaResult<()>;
     /// running -> failed, inputs -> live. Returns the job's final status (Done if the commit had landed).
     async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus>;
-    /// Startup (one process per data dir): every running job -> failed, its inputs -> live. Returns the count.
-    async fn reset_compactions(&self) -> MetaResult<usize>;
+    /// Every running job not in `keep` -> failed, its inputs -> live; returns the count. One process owns the data
+    /// dir (D2): at startup `keep` is empty; while it runs, `keep` is the jobs that still have a task.
+    async fn reset_compactions(&self, keep: &[i64]) -> MetaResult<usize>;
     /// trace_index of one segment, by row_start.
     async fn segment_traces(&self, id: SegmentId) -> MetaResult<Vec<TraceRange>>;
     /// Deletes done/failed jobs finished before `finished_before_ms`.
     async fn prune_compaction_jobs(&self, finished_before_ms: i64) -> MetaResult<usize>;
 }
 
-/// Most inputs `begin_compaction` accepts. The picker's own caps (forge-ingest `MAX_INPUTS`) must stay within it.
-pub const MAX_JOB_INPUTS: usize = 64;
+/// Most inputs of one compaction job: `begin_compaction` rejects more, and the picker (forge-ingest `MAX_INPUTS`,
+/// the same constant) never builds more.
+pub const MAX_JOB_INPUTS: usize = 16;
 
 /// Read-only open (`sqlite://path` only): no create, no migrations, no journal_mode change. A missing file is a
 /// `Config` error and nothing is created.

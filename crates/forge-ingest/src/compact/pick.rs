@@ -38,36 +38,47 @@ pub fn groups<'a>(segs: &[&'a SegmentMeta]) -> Vec<Vec<&'a SegmentMeta>> {
     out.into_iter().map(|x| x.1).collect()
 }
 
-/// Kind B for one hour: the newest groups whose bytes fit in `max_bytes` (at least 2 groups), if some class (main /
-/// orphan) has two segments with intersecting trace ranges in them and the hour is closed, forced, or that class
-/// has more than `L1_MAX_RUNS` segments there. Never because the hour merely has several segments.
-fn rewrite(segs: &[&SegmentMeta], closed: bool, force: bool, max_bytes: u64) -> Option<Vec<SegmentId>> {
+/// Kind B for one hour: a newest suffix of whole groups within `max_bytes` and `MAX_INPUTS`. Either
+/// - the longest such suffix (at least 2 groups), if some class (main / orphan) has two segments with intersecting
+///   trace ranges in it and the hour is closed, forced, or that class has more than `L1_MAX_RUNS` segments there; or
+/// - (review 1 #12: time-ordered traces give disjoint runs) the newest `L1_MAX_RUNS` or more groups made only of
+///   segments below `small` bytes. Its output is one group rotated at the target size, so it cannot retrigger.
+///
+/// Never because the hour merely has several segments, nor for one group (one job's files).
+fn rewrite(segs: &[&SegmentMeta], closed: bool, force: bool, max_bytes: u64, small: u64) -> Option<Vec<SegmentId>> {
     let g = groups(segs);
-    let mut take = 0;
-    let mut total = 0u64;
+    let (mut take, mut total, mut count) = (0, 0u64, 0usize);
     for grp in g.iter().rev() {
         let b: u64 = grp.iter().map(|s| s.byte_size).sum();
-        if total.saturating_add(b) > max_bytes {
+        if total.saturating_add(b) > max_bytes || count + grp.len() > MAX_INPUTS {
             break;
         }
-        total += b;
-        take += 1;
+        (total, count, take) = (total + b, count + grp.len(), take + 1);
     }
-    if take < 2 {
-        return None;
+    let suffix = |n: usize| -> Vec<&SegmentMeta> { g[g.len() - n..].iter().flatten().copied().collect() };
+    let ids = |v: Vec<&SegmentMeta>| v.iter().map(|s| s.id).collect();
+    if take >= 2 {
+        let suffix = suffix(take);
+        debug_assert!(
+            suffix
+                .iter()
+                .all(|s| s.start_time_nulls == 0 || s.start_time_nulls == s.row_count),
+            "mixed L1 segment"
+        );
+        let trigger = [false, true].into_iter().any(|orphan| {
+            let mut v: Vec<&SegmentMeta> = suffix.iter().copied().filter(|s| s.is_orphan_run() == orphan).collect();
+            trace_ranges_overlap(&mut v) && (closed || force || v.len() > L1_MAX_RUNS)
+        });
+        if trigger {
+            return Some(ids(suffix));
+        }
     }
-    let suffix: Vec<&SegmentMeta> = g[g.len() - take..].iter().flatten().copied().collect();
-    debug_assert!(
-        suffix
-            .iter()
-            .all(|s| s.start_time_nulls == 0 || s.start_time_nulls == s.row_count),
-        "mixed L1 segment"
-    );
-    let trigger = [false, true].into_iter().any(|orphan| {
-        let mut v: Vec<&SegmentMeta> = suffix.iter().copied().filter(|s| s.is_orphan_run() == orphan).collect();
-        trace_ranges_overlap(&mut v) && (closed || force || v.len() > L1_MAX_RUNS)
-    });
-    trigger.then(|| suffix.iter().map(|s| s.id).collect())
+    let small_groups = g[g.len() - take..]
+        .iter()
+        .rev()
+        .take_while(|grp| grp.iter().all(|s| s.byte_size < small))
+        .count();
+    (small_groups >= L1_MAX_RUNS).then(|| ids(suffix(small_groups)))
 }
 
 /// Segments split into the L0s, oldest first, and the L1s by hour.
@@ -131,7 +142,7 @@ pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<S
             continue;
         }
         let closed = hour_end_ns(*h) < i.data_now_ns.saturating_sub(HourBucket::NANOS);
-        if let Some(ids) = rewrite(runs, closed, i.force, max_bytes) {
+        if let Some(ids) = rewrite(runs, closed, i.force, max_bytes, cfg.target_segment.as_u64() / 2) {
             return Some((JobKind::L1, ids));
         }
     }
@@ -252,6 +263,70 @@ mod tests {
         assert!(
             pick(&input(&s, true, true), &cfg(15)).is_none(),
             "fewer than 2 groups fit"
+        );
+    }
+
+    /// Review 1 #3: the suffix is capped by count too, in whole groups, and stays the newest.
+    #[test]
+    fn suffix_stops_at_the_input_count() {
+        let s: Vec<SegmentMeta> = (0..20u64)
+            .map(|k| seg(Level::L1, (10 * k + 1, 10 * k + 5), (1, 5), 10, false))
+            .collect();
+        let (_, ids) = pick(&input(&s, true, true), &cfg(u64::MAX)).unwrap();
+        let newest: Vec<SegmentId> = s[20 - MAX_INPUTS..].iter().map(|s| s.id).collect();
+        assert_eq!(ids, newest);
+        // Two-file groups: whole groups only.
+        let s: Vec<SegmentMeta> = (0..20u64)
+            .flat_map(|k| {
+                let v = (10 * k + 1, 10 * k + 5);
+                [
+                    seg(Level::L1, v, (1, 5), 10, false),
+                    seg(Level::L1, v, (1, 5), 10, true),
+                ]
+            })
+            .collect();
+        let (_, ids) = pick(&input(&s, true, true), &cfg(u64::MAX)).unwrap();
+        assert_eq!(ids.len(), MAX_INPUTS);
+        let s: Vec<SegmentMeta> = (0..20u64)
+            .flat_map(|k| {
+                let v = (10 * k + 1, 10 * k + 5);
+                let orphan = seg(Level::L1, v, (1, 5), 10, true);
+                [seg(Level::L1, v, (1, 5), 10, false), orphan.clone(), orphan]
+            })
+            .collect();
+        let (_, ids) = pick(&input(&s, true, true), &cfg(u64::MAX)).unwrap();
+        assert_eq!(ids.len(), MAX_INPUTS / 3 * 3, "whole groups of 3");
+    }
+
+    /// Review 1 #12: disjoint small groups trigger once there are `L1_MAX_RUNS` of them (newest, small only); one
+    /// job's files (one group) never do.
+    #[test]
+    fn many_small_disjoint_groups_trigger() {
+        let target = CompactionConfig::default().target_segment.as_u64();
+        let disjoint = |k: u64, bytes: u64| {
+            seg(
+                Level::L1,
+                (10 * k + 1, 10 * k + 5),
+                (k as u8 * 2, k as u8 * 2 + 1),
+                bytes,
+                false,
+            )
+        };
+        let s: Vec<SegmentMeta> = (0..L1_MAX_RUNS as u64 - 1).map(|k| disjoint(k, 10)).collect();
+        assert!(pick(&input(&s, false, false), &cfg(u64::MAX)).is_none(), "too few");
+        let mut s: Vec<SegmentMeta> = (0..6).map(|k| disjoint(k, 10)).collect();
+        s[0].byte_size = target; // old big run: not in the suffix
+        let (kind, ids) = pick(&input(&s, false, false), &cfg(u64::MAX)).unwrap();
+        assert_eq!(kind, JobKind::L1);
+        assert_eq!(ids, s[1..].iter().map(|s| s.id).collect::<Vec<_>>());
+        s[5].byte_size = target / 2; // the newest group is not small: nothing
+        assert!(pick(&input(&s, false, false), &cfg(u64::MAX)).is_none());
+        let one_job: Vec<SegmentMeta> = (0..6)
+            .map(|k| seg(Level::L1, (1, 9), (k * 2, k * 2 + 1), 10, false))
+            .collect();
+        assert!(
+            pick(&input(&one_job, true, true), &cfg(u64::MAX)).is_none(),
+            "one group"
         );
     }
 

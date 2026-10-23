@@ -17,14 +17,16 @@ use std::time::Duration;
 
 type Hook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// Delegates to `inner`; after each `list_segments` / `locate_trace` / `locate_traces` it computes the real result,
-/// then awaits `hook` before returning it.
+/// Delegates to `inner`; after each `list_segments` / `locate_trace` / `locate_traces` / `purge_candidates` (a GC
+/// pass) it computes the real result, then awaits `hook` before returning it.
 pub struct HookedMetastore {
     inner: Arc<dyn Metastore>,
     hook: Hook,
     /// `commit_compaction`: (run the real commit first?, the error every call returns).
     commit: Option<(bool, fn() -> MetaError)>,
     commit_calls: AtomicUsize,
+    /// The first this many `fail_compaction` calls return the commit error without running.
+    failing_fails: AtomicUsize,
 }
 
 impl std::fmt::Debug for HookedMetastore {
@@ -41,6 +43,7 @@ impl HookedMetastore {
             hook: Box::new(move || Box::pin(tokio::time::sleep(d))),
             commit: None,
             commit_calls: AtomicUsize::new(0),
+            failing_fails: AtomicUsize::new(0),
         }
     }
     /// The FIRST read runs `f` (e.g. a flush that commits and releases a memtable) before returning its
@@ -56,6 +59,7 @@ impl HookedMetastore {
             hook,
             commit: None,
             commit_calls: AtomicUsize::new(0),
+            failing_fails: AtomicUsize::new(0),
         }
     }
     /// Every `commit_compaction` runs the real commit if `land` (its result is ignored), then returns `err()`
@@ -66,7 +70,13 @@ impl HookedMetastore {
             hook: Box::new(|| Box::pin(async {})),
             commit: Some((land, err)),
             commit_calls: AtomicUsize::new(0),
+            failing_fails: AtomicUsize::new(0),
         }
+    }
+    /// The first `n` `fail_compaction` calls also return the commit error, without running.
+    pub fn failing_fails(self, n: usize) -> Self {
+        self.failing_fails.store(n, Ordering::SeqCst);
+        self
     }
     /// `commit_compaction` calls so far.
     pub fn commit_calls(&self) -> usize {
@@ -134,7 +144,12 @@ impl Metastore for HookedMetastore {
         self.inner.expire_candidates(p, cutoff_ns, max_hours).await
     }
     async fn purge_candidates(&self, before_ms: i64, limit: usize) -> MetaResult<Vec<SegmentMeta>> {
-        self.inner.purge_candidates(before_ms, limit).await
+        let r = self.inner.purge_candidates(before_ms, limit).await;
+        (self.hook)().await;
+        r
+    }
+    async fn purge_stats(&self, before_ms: i64) -> MetaResult<(usize, u64)> {
+        self.inner.purge_stats(before_ms).await
     }
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
         self.inner.forget_segments(ids).await
@@ -158,10 +173,16 @@ impl Metastore for HookedMetastore {
         }
     }
     async fn fail_compaction(&self, job_id: i64, error: &str) -> MetaResult<JobStatus> {
+        let failing = self
+            .failing_fails
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if let (Ok(_), Some((_, err))) = (failing, self.commit) {
+            return Err(err());
+        }
         self.inner.fail_compaction(job_id, error).await
     }
-    async fn reset_compactions(&self) -> MetaResult<usize> {
-        self.inner.reset_compactions().await
+    async fn reset_compactions(&self, keep: &[i64]) -> MetaResult<usize> {
+        self.inner.reset_compactions(keep).await
     }
     async fn segment_traces(&self, id: SegmentId) -> MetaResult<Vec<TraceRange>> {
         self.inner.segment_traces(id).await

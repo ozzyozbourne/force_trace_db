@@ -273,8 +273,8 @@ struct Offline {
     cfg: ForgeConfig,
     meta: std::sync::Arc<dyn forge_meta::Metastore>,
     segments: std::sync::Arc<dyn forge_storage::SegmentStore>,
-    /// (node dir name, records past its checkpoint) per locked WAL directory.
-    wal: Vec<(String, u64)>,
+    /// The locked WAL node directories (offline commands never write them; review 1 #7).
+    wal_dirs: Vec<std::path::PathBuf>,
     _locks: Vec<std::fs::File>,
 }
 
@@ -301,8 +301,9 @@ impl Offline {
                 cfg
             }
         };
-        // Every node directory (a server may run under another node id) plus our own.
-        let mut dirs = std::collections::BTreeSet::from([cfg.wal.dir.join(&cfg.node.id)]);
+        // Every existing node directory (a server may run under another node id; a running server has created its
+        // own). None is created.
+        let mut dirs = std::collections::BTreeSet::new();
         if let Ok(rd) = std::fs::read_dir(&cfg.wal.dir) {
             for e in rd {
                 let e = e?;
@@ -326,22 +327,12 @@ impl Offline {
         }
         let meta = forge_meta::open(&cfg.metastore).await?;
         let segments = segment_store(&cfg)?;
-        let mut wal = Vec::new();
-        for d in &dirs {
-            let node = d
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let flushed = meta.wal_checkpoint(&node).await?.map_or(0, |c| c.flushed_seq);
-            let n = forge_ingest::wal::replay(d, flushed, |_, _| Ok::<_, String>(()))?.applied;
-            wal.push((node, n));
-        }
-        meta.reset_compactions().await?;
+        meta.reset_compactions(&[]).await?;
         Ok(Self {
             cfg,
             meta,
             segments,
-            wal,
+            wal_dirs: dirs.into_iter().collect(),
             _locks: locks,
         })
     }
@@ -412,12 +403,18 @@ async fn gc(
     format: Format,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    let unflushed: Vec<String> = o
-        .wal
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(node, n)| format!("WAL of {node} has {n} unflushed records"))
-        .collect();
+    let mut unflushed: Vec<String> = Vec::new();
+    for d in &o.wal_dirs {
+        let node = d
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let flushed = o.meta.wal_checkpoint(&node).await?.map_or(0, |c| c.flushed_seq);
+        let n = forge_ingest::wal::count_unflushed(d, flushed)?;
+        if n > 0 {
+            unflushed.push(format!("WAL of {node} has {n} unflushed records"));
+        }
+    }
     let c = &o.cfg.compaction;
     let opts = forge_ingest::lifecycle::GcOptions {
         gc_grace: gc_grace.unwrap_or(c.gc_grace),

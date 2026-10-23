@@ -6,7 +6,7 @@
 //! Default: 8 seeds in 4 shards. `FORGE_PROP_SEEDS=N` (400 in quick-release), `FORGE_PROP_SEED=s` (one seed).
 use arrow::record_batch::RecordBatch;
 use forge_ingest::blob::BlobGuard;
-use forge_ingest::compact::{CompactCtx, JobReport, job, pick};
+use forge_ingest::compact::{CompactCtx, JobReport, MAX_INPUTS, job, pick};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
 use forge_ingest::testing::write_flush;
 use forge_meta::{CompactionJob, JobRequest, Metastore, SegmentFilter, SqliteMetastore};
@@ -642,7 +642,11 @@ impl World {
                 req(JobKind::L0, vec![l0[0].id, l0[1].id]),
             ));
         }
-        if let (Some(first), Some(runs)) = (l0.first(), hours.values().find(|v| v.len() >= 2)) {
+        // Every request stays within the input cap (begin rejects more with InvalidInput).
+        if let (Some(first), Some(runs)) = (
+            l0.first(),
+            hours.values().find(|v| v.len() >= 2 && v.len() < MAX_INPUTS),
+        ) {
             let mut all = vec![first.id];
             all.extend(runs.iter().map(|s| s.id));
             cases.push((
@@ -651,7 +655,12 @@ impl World {
                 req(JobKind::L0, all),
             ));
         }
-        if let Some(g) = hours.values().map(|v| groups(v)).find(|g| g.len() >= 2) {
+        if let Some(g) = hours
+            .values()
+            .filter(|v| v.len() <= MAX_INPUTS)
+            .map(|v| groups(v))
+            .find(|g| g.len() >= 2)
+        {
             cases.push((
                 "inv_non_suffix",
                 req(JobKind::L1, g[0].clone()),
@@ -683,7 +692,7 @@ impl World {
                 .unwrap()
                 .unwrap();
             let snapshot = self.visible(None).await;
-            for second in [vec![first.id], l0.iter().map(|s| s.id).collect()] {
+            for second in [vec![first.id], l0.iter().take(MAX_INPUTS).map(|s| s.id).collect()] {
                 assert!(
                     self.meta
                         .begin_compaction(req(JobKind::L0, second))
@@ -753,10 +762,17 @@ impl World {
         if l0.is_empty() || hours.is_empty() {
             return;
         }
-        let n = 1 + r.below(l0.len() as u64) as usize;
+        // Both requests within the input cap: an L0 prefix of at most MAX_INPUTS, a suffix of whole groups that fits.
+        let n = 1 + r.below(l0.len().min(MAX_INPUTS) as u64) as usize;
         let (hour, in_hour) = hours.iter().nth(r.below(hours.len() as u64) as usize).unwrap();
         let g = groups(in_hour);
-        let k = 1 + r.below(g.len() as u64) as usize;
+        let fit = (1..=g.len())
+            .take_while(|k| g[g.len() - k..].iter().map(Vec::len).sum::<usize>() <= MAX_INPUTS)
+            .count();
+        if fit == 0 {
+            return;
+        }
+        let k = 1 + r.below(fit as u64) as usize;
         let req_a = JobRequest {
             project_id: forge_model::testing::pid(p),
             kind: JobKind::L0,

@@ -91,8 +91,8 @@ async fn zero_intervals_start_no_ticker() {
         .unwrap();
     let lc = forge_server::lifecycle::start(f.clone());
     six_flushes(&f).await;
-    // With zero intervals no ticker exists at all: a short wait proves as much as a long one.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Longer than 2x the smallest interval the tests use (200 ms): a ticker would have run by now (review T2).
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
     assert_eq!(
         segs.iter().filter(|s| s.level == Level::L0).count(),
@@ -137,4 +137,32 @@ async fn open_resets_running_jobs() {
     let f = forge_server::Forge::open(c).await.unwrap();
     let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
     assert!(segs.iter().all(|s| s.state == SegmentState::Live), "{segs:?}");
+}
+
+/// Review 1 #6: a GC pass in progress does not hold up shutdown (it runs as its own task and is aborted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_a_slow_gc_pass_is_prompt() {
+    let d = tempfile::tempdir().unwrap();
+    let f = forge_server::Forge::open(cfg(d.path(), Duration::ZERO, Duration::from_millis(50)))
+        .await
+        .unwrap();
+    // Every GC pass blocks 30 s in its purge read.
+    let slow = std::sync::Arc::new(forge_query::testing::HookedMetastore::slow(
+        f.meta.clone(),
+        Duration::from_secs(30),
+    ));
+    let f = std::sync::Arc::new(forge_server::Forge {
+        config: f.config.clone(),
+        meta: slow,
+        segments: f.segments.clone(),
+        ingest: f.ingest.clone(),
+        query: f.query.clone(),
+        ready: Default::default(),
+        shutdown: Default::default(),
+    });
+    let lc = forge_server::lifecycle::start(f.clone());
+    tokio::time::sleep(Duration::from_millis(300)).await; // the first pass started at 50 ms
+    let t = std::time::Instant::now();
+    lc.shutdown(Duration::from_secs(5)).await;
+    assert!(t.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t.elapsed());
 }

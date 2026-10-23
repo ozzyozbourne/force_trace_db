@@ -468,9 +468,16 @@ impl Case {
 /// Load until the failpoint SIGKILLs the server, restart, verify (A–O). A compaction/GC failpoint passes
 /// `Some(after_restart)`: the load runs with compaction on, then `after_restart` (before S, whose `forge compact`
 /// adds jobs), then P and R; the full S (offline compact + gc, answers unchanged) only for `FULL_S`.
-/// The compaction failpoints that also run S (one inside the swap txn, one inside GC); S is costly (many
-/// `forge sql` processes) and the other cases add no S-specific state.
-const FULL_S: [&str; 2] = ["meta_compact_in_txn@1", "gc_after_object_delete@1"];
+/// The compaction failpoints that also run S, each with state of its own (review T6): a kill inside the swap txn,
+/// deleted inputs whose objects are kept (after the swap), inputs reset to live (after the lease), deleted rows
+/// whose objects are gone (inside GC). S is costly (many `forge sql` processes); the other cases add no
+/// S-specific state.
+const FULL_S: [&str; 4] = [
+    "meta_compact_in_txn@1",
+    "compact_after_swap@1",
+    "compact_after_lease@1",
+    "gc_after_object_delete@1",
+];
 
 async fn crash_case(fp: &str, interval: &str, orphans: Orphans, compaction: Option<fn(&Path)>) -> Replay {
     let c = Case::new("5s");
@@ -815,14 +822,21 @@ async fn crash_compact_after_swap() {
     timed(crash_case("compact_after_swap@1", "300ms", Orphans::Any, Some(|_| {}))).await;
 }
 
-/// S4 proves the next GC forgets the row whose object is gone.
+/// The failpoint fires after a non-empty purge batch deleted its objects (review T1): at least one `deleted` row
+/// has lost its object; S4 then proves the next GC forgets it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_gc_after_object_delete() {
     timed(crash_case(
         "gc_after_object_delete@1",
         "300ms",
         Orphans::Any,
-        Some(|_| {}),
+        Some(|d| {
+            let gone = segment_paths(d, "state = 'deleted'")
+                .iter()
+                .filter(|p| !d.join("data").join(p).exists())
+                .count();
+            assert!(gone >= 1, "no deleted row lost its object: the kill hit no purge batch");
+        }),
     ))
     .await;
 }

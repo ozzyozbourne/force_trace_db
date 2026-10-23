@@ -58,6 +58,16 @@ impl SegmentSink {
         self.tx.close_channel();
     }
 
+    /// Ends the input and waits until the writer has stopped, ignoring its result (cleanup after a failure: nothing
+    /// it started is still being written afterwards). Not an abort: dropping a store `put` future does not stop a
+    /// write already handed to a blocking thread.
+    pub async fn wait(mut self) {
+        self.close();
+        if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+    }
+
     /// Ends the input and waits for the upload.
     pub async fn finish(mut self) -> Result<NewSegment, IngestError> {
         self.close();

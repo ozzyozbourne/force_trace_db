@@ -245,3 +245,21 @@ fn m1_keys() {
         Ok(())
     });
 }
+
+/// Review 1 #11: `orphan_grace` below the blob refresh interval (1 h) or the 10 min floor is rejected at load.
+#[test]
+fn orphan_grace_is_validated() {
+    jail(|jail| {
+        for bad in ["0s", "5m", "59m"] {
+            jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", bad);
+            let e = ForgeConfig::load(None).unwrap_err().to_string();
+            assert!(e.contains("orphan_grace"), "{bad}: {e}");
+        }
+        jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", "1h");
+        assert_eq!(
+            ForgeConfig::load(None)?.compaction.orphan_grace,
+            Duration::from_secs(3600)
+        );
+        Ok(())
+    });
+}

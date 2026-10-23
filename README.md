@@ -90,7 +90,8 @@ The server compacts and collects in the background (`[compaction]` in `forge.exa
   "retention_days": 30}` (omit `retention_days` to keep forever). Every `gc_interval` (10m) whole hours older than
   the retention are deleted (L1 by partition hour; an L0 once all its rows are older than the cutoff).
 - **GC.** Deleted segments' objects are removed `gc_grace` (1h) after deletion; objects the catalog does not know
-  (cut uploads) after `orphan_grace` (24h). A compaction job older than half of `orphan_grace` cannot commit.
+  (cut uploads) after `orphan_grace` (24h; at least 1h, the blob refresh interval). A compaction job older than half
+  of `orphan_grace` cannot commit.
 - `interval = "0s"` / `gc_interval = "0s"` turn the background tasks off.
 
 Offline tools (they refuse with exit code 3 while a server holds the data dir; stop the server first):
@@ -98,7 +99,8 @@ Offline tools (they refuse with exit code 3 while a server holds the data dir; s
   off (run it again if the output says capped). Exit 1 on an unknown project or a failed job.
 - `forge gc [--data-dir D] [--dry-run] [--gc-grace 0s] [--orphan-grace 0s] [--format table|json]` runs one retention
   + purge + orphan pass. Blobs are skipped while the WAL holds unflushed records (start and stop the server once to
-  flush them).
+  flush them). Neither command changes the WAL; both (`--dry-run` too) migrate the metastore and reset compaction
+  jobs an earlier process left running.
 
 ## Configuration
 

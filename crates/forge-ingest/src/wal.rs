@@ -379,9 +379,28 @@ pub struct ReplayStats {
 pub fn replay<E: std::fmt::Display>(
     dir: &Path,
     flushed_seq: u64,
-    mut apply: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    apply: impl FnMut(u64, &[u8]) -> Result<(), E>,
 ) -> Result<ReplayStats, WalError> {
     fs::create_dir_all(dir)?;
+    read(dir, flushed_seq, true, apply)
+}
+
+/// Records with `seq > flushed_seq`, read only (offline `forge gc`, review 1 #7): a missing dir counts 0; a torn
+/// tail or a headerless last segment ends the count; nothing is created, cut or removed.
+pub fn count_unflushed(dir: &Path, flushed_seq: u64) -> Result<u64, WalError> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    Ok(read(dir, flushed_seq, false, |_, _| Ok::<_, String>(()))?.applied)
+}
+
+/// `replay`'s loop; `repair` = cut a torn tail and remove a headerless last segment.
+fn read<E: std::fmt::Display>(
+    dir: &Path,
+    flushed_seq: u64,
+    repair: bool,
+    mut apply: impl FnMut(u64, &[u8]) -> Result<(), E>,
+) -> Result<ReplayStats, WalError> {
     let segs = list_segments(dir)?;
     let mut st = ReplayStats {
         next_seq: flushed_seq + 1,
@@ -401,9 +420,11 @@ pub fn replay<E: std::fmt::Display>(
         if file_len < MAGIC.len() as u64 {
             if last {
                 // Crash between create and the magic's fsync: no records can be in it.
-                fs::remove_file(path)?;
-                sync_dir(dir)?;
-                st.removed_empty += 1;
+                if repair {
+                    fs::remove_file(path)?;
+                    sync_dir(dir)?;
+                    st.removed_empty += 1;
+                }
                 continue;
             }
             return Err(corrupt(0, "short segment header".into()));
@@ -461,7 +482,7 @@ pub fn replay<E: std::fmt::Display>(
             st.next_seq = st.next_seq.max(seq + 1);
             off += REC_HDR as u64 + len;
         }
-        if off < file_len {
+        if off < file_len && repair {
             // Only reachable for the last segment (torn tail).
             let f = OpenOptions::new().write(true).open(path)?;
             f.set_len(off)?;

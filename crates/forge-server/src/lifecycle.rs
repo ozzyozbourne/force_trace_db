@@ -1,8 +1,7 @@
 //! The lifecycle task: compaction picker + GC pass on intervals. Stops between jobs.
 use crate::app::Forge;
-use forge_ingest::compact::{CompactCtx, run_next};
+use forge_ingest::compact::{CompactCtx, reset_dead_jobs, run_next};
 use forge_ingest::lifecycle::{GcOptions, run_gc};
-use forge_model::merge::Cancel;
 use forge_model::time::{Clock, Clocks, wall_clock};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,21 +10,26 @@ use tokio_util::sync::CancellationToken;
 
 pub struct LifecycleTasks {
     stop: CancellationToken,
-    /// The running jobs' cancel flag (`CompactCtx::cancel`).
-    cancel: Cancel,
+    cx: Arc<CompactCtx>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl LifecycleTasks {
-    /// Stop picking new jobs and cancel running ones (they stop at their next slice boundary, never inside the
-    /// commit); wait up to `grace`, then abort. An aborted job is safe: the swap is one txn (all or nothing), its
-    /// outputs become orphans, and the next start resets the job (`Forge::open`).
+    /// Stop picking new jobs, abort a running GC pass (every GC step is idempotent and metastore-first) and cancel
+    /// running jobs (they stop at their next slice boundary, never inside the commit); wait up to `grace`, then
+    /// abort. An aborted job is safe: the swap is one txn (all or nothing), its outputs become orphans, and the
+    /// next start resets the job (`Forge::open`).
     pub async fn shutdown(self, grace: Duration) {
         self.stop.cancel();
-        self.cancel.cancel();
+        self.cx.cancel.cancel();
         let abort = self.handle.abort_handle();
         if tokio::time::timeout(grace, self.handle).await.is_err() {
-            tracing::warn!(?grace, "lifecycle: running compactions abandoned at shutdown");
+            let jobs = self.cx.running.count();
+            tracing::warn!(
+                jobs,
+                ?grace,
+                "lifecycle: shutdown grace elapsed; aborting running compactions"
+            );
             abort.abort();
         }
     }
@@ -49,9 +53,8 @@ pub fn start_with(f: Arc<Forge>, data_clock: Clock) -> LifecycleTasks {
         clocks,
     ));
     let stop = CancellationToken::new();
-    let cancel = cx.cancel.clone();
-    let handle = tokio::spawn(run(f, cx, stop.clone()));
-    LifecycleTasks { stop, cancel, handle }
+    let handle = tokio::spawn(run(f, cx.clone(), stop.clone()));
+    LifecycleTasks { stop, cx, handle }
 }
 
 /// A period of zero disables the tick (tokio's `interval` panics on zero).
@@ -74,16 +77,31 @@ async fn tick(t: &mut Option<tokio::time::Interval>) {
     }
 }
 
+/// One GC pass, logged.
+async fn gc_pass(f: Arc<Forge>, cx: Arc<CompactCtx>) {
+    let store = f.segments.object_store();
+    let o = GcOptions::from_config(&f.config.compaction);
+    match run_gc(f.meta.as_ref(), store.as_ref(), &cx.clocks, &o, f.ingest.blob_guard()).await {
+        Ok(r) => tracing::info!(?r, "gc pass done"),
+        Err(e) => tracing::warn!(error = %e, "gc pass failed; retried next interval"),
+    }
+}
+
 async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, stop: CancellationToken) {
     let c = f.config.compaction.clone();
     let mut jobs: JoinSet<()> = JoinSet::new();
+    // GC runs as its own task (at most one), so a long pass neither delays the compaction ticks nor the stop.
+    let mut gc: Option<tokio::task::JoinHandle<()>> = None;
     let mut compact_tick = ticker(c.interval, false);
     let mut gc_tick = ticker(c.gc_interval, true);
-    let blobs = f.ingest.blob_guard();
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
             _ = tick(&mut compact_tick) => {
+                // Jobs whose task died (panic, abort) or whose fail_compaction failed (review 1 #4).
+                if let Err(e) = reset_dead_jobs(&cx).await {
+                    tracing::warn!(error = %e, "compaction: resetting dead jobs failed");
+                }
                 for _ in jobs.len()..c.concurrency.max(1) {
                     let cx = cx.clone();
                     jobs.spawn(async move {
@@ -96,14 +114,20 @@ async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, stop: CancellationToken) {
                 }
             }
             _ = tick(&mut gc_tick) => {
-                let store = f.segments.object_store();
-                match run_gc(f.meta.as_ref(), store.as_ref(), &cx.clocks, &GcOptions::from_config(&c), blobs).await {
-                    Ok(r) => tracing::info!(?r, "gc pass done"),
-                    Err(e) => tracing::warn!(error = %e, "gc pass failed; retried next interval"),
+                if gc.as_ref().is_none_or(|h| h.is_finished()) {
+                    gc = Some(tokio::spawn(gc_pass(f.clone(), cx.clone())));
                 }
             }
-            Some(_) = jobs.join_next(), if !jobs.is_empty() => {}
+            Some(r) = jobs.join_next(), if !jobs.is_empty() => {
+                if let Err(e) = r {
+                    tracing::error!(error = %e, "compaction task died; its job is reset on the next tick");
+                }
+            }
         }
+    }
+    if let Some(h) = gc {
+        h.abort();
+        let _ = h.await;
     }
     while jobs.join_next().await.is_some() {}
 }

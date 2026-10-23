@@ -31,7 +31,7 @@ impl Forge {
         let (ingest, _report) = forge_ingest::Pipeline::open(&config, meta.clone(), segments.clone()).await?;
         // One process per data dir (the WAL LOCK is held now): no compaction job of an earlier process is still
         // running (plans/phase-4 D2).
-        let n = meta.reset_compactions().await?;
+        let n = meta.reset_compactions(&[]).await?;
         if n > 0 {
             tracing::info!(jobs = n, "compaction jobs of the previous run reset");
         }

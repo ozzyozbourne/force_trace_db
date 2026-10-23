@@ -433,3 +433,395 @@ async fn tiny_merge_chunks_write_the_same_outputs() {
     }
     assert_eq!(outputs[0], outputs[1]);
 }
+
+/// Review 1 #3: an hour with 70 overlapping L1 runs (more than one job may take) makes progress over ticks: each
+/// tick takes the newest `MAX_INPUTS` whole groups, and the hour ends as one group.
+#[tokio::test]
+async fn hour_with_70_runs_makes_progress() {
+    let mut w = W::new();
+    for k in 0..70u64 {
+        // Traces 1 and 100 in every run: every pair of runs overlaps.
+        let rows: Vec<SpanRow> = [1, 100]
+            .map(|t| SpanRow {
+                start_time_ns: Some(at(0, k as i64)),
+                ..row(t, k + 1, k + 1)
+            })
+            .to_vec();
+        w.flush(&rows).await;
+        w.compact_l0(CompactionConfig::default()).await;
+    }
+    assert_eq!(w.l1().await.len(), 70);
+    let want = w.read().await;
+    let cx = w.cx(CompactionConfig::default());
+    let mut ticks = 0;
+    while let Some(r) = forge_ingest::compact::run_next(&cx).await.unwrap() {
+        assert!(r.l1_inputs <= forge_ingest::compact::MAX_INPUTS, "{r:?}");
+        ticks += 1;
+        assert!(ticks < 10, "no progress");
+    }
+    assert_eq!(w.l1().await.len(), 1);
+    assert_eq!(w.read().await, want);
+}
+
+/// Review 1 #12: time-ordered, non-overlapping L0s (disjoint runs) keep each hour's segment count bounded, with the
+/// picker on every flush.
+#[tokio::test]
+async fn time_ordered_disjoint_l0s_keep_hours_bounded() {
+    const PER_HOUR: u64 = 40;
+    let mut w = W::new();
+    let cx = w.cx(CompactionConfig {
+        target_segment: bytesize::ByteSize::kib(128),
+        l0_trigger: 1,
+        ..Default::default()
+    });
+    let mut most = 0;
+    for k in 0..2 * PER_HOUR {
+        let hour = (k / PER_HOUR) as i64;
+        let rows: Vec<SpanRow> = (0..10u64)
+            .map(|j| SpanRow {
+                start_time_ns: Some(at(hour, (k * 10 + j) as i64)),
+                // ~1 KiB of poorly compressible text per row.
+                inputs: Some(
+                    (0..64u64)
+                        .map(|i| {
+                            format!(
+                                "{:016x}",
+                                (k * 10 + j).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                    ^ i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                            )
+                        })
+                        .collect(),
+                ),
+                trace_id: forge_model::ids::TraceId((u128::from(k * 10 + j + 1)).to_be_bytes()), // time-ordered
+                ..row(0, 1, k + 1)
+            })
+            .collect();
+        w.flush(&rows).await;
+        while forge_ingest::compact::run_next(&cx).await.unwrap().is_some() {}
+        let l1 = w.l1().await;
+        let n = l1.iter().filter(|s| s.partition_hour == HourBucket(H0 + hour)).count();
+        most = most.max(n);
+    }
+    assert!(most <= 8, "per-hour L1 count grew to {most}");
+}
+
+/// An object store whose `put_opts` runs on a detached task after `delay` (like a local-fs write on a blocking
+/// thread): dropping the put future does not stop the write.
+#[derive(Debug)]
+struct DetachedPuts {
+    inner: Arc<dyn object_store::ObjectStore>,
+    delay: std::time::Duration,
+}
+
+impl std::fmt::Display for DetachedPuts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DetachedPuts")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DetachedPuts {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let (inner, location, delay) = (self.inner.clone(), location.clone(), self.delay);
+        let write = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            inner.put_opts(&location, payload, opts).await
+        });
+        write.await.expect("put task")
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Review 1 #9: a failed build waits for its writers before deleting their objects, so an upload still in flight at
+/// the failure does not land afterwards as an orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_job_leaves_no_late_upload() {
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(DetachedPuts {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        delay: std::time::Duration::from_millis(300),
+    });
+    let mut w = W {
+        meta: Arc::new(SqliteMetastore::open_in_memory().unwrap()),
+        store: Arc::new(forge_storage::VortexSegmentStore::new(forge_storage::BuiltStore {
+            store: os.clone(),
+            local_root: None,
+        })),
+        seq: 0,
+    };
+    let rows: Vec<SpanRow> = (0..20)
+        .map(|t| SpanRow {
+            start_time_ns: Some(at(0, t as i64)),
+            inputs: Some("z".repeat(3000)),
+            ..row(t, 1, t + 1)
+        })
+        .collect();
+    let l0 = w.flush(&rows).await;
+    // The second output's write fails after 100 ms, while the first is still uploading (300 ms).
+    let writes = Arc::new(AtomicUsize::new(0));
+    let n = writes.clone();
+    let store = Arc::new(HookedSegmentStore::new(
+        w.store.clone(),
+        Box::new(move |_| {
+            let fail = n.fetch_add(1, Ordering::SeqCst) + 1 == 2;
+            Box::pin(async move {
+                if !fail {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Err(StorageError::InvalidInput("injected upload failure".into()))
+            })
+        }),
+    ));
+    let cx = CompactCtx {
+        segments: store,
+        ..w.cx(CompactionConfig {
+            target_segment: bytesize::ByteSize::kib(8),
+            slice_bytes: bytesize::ByteSize::kib(1),
+            ..Default::default()
+        })
+    };
+    let j = w.begin(JobKind::L0, vec![l0]).await;
+    assert!(job::run_job(&cx, j).await.is_err());
+    assert!(writes.load(Ordering::SeqCst) >= 2);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let l1_objects: Vec<_> = os
+        .list(Some(&object_store::path::Path::from("segments/p/L1")))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(l1_objects.is_empty(), "uploads left: {l1_objects:?}");
+}
+
+/// Scans panic (a bug in the job's async code).
+#[derive(Debug)]
+struct PanicScan(Arc<dyn SegmentStore>);
+
+#[async_trait::async_trait]
+impl SegmentStore for PanicScan {
+    async fn write_segment(
+        &self,
+        spec: forge_storage::SegmentSpec,
+        rows: forge_storage::BatchStream,
+    ) -> forge_storage::StorageResult<forge_storage::WrittenSegment> {
+        self.0.write_segment(spec, rows).await
+    }
+    async fn scan(&self, _: &SegmentMeta, _: ScanRequest) -> forge_storage::StorageResult<forge_storage::BatchStream> {
+        panic!("injected scan panic")
+    }
+    fn object_store(&self) -> Arc<dyn object_store::ObjectStore> {
+        self.0.object_store()
+    }
+}
+
+/// Review 1 #4: a job whose task panicked stays `running` (inputs `compacting`) until the next tick's
+/// `reset_dead_jobs` fails it; a job that a task still runs is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_job_is_reset_live_job_is_kept() {
+    let mut w = W::new();
+    w.flush(&[row(1, 1, 1)]).await;
+    let cfg = CompactionConfig {
+        l0_trigger: 1,
+        ..Default::default()
+    };
+    let cx = Arc::new(CompactCtx {
+        segments: Arc::new(PanicScan(w.store.clone())),
+        ..w.cx(cfg.clone())
+    });
+    let task = tokio::spawn({
+        let cx = cx.clone();
+        async move { forge_ingest::compact::run_next(&cx).await }
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(w.segs().await.iter().all(|s| s.state == SegmentState::Compacting));
+    assert_eq!(forge_ingest::compact::reset_dead_jobs(&cx).await.unwrap(), 1);
+    assert!(w.segs().await.iter().all(|s| s.state == SegmentState::Live));
+    // A slow job in progress is not reset, and commits.
+    let slow = Arc::new(HookedSegmentStore::new(
+        w.store.clone(),
+        Box::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Ok(())
+            })
+        }),
+    ));
+    let cx = Arc::new(CompactCtx {
+        segments: slow,
+        ..w.cx(cfg)
+    });
+    let task = tokio::spawn({
+        let cx = cx.clone();
+        async move { forge_ingest::compact::run_next(&cx).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(cx.running.count(), 1);
+    assert_eq!(forge_ingest::compact::reset_dead_jobs(&cx).await.unwrap(), 0);
+    assert!(task.await.unwrap().unwrap().is_some());
+    assert_eq!(cx.running.count(), 0);
+    assert_eq!(w.l1().await.len(), 1);
+}
+
+/// Review 1 #10: `capped` only when work remains after `COMPACT_MAX_JOBS` (64) jobs.
+#[tokio::test]
+async fn exactly_64_jobs_are_not_capped() {
+    let mut w = W::new();
+    for k in 0..64u64 {
+        w.flush(&[row(k, 1, k + 1)]).await;
+    }
+    let cx = w.cx(CompactionConfig {
+        max_job_bytes: bytesize::ByteSize::b(1), // one L0 per job, no folds, no kind B
+        ..Default::default()
+    });
+    let s = compact_project(&cx, &pid("p")).await.unwrap();
+    assert_eq!(s.jobs.len(), 64);
+    assert!(!s.capped, "the 64th job finished the work");
+}
+
+/// Review 1 #10: a job that fails is not picked again by the server ticks before its backoff, and one project's
+/// failure does not end the round: the next project's job runs.
+#[tokio::test]
+async fn failed_job_backs_off_and_the_round_goes_on() {
+    let mut w = W::new();
+    let in_project = |p: &str| SpanRow {
+        project_id: Some(pid(p)),
+        ..row(1, 1, 1)
+    };
+    w.flush(&[in_project("a"), in_project("b")]).await;
+    let a_writes = Arc::new(AtomicUsize::new(0));
+    let n = a_writes.clone();
+    let store = Arc::new(HookedSegmentStore::new(
+        w.store.clone(),
+        Box::new(move |spec| {
+            let r = if spec.project_id == pid("a") {
+                n.fetch_add(1, Ordering::SeqCst);
+                Err(StorageError::InvalidInput("injected upload failure".into()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { r })
+        }),
+    ));
+    let cx = CompactCtx {
+        segments: store,
+        ..w.cx(CompactionConfig {
+            l0_trigger: 1,
+            ..Default::default()
+        })
+    };
+    // Rotation starts at "a": it fails, "b" runs.
+    let r = forge_ingest::compact::run_next(&cx).await.unwrap().expect("b's job");
+    assert_eq!(r.project, "b");
+    // "a" is backing off: nothing due, and its job is not tried again.
+    assert!(forge_ingest::compact::run_next(&cx).await.unwrap().is_none());
+    assert_eq!(a_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(cx.running.count(), 0);
+}
+
+/// §6.5 / review T7: kind A folding hour 0 runs beside kind B rewriting hour 1, with a flush between the begins
+/// and the commits; the reads equal the reference merge of every row posted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_a_folds_beside_kind_b_with_a_flush_in_between() {
+    let mut w = W::new();
+    let mut all = Vec::new();
+    let start = |trace: u64, span: u64, v: u64, hour: i64| SpanRow {
+        start_time_ns: Some(at(hour, v as i64)),
+        ..row(trace, span, v)
+    };
+    let patch = |trace: u64, span: u64, v: u64, hour: i64| SpanRow {
+        end_time_ns: Some(at(hour, 50 + v as i64)),
+        ..row(trace, span, v)
+    };
+    // Hour 1: two overlapping runs (kind B); hour 0: one small run (folded by kind A).
+    for rows in [
+        vec![start(1, 1, 1, 1), start(2, 1, 2, 1)],
+        vec![patch(1, 1, 3, 1), start(2, 2, 4, 1)],
+        vec![start(10, 1, 5, 0)],
+    ] {
+        w.flush(&rows).await;
+        w.compact_l0(CompactionConfig::default()).await;
+        all.extend(rows);
+    }
+    let l0 = vec![patch(10, 1, 6, 0), start(11, 1, 7, 0)];
+    let l0_id = w.flush(&l0).await;
+    all.extend(l0);
+    let l1 = w.l1().await;
+    let in_hour = |h: i64| -> Vec<SegmentId> {
+        l1.iter()
+            .filter(|s| s.partition_hour == HourBucket(H0 + h))
+            .map(|s| s.id)
+            .collect()
+    };
+    assert_eq!((in_hour(0).len(), in_hour(1).len()), (1, 2));
+    let jb = w.begin(JobKind::L1, in_hour(1)).await;
+    let ja = w.begin(JobKind::L0, [vec![l0_id], in_hour(0)].concat()).await;
+    // The flush lands between the begins and the commits.
+    let late = vec![patch(1, 1, 8, 1), patch(10, 1, 9, 0), start(12, 1, 10, 1)];
+    w.flush(&late).await;
+    all.extend(late);
+    let cx = w.cx(CompactionConfig::default());
+    let (ra, rb) = tokio::join!(job::run_job(&cx, ja), job::run_job(&cx, jb));
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(
+        (ra.stats.folded_hours, ra.l1_inputs, rb.l1_inputs),
+        (1, 1, 2),
+        "{ra:?} {rb:?}"
+    );
+    let strip = |mut v: Vec<SpanRow>| {
+        for r in &mut v {
+            r.dotted_order = None;
+        }
+        v.sort_by_key(|r| (r.trace_id, r.span_id));
+        v
+    };
+    assert_eq!(
+        strip(w.read().await),
+        strip(forge_model::testing::reference_merge(&all))
+    );
+    let segs = w.segs().await;
+    assert!(segs.iter().all(|s| s.state == SegmentState::Live), "{segs:?}");
+    assert_eq!(w.l1().await.len(), 2, "one output per hour");
+}

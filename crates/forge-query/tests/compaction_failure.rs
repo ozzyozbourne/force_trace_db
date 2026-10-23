@@ -22,7 +22,10 @@ fn busy() -> MetaError {
     ))
 }
 
-async fn run(land: bool) -> (Arc<dyn Metastore>, Arc<dyn SegmentStore>, Result<(), String>, usize) {
+async fn run(
+    land: bool,
+    failing_fails: usize,
+) -> (Arc<dyn Metastore>, Arc<dyn SegmentStore>, Result<(), String>, usize) {
     assert_eq!(busy().kind(), ErrorKind::Transient);
     let inner: Arc<dyn Metastore> = Arc::new(SqliteMetastore::open_in_memory().unwrap());
     let store = memory_store();
@@ -49,7 +52,7 @@ async fn run(land: bool) -> (Arc<dyn Metastore>, Arc<dyn SegmentStore>, Result<(
     )
     .await;
     // Every attempt (the real commit runs first if `land`) reports a transient error.
-    let hooked = Arc::new(HookedMetastore::on_commit(inner.clone(), land, busy));
+    let hooked = Arc::new(HookedMetastore::on_commit(inner.clone(), land, busy).failing_fails(failing_fails));
     let meta: Arc<dyn Metastore> = hooked.clone();
     let l0 = inner.list_segments(&SegmentFilter::default()).await.unwrap();
     let j = meta
@@ -78,7 +81,7 @@ async fn l1_objects(store: &dyn SegmentStore) -> Vec<object_store::path::Path> {
 
 #[tokio::test]
 async fn commit_lands_then_errors_is_success() {
-    let (meta, store, r, calls) = run(true).await;
+    let (meta, store, r, calls) = run(true, 0).await;
     assert!(r.is_ok(), "{r:?}");
     assert_eq!(calls, 3, "3 attempts, then fail_compaction finds the job done");
     let segs = meta.list_segments(&SegmentFilter::default()).await.unwrap();
@@ -100,7 +103,14 @@ async fn commit_lands_then_errors_is_success() {
 
 #[tokio::test]
 async fn commit_that_does_not_land_leaves_orphans() {
-    let (meta, store, r, calls) = run(false).await;
+    // Review 1 #4: the first fail_compaction fails too (transient); its retry still fails the job.
+    for failing_fails in [0, 1] {
+        commit_does_not_land(failing_fails).await;
+    }
+}
+
+async fn commit_does_not_land(failing_fails: usize) {
+    let (meta, store, r, calls) = run(false, failing_fails).await;
     assert!(r.is_err());
     assert_eq!(calls, 3);
     let segs = meta.list_segments(&SegmentFilter::default()).await.unwrap();

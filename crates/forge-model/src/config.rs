@@ -142,6 +142,14 @@ pub struct CompactionConfig {
     pub orphan_grace: Duration,
 }
 
+/// `put_blobs` rewrites a reused blob older than this (bumps last_modified), so the orphan sweep spares it until
+/// its row is flushed; `orphan_grace` must be at least this.
+pub const BLOB_REFRESH: Duration = Duration::from_secs(3600);
+/// Smallest `orphan_grace` `ForgeConfig::load` accepts (review 1 #11): a compaction job must commit within half of
+/// it (D15), and a flush's upload must be committed before the orphan sweep may take it. Configs built in code
+/// (tests) are not checked.
+pub const MIN_ORPHAN_GRACE: Duration = Duration::from_secs(600);
+
 impl CompactionConfig {
     /// D15: a compaction job older than this cannot commit, so the orphan sweep (`orphan_grace` = 2 x this) never
     /// deletes an upload that is about to be committed.
@@ -237,6 +245,13 @@ impl ForgeConfig {
         ProjectId::new(cfg.node.id.clone()).map_err(|e| figment::Error::from(format!("node.id: {e}")))?;
         ProjectId::new(cfg.ingest.default_project.clone())
             .map_err(|e| figment::Error::from(format!("ingest.default_project: {e}")))?;
+        let og = cfg.compaction.orphan_grace;
+        if og < MIN_ORPHAN_GRACE || og < BLOB_REFRESH {
+            return Err(figment::Error::from(format!(
+                "compaction.orphan_grace ({og:?}) must be at least {BLOB_REFRESH:?} (the blob refresh interval) and \
+                 {MIN_ORPHAN_GRACE:?} (compaction jobs and flush uploads commit before the orphan sweep)"
+            )));
+        }
         if cfg.memtable.flush_bytes > cfg.memtable.memory_budget {
             return Err(figment::Error::from(
                 "memtable.flush_bytes must be <= memtable.memory_budget".to_string(),

@@ -142,6 +142,10 @@ async fn begin_rules_kind_b_suffix() {
         "skips a middle group"
     );
     assert!(d.begin(JobKind::L1, &[&g2m, &g3]).await.is_none(), "splits a group");
+    assert!(
+        d.begin(JobKind::L1, &[&g2o, &g3]).await.is_none(),
+        "splits a group (the excluded file starts older)"
+    );
     assert!(d.begin(JobKind::L1, &[&g3, &other_hour]).await.is_none(), "two hours");
     assert_eq!(d.snapshot(), before);
     // The newest suffix of whole groups.
@@ -236,13 +240,13 @@ async fn swap_retry_fail_reset_prune() {
     assert_eq!(d.state(&b).await, SegmentState::Compacting);
 
     // reset: every running job failed, inputs live.
-    assert_eq!(d.m.reset_compactions().await.unwrap(), 1);
+    assert_eq!(d.m.reset_compactions(&[]).await.unwrap(), 1);
     assert_eq!(d.state(&b).await, SegmentState::Live);
     assert_eq!(
         d.count("SELECT count(*) FROM compaction_jobs WHERE status = 'running'"),
         0
     );
-    assert_eq!(d.m.reset_compactions().await.unwrap(), 0);
+    assert_eq!(d.m.reset_compactions(&[]).await.unwrap(), 0);
 
     // prune: done/failed only, by finished_at.
     let j4 = d.begin(JobKind::L0, &[&b]).await.unwrap();

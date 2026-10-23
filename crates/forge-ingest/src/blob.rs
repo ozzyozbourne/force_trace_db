@@ -9,9 +9,9 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path}
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-/// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. Far below the
-/// 24 h orphan grace.
-const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+/// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. At most the orphan
+/// grace (checked at config load).
+const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::seconds(forge_model::config::BLOB_REFRESH.as_secs() as i64);
 
 /// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
 /// `threshold` bytes with a blob reference and returns the blobs to write (`put_blobs`), keyed by path.
@@ -36,14 +36,26 @@ pub fn plan_blobs(rows: &mut [SpanRow], threshold: usize) -> HashMap<String, Byt
     puts
 }
 
-/// Blob sweep vs ingest (plans/phase-4 §2.9). `put_blobs` holds the read lock for its whole call and records
-/// every path it writes or reuses; the sweep deletes each chunk under the write lock, minus the recorded paths.
+/// Blob sweep vs ingest (plans/phase-4 §2.9). `put_blobs` holds the read lock for its whole call; `begin_sweep` takes
+/// the write lock once (every earlier put has refreshed its blob, so the listing sees it fresh) and then records
+/// the paths of every later put until the sweep ends; the sweep deletes each chunk under the write lock, minus the
+/// recorded paths. Nothing is recorded while no sweep runs.
 #[derive(Debug, Default)]
 pub struct BlobGuard {
     lock: tokio::sync::RwLock<()>,
-    recent: std::sync::Mutex<HashSet<String>>,
+    /// Some only while a sweep runs (`begin_sweep` .. drop of its `SweepGuard`).
+    recent: std::sync::Mutex<Option<HashSet<String>>>,
     /// No `put_blobs` can run during a sweep (see `exclusive`).
     pub(crate) exclusive: bool,
+}
+
+/// An active sweep's recording window; dropping it (also on error) stops recording.
+pub struct SweepGuard<'a>(&'a BlobGuard);
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.recent.lock().unwrap() = None;
+    }
 }
 
 impl BlobGuard {
@@ -56,12 +68,19 @@ impl BlobGuard {
         }
     }
 
-    /// Sweep start (before listing): forget the paths of earlier puts.
-    pub fn clear_recent(&self) {
-        self.recent.lock().unwrap().clear();
+    /// Sweep start (before listing): waits out in-flight puts, then records later puts until the guard drops.
+    pub async fn begin_sweep(&self) -> SweepGuard<'_> {
+        let _w = self.lock.write().await;
+        *self.recent.lock().unwrap() = Some(HashSet::new());
+        SweepGuard(self)
     }
 
-    /// Deletes `paths` except those put since `clear_recent`, under the write lock (no `put_blobs` runs meanwhile).
+    /// Paths recorded by the active sweep; None when no sweep runs (tests).
+    pub fn recorded(&self) -> Option<usize> {
+        self.recent.lock().unwrap().as_ref().map(HashSet::len)
+    }
+
+    /// Deletes `paths` except those put since `begin_sweep`, under the write lock (no `put_blobs` runs meanwhile).
     /// Returns the paths it deleted.
     pub async fn delete_unless_recent(
         &self,
@@ -71,7 +90,11 @@ impl BlobGuard {
         let _sweep = self.lock.write().await;
         let doomed: Vec<Path> = {
             let recent = self.recent.lock().unwrap();
-            paths.into_iter().filter(|p| !recent.contains(p.as_ref())).collect()
+            let recent = recent.as_ref();
+            paths
+                .into_iter()
+                .filter(|p| !recent.is_some_and(|r| r.contains(p.as_ref())))
+                .collect()
         };
         forge_storage::delete_all(store, doomed.clone()).await?;
         Ok(doomed)
@@ -86,7 +109,9 @@ pub async fn put_blobs(
     guard: &BlobGuard,
 ) -> object_store::Result<usize> {
     let _sweep = guard.lock.read().await;
-    guard.recent.lock().unwrap().extend(puts.keys().cloned());
+    if let Some(r) = guard.recent.lock().unwrap().as_mut() {
+        r.extend(puts.keys().cloned());
+    }
     let n = puts.len();
     futures::stream::iter(puts)
         .map(|(path, bytes)| async move {

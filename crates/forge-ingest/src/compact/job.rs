@@ -266,10 +266,13 @@ impl Writers {
         Ok(out)
     }
 
-    /// Stops every writer (dropping a sink aborts it) and returns every object the job may have created.
-    fn abort(&mut self) -> Vec<object_store::path::Path> {
-        self.open.clear();
-        self.closing.clear();
+    /// Ends every writer and waits for it (`SegmentSink::wait`), so no upload lands after the caller's cleanup
+    /// (review 1 #9). Returns every object the job may have created.
+    async fn abort(&mut self) -> Vec<object_store::path::Path> {
+        let open = std::mem::take(&mut self.open).into_values().map(|w| w.sink);
+        for sink in open.chain(std::mem::take(&mut self.closing)) {
+            sink.wait().await;
+        }
         std::mem::take(&mut self.objects)
     }
 }
@@ -284,23 +287,32 @@ pub async fn run_job(cx: &CompactCtx, job: CompactionJob) -> Result<JobReport, I
     let (mut report, commit) = match build(cx, &job, &mut w).await {
         Ok(x) => x,
         Err(e) => {
-            let objects = w.abort();
-            let _ = cx.meta.fail_compaction(job.id, &e.to_string()).await;
+            let objects = w.abort().await;
+            fail_job(cx, job.id, &e).await;
             let _ = forge_storage::delete_all(cx.segments.object_store().as_ref(), objects).await;
             return Err(e);
         }
     };
     if let Err(e) = commit_job(cx, commit).await {
-        if !matches!(
-            cx.meta.fail_compaction(job.id, &e.to_string()).await,
-            Ok(JobStatus::Done)
-        ) {
+        if fail_job(cx, job.id, &e).await != Some(JobStatus::Done) {
             return Err(e);
         }
         tracing::warn!(job = job.id, error = %e, "compaction commit reported an error but landed");
     }
     report.elapsed_ms = t0.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// `fail_compaction`, retried on transient errors (it is idempotent). None if it still fails: the job stays running
+/// until the next tick resets it (`reset_dead_jobs`).
+async fn fail_job(cx: &CompactCtx, id: i64, e: &IngestError) -> Option<JobStatus> {
+    let msg = e.to_string();
+    let r = retry_bounded("fail_compaction", COMMIT_BACKOFF, COMMIT_ATTEMPTS, || {
+        cx.meta.fail_compaction(id, &msg)
+    })
+    .await;
+    r.inspect_err(|err| tracing::error!(job = id, error = %err, "fail_compaction failed; the job stays running"))
+        .ok()
 }
 
 /// The commit: the atomic swap, retried on transient errors.

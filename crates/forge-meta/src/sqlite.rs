@@ -555,9 +555,10 @@ fn expire_params(project: &ProjectId, cutoff_ns: i64, max_hours: usize) -> (Stri
 /// Inputs of running jobs back to live, then the jobs to failed; `?1` = job id or NULL (every running job).
 const RESET_INPUTS: &str = "UPDATE segments SET state = 'live' WHERE state = 'compacting' AND id IN ( \
     SELECT ci.segment_id FROM compaction_inputs ci JOIN compaction_jobs j ON j.id = ci.job_id \
-    WHERE j.status = 'running' AND (?1 IS NULL OR j.id = ?1))";
+    WHERE j.status = 'running' AND j.id = ?1)";
 const RESET_JOBS: &str = "UPDATE compaction_jobs SET status = 'failed', finished_at_ms = ?2, error = ?3 \
-    WHERE status = 'running' AND (?1 IS NULL OR id = ?1)";
+    WHERE status = 'running' AND id = ?1";
+const RUNNING_JOBS: &str = "SELECT id FROM compaction_jobs WHERE status = 'running'";
 
 fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
@@ -1072,6 +1073,19 @@ impl Metastore for SqliteMetastore {
         .await
     }
 
+    async fn purge_stats(&self, deleted_before_ms: i64) -> MetaResult<(usize, u64)> {
+        self.read(move |c| {
+            let (n, bytes): (i64, i64) = c
+                .prepare_cached(
+                    "SELECT count(*), COALESCE(sum(byte_size + COALESCE(fts_byte_size, 0)), 0) FROM segments \
+                     WHERE state = 'deleted' AND deleted_at_ms < ?1",
+                )?
+                .query_row([deleted_before_ms], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok((n as usize, bytes as u64))
+        })
+        .await
+    }
+
     async fn forget_segments(&self, ids: &[SegmentId]) -> MetaResult<usize> {
         let ids: Arc<Vec<String>> = Arc::new(ids.iter().map(SegmentId::to_string).collect());
         // Short txns: each deletes <= TRACE_INDEX_PURGE_CHUNK trace rows of deleted segments, filled across
@@ -1154,12 +1168,26 @@ impl Metastore for SqliteMetastore {
         .await
     }
 
-    async fn reset_compactions(&self) -> MetaResult<usize> {
+    async fn reset_compactions(&self, keep: &[i64]) -> MetaResult<usize> {
+        let keep: HashSet<i64> = keep.iter().copied().collect();
+        let running = |c: &Connection| -> MetaResult<Vec<i64>> {
+            let mut st = c.prepare_cached(RUNNING_JOBS)?;
+            let ids = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?;
+            Ok(ids)
+        };
+        // Read first: the usual tick finds nothing to reset and takes no write lock.
+        if self.read(move |c| running(c)).await?.iter().all(|id| keep.contains(id)) {
+            return Ok(0);
+        }
         self.write(move |tx| {
-            tx.prepare_cached(RESET_INPUTS)?.execute([Option::<i64>::None])?;
-            Ok(tx
-                .prepare_cached(RESET_JOBS)?
-                .execute(params![Option::<i64>::None, now_ms(), "reset at startup"])?)
+            let mut n = 0;
+            for id in running(tx)?.into_iter().filter(|id| !keep.contains(id)) {
+                tx.prepare_cached(RESET_INPUTS)?.execute([id])?;
+                n += tx
+                    .prepare_cached(RESET_JOBS)?
+                    .execute(params![id, now_ms(), "reset: no task runs it"])?;
+            }
+            Ok(n)
         })
         .await
     }
