@@ -90,11 +90,13 @@ The server compacts and collects in the background (`[compaction]` in `forge.exa
   "retention_days": 30}` (omit `retention_days` to keep forever). Every `gc_interval` (10m) whole hours older than
   the retention are deleted (L1 by partition hour; an L0 once all its rows are older than the cutoff).
 - **GC.** Deleted segments' objects are removed `gc_grace` (1h) after deletion; objects the catalog does not know
-  (cut uploads) after `orphan_grace` (24h; at least 1h, the blob refresh interval). A compaction job older than half
-  of `orphan_grace` cannot commit.
+  (cut uploads) after `orphan_grace` (24h; at least 4 x `memtable.flush_interval` + 10m, i.e. 12m at the defaults).
+  A reused blob is refreshed once older than min(1h, `orphan_grace` / 4). A compaction job older than half of
+  `orphan_grace` cannot commit.
 - `interval = "0s"` / `gc_interval = "0s"` turn the background tasks off.
 
-Offline tools (they refuse with exit code 3 while a server holds the data dir; stop the server first):
+Offline tools (they refuse with exit code 3 while a server holds the data dir, i.e. its `LOCK` next to `meta.db` or a
+WAL node dir's `LOCK`; stop the server first; `forge serve` likewise refuses to start while one of them runs):
 - `forge compact --project P [--data-dir D] [--format table|json]` runs up to 64 jobs of one project with the triggers
   off (run it again if the output says capped). Exit 1 on an unknown project or a failed job.
 - `forge gc [--data-dir D] [--dry-run] [--gc-grace 0s] [--orphan-grace 0s] [--format table|json]` runs one retention

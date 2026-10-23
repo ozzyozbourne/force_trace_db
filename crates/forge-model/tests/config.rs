@@ -246,20 +246,31 @@ fn m1_keys() {
     });
 }
 
-/// Review 1 #11: `orphan_grace` below the blob refresh interval (1 h) or the 10 min floor is rejected at load.
+/// Review 1 #11 / review 2 R2-1: `orphan_grace` below 4 x flush_interval + 10 min is rejected at load.
 #[test]
 fn orphan_grace_is_validated() {
     jail(|jail| {
-        for bad in ["0s", "5m", "59m"] {
+        for bad in ["0s", "5m", "11m59s"] {
             jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", bad);
             let e = ForgeConfig::load(None).unwrap_err().to_string();
-            assert!(e.contains("orphan_grace"), "{bad}: {e}");
+            assert!(e.contains("orphan_grace") && e.contains("flush_interval"), "{bad}: {e}");
         }
-        jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", "1h");
+        jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", "12m"); // 4 x 30 s + 10 min
         assert_eq!(
             ForgeConfig::load(None)?.compaction.orphan_grace,
-            Duration::from_secs(3600)
+            Duration::from_secs(720)
         );
+        jail.set_env("FORGE_MEMTABLE__FLUSH_INTERVAL", "10m");
+        assert!(ForgeConfig::load(None).is_err(), "12m < 4 x 10m + 10m");
+        jail.set_env("FORGE_COMPACTION__ORPHAN_GRACE", "50m");
+        assert!(ForgeConfig::load(None).is_ok());
         Ok(())
     });
+    let c = forge_model::config::CompactionConfig::default();
+    assert_eq!(c.blob_refresh(), Duration::from_secs(3600), "min(1 h, 24 h / 4)");
+    let c = forge_model::config::CompactionConfig {
+        orphan_grace: Duration::from_secs(3600),
+        ..c
+    };
+    assert_eq!(c.blob_refresh(), Duration::from_secs(900));
 }

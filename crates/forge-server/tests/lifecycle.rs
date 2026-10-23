@@ -159,10 +159,59 @@ async fn shutdown_during_a_slow_gc_pass_is_prompt() {
         query: f.query.clone(),
         ready: Default::default(),
         shutdown: Default::default(),
+        data_lock: None,
     });
     let lc = forge_server::lifecycle::start(f.clone());
     tokio::time::sleep(Duration::from_millis(300)).await; // the first pass started at 50 ms
     let t = std::time::Instant::now();
     lc.shutdown(Duration::from_secs(5)).await;
     assert!(t.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t.elapsed());
+}
+
+/// Review 2 R2-6: a running job that no task of this server runs (begun after open, as if its task died) is failed
+/// by the compaction tick, and its inputs are compacted again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tick_resets_a_job_without_a_task() {
+    let d = tempfile::tempdir().unwrap();
+    let f = forge_server::Forge::open(cfg(d.path(), Duration::from_millis(100), Duration::ZERO))
+        .await
+        .unwrap();
+    six_flushes(&f).await;
+    let ids = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
+    let job = f
+        .meta
+        .begin_compaction(JobRequest {
+            project_id: pid("p"),
+            kind: JobKind::L0,
+            inputs: ids.iter().map(|s| s.id).collect(),
+        })
+        .await
+        .unwrap()
+        .expect("begun");
+    let lc = forge_server::lifecycle::start(f.clone());
+    let db = rusqlite::Connection::open(d.path().join("meta.db")).unwrap();
+    let status = || -> String {
+        db.query_row("SELECT status FROM compaction_jobs WHERE id = ?1", [job.id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while status() == "running" {
+        assert!(std::time::Instant::now() < deadline, "the dead job is still running");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status(), "failed");
+    loop {
+        let segs = f.meta.list_segments(&SegmentFilter::default()).await.unwrap();
+        if segs.iter().all(|s| s.level == Level::L1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "inputs not compacted again: {segs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    lc.shutdown(Duration::from_secs(5)).await;
 }

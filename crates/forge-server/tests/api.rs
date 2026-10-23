@@ -127,6 +127,7 @@ fn with_engine(
         query: Arc::new(query),
         ready: std::sync::atomic::AtomicBool::new(true),
         shutdown: tokio_util::sync::CancellationToken::new(),
+        data_lock: None,
     })
 }
 

@@ -267,7 +267,7 @@ impl std::fmt::Display for ServerRunning {
 }
 impl std::error::Error for ServerRunning {}
 
-/// An offline data dir: every WAL node directory locked (held until drop), metastore read-write, compaction jobs
+/// An offline data dir: every WAL node directory and the data dir locked (held until drop), metastore read-write, compaction jobs
 /// of an earlier process reset.
 struct Offline {
     cfg: ForgeConfig,
@@ -321,6 +321,17 @@ impl Offline {
                         .strip_prefix(cfg.wal.dir.parent().unwrap_or(&cfg.wal.dir))
                         .unwrap_or(d);
                     return Err(ServerRunning(rel.display().to_string()).into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // The data-dir lock the server holds too: refuses even when no WAL node dir exists (review 2 R2-2). Taken
+        // after the WAL locks, so a server's WAL lock is still what the message names.
+        if let Some(d) = cfg.data_lock_dir() {
+            match forge_ingest::wal::lock_dir(&d) {
+                Ok(l) => locks.push(l),
+                Err(forge_ingest::wal::WalError::Locked(_)) => {
+                    return Err(ServerRunning(d.display().to_string()).into());
                 }
                 Err(e) => return Err(e.into()),
             }

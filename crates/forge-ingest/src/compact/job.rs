@@ -268,6 +268,11 @@ impl Writers {
 
     /// Ends every writer and waits for it (`SegmentSink::wait`), so no upload lands after the caller's cleanup
     /// (review 1 #9). Returns every object the job may have created.
+    ///
+    /// Cost (review 2 R2-5): ending the input lets each writer finish, so a failed or cancelled job encodes and
+    /// uploads up to `MAX_OPEN_WRITERS` partial outputs (each up to about `target_segment`) and then deletes them.
+    /// A shutdown cancel waits for that too; past the shutdown grace the lifecycle task is aborted, the writers run
+    /// on detached and their uploads become orphans for the orphan sweep.
     async fn abort(&mut self) -> Vec<object_store::path::Path> {
         let open = std::mem::take(&mut self.open).into_values().map(|w| w.sink);
         for sink in open.chain(std::mem::take(&mut self.closing)) {

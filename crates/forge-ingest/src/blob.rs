@@ -9,10 +9,6 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path}
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-/// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. At most the orphan
-/// grace (checked at config load).
-const BLOB_REFRESH: chrono::TimeDelta = chrono::TimeDelta::seconds(forge_model::config::BLOB_REFRESH.as_secs() as i64);
-
 /// Replaces every payload column value (`SpanRow::payload_columns_mut`) longer than
 /// `threshold` bytes with a blob reference and returns the blobs to write (`put_blobs`), keyed by path.
 /// CPU only (SHA-256): call off the async workers.
@@ -40,13 +36,23 @@ pub fn plan_blobs(rows: &mut [SpanRow], threshold: usize) -> HashMap<String, Byt
 /// the write lock once (every earlier put has refreshed its blob, so the listing sees it fresh) and then records
 /// the paths of every later put until the sweep ends; the sweep deletes each chunk under the write lock, minus the
 /// recorded paths. Nothing is recorded while no sweep runs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BlobGuard {
     lock: tokio::sync::RwLock<()>,
     /// Some only while a sweep runs (`begin_sweep` .. drop of its `SweepGuard`).
     recent: std::sync::Mutex<Option<HashSet<String>>>,
     /// No `put_blobs` can run during a sweep (see `exclusive`).
     pub(crate) exclusive: bool,
+    /// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified
+    /// (`CompactionConfig::blob_refresh`).
+    refresh: chrono::TimeDelta,
+}
+
+impl Default for BlobGuard {
+    /// The refresh age of the default orphan grace.
+    fn default() -> Self {
+        Self::with_refresh(forge_model::config::CompactionConfig::default().blob_refresh())
+    }
 }
 
 /// An active sweep's recording window; dropping it (also on error) stops recording.
@@ -59,6 +65,16 @@ impl Drop for SweepGuard<'_> {
 }
 
 impl BlobGuard {
+    /// A guard whose `put_blobs` refreshes reused blobs older than `refresh`.
+    pub fn with_refresh(refresh: std::time::Duration) -> Self {
+        Self {
+            lock: Default::default(),
+            recent: Default::default(),
+            exclusive: false,
+            refresh: chrono::TimeDelta::from_std(refresh).unwrap_or(chrono::TimeDelta::MAX),
+        }
+    }
+
     /// For offline callers (`forge gc`) that hold every WAL lock: no ingest runs, so no blob is put or refreshed
     /// during the sweep and its re-check HEAD is skipped.
     pub fn exclusive() -> Self {
@@ -121,11 +137,11 @@ pub async fn put_blobs(
                 Err(object_store::Error::AlreadyExists { .. }) => {}
                 r => return r.map(drop),
             }
-            // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - 24 h and no blob_refs
+            // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - orphan_grace and no blob_refs
             // row) cannot take it before this row is flushed (lifecycle.md §1.4). Gone since the put (RD #13):
             // write it again.
             match store.head(&path).await {
-                Ok(m) if chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH => {
+                Ok(m) if chrono::Utc::now().signed_duration_since(m.last_modified) > guard.refresh => {
                     store.put(&path, bytes.into()).await.map(drop)
                 }
                 Ok(_) => Ok(()),

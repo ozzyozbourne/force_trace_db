@@ -27,6 +27,8 @@ pub struct HookedMetastore {
     commit_calls: AtomicUsize,
     /// The first this many `fail_compaction` calls return the commit error without running.
     failing_fails: AtomicUsize,
+    /// Awaited after each real `begin_compaction`, before it returns.
+    after_begin: Option<Hook>,
 }
 
 impl std::fmt::Debug for HookedMetastore {
@@ -44,6 +46,7 @@ impl HookedMetastore {
             commit: None,
             commit_calls: AtomicUsize::new(0),
             failing_fails: AtomicUsize::new(0),
+            after_begin: None,
         }
     }
     /// The FIRST read runs `f` (e.g. a flush that commits and releases a memtable) before returning its
@@ -60,6 +63,7 @@ impl HookedMetastore {
             commit: None,
             commit_calls: AtomicUsize::new(0),
             failing_fails: AtomicUsize::new(0),
+            after_begin: None,
         }
     }
     /// Every `commit_compaction` runs the real commit if `land` (its result is ignored), then returns `err()`
@@ -71,6 +75,17 @@ impl HookedMetastore {
             commit: Some((land, err)),
             commit_calls: AtomicUsize::new(0),
             failing_fails: AtomicUsize::new(0),
+            after_begin: None,
+        }
+    }
+    /// Every `begin_compaction` runs the real begin, then awaits `hook` before returning its result.
+    pub fn after_begin(
+        inner: Arc<dyn Metastore>,
+        hook: impl Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            after_begin: Some(Box::new(hook)),
+            ..Self::slow(inner, Duration::ZERO)
         }
     }
     /// The first `n` `fail_compaction` calls also return the commit error, without running.
@@ -158,7 +173,11 @@ impl Metastore for HookedMetastore {
         self.inner.segment_paths(p).await
     }
     async fn begin_compaction(&self, r: JobRequest) -> MetaResult<Option<CompactionJob>> {
-        self.inner.begin_compaction(r).await
+        let r = self.inner.begin_compaction(r).await;
+        if let Some(h) = &self.after_begin {
+            h().await;
+        }
+        r
     }
     async fn commit_compaction(&self, c: Arc<CompactionCommit>) -> MetaResult<()> {
         self.commit_calls.fetch_add(1, Ordering::SeqCst);

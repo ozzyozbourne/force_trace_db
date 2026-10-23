@@ -461,3 +461,39 @@ async fn purge_dry_run_counts_past_one_batch() {
     let r = run_gc(&m, &store, &Clocks::at(later, later), &o, &g).await.unwrap();
     assert_eq!((r.purged_segments, r.freed_bytes), (1001, 10_010), "{r:?}");
 }
+
+/// Review 2 R2-1: at orphan_grace = 1 h, a blob reused 10 s before its 1 h mark is refreshed (refresh age
+/// orphan_grace / 4), so a sweep 15 s later, before its row is flushed, keeps it.
+#[tokio::test]
+async fn blob_reused_near_the_grace_survives_a_sweep_before_its_flush() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("data");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = DurableLocalFs::new(root.clone()).unwrap();
+    let m = SqliteMetastore::open_path(&d.path().join("meta.db")).unwrap();
+    let x = Path::from("blobs/p/x");
+    store.put(&x, "x".into()).await.unwrap();
+    let f = std::fs::File::options()
+        .write(true)
+        .open(root.join(x.as_ref()))
+        .unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(3590)).unwrap();
+    let cfg = forge_model::config::CompactionConfig {
+        orphan_grace: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let g = BlobGuard::with_refresh(cfg.blob_refresh());
+    let puts = std::collections::HashMap::from([(x.to_string(), bytes::Bytes::from("x"))]);
+    forge_ingest::blob::put_blobs(puts, &store, &g).await.unwrap();
+    let o = GcOptions {
+        sweep_blobs: true,
+        ..GcOptions::from_config(&cfg)
+    };
+    let later = forge_model::time::now_ms() + 15_000; // before a 30 s flush
+    let r = run_gc(&m, &store, &Clocks::at(later, later), &o, &g).await.unwrap();
+    assert_eq!(r.orphan_blobs, 0, "{r:?}");
+    assert!(
+        store.head(&x).await.is_ok(),
+        "reused blob swept before its row was flushed"
+    );
+}

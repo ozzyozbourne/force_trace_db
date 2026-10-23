@@ -48,7 +48,8 @@ pub struct RunningJobs {
     /// begun job that is not registered yet.
     begin_lock: tokio::sync::RwLock<()>,
     /// Review 1 #10: input sets whose job failed -> (consecutive failures, not picked again before). Server ticks
-    /// skip such a set until then (`forge compact` does not: it stops after 3 failures).
+    /// pass over such a set until then and pick the project's next candidate (`forge compact` does not: it stops
+    /// after 3 failures). Not distinguished: a transient store outage grows the backoff like a poisoned input.
     backoff: std::sync::Mutex<HashMap<Vec<SegmentId>, (u32, Instant)>>,
 }
 
@@ -137,7 +138,8 @@ pub struct CompactSummary {
     pub capped: bool,
 }
 
-/// The project's pick, or None. `force` = triggers off (`forge compact`).
+/// The project's pick, or None. `force` = triggers off (`forge compact`); otherwise input sets backing off after a
+/// failure are passed over and the next candidate is picked (review 2 R2-4).
 async fn pick_for(
     cx: &CompactCtx,
     p: &ProjectId,
@@ -159,7 +161,10 @@ async fn pick_for(
         expired_before_ns: project.and_then(|p| p.retention_cutoff_ns(data_now_ns)),
         force,
     };
-    Ok(pick::pick(&input, &cx.cfg))
+    let backoff = cx.running.backoff.lock().unwrap();
+    let now = Instant::now();
+    let backing_off = |ids: &[SegmentId]| !force && backoff.get(ids).is_some_and(|(_, until)| now < *until);
+    Ok(pick::pick_excluding(&input, &cx.cfg, backing_off))
 }
 
 /// What one pick -> begin -> run did.
@@ -176,15 +181,6 @@ async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Outcome, Ing
         return Ok(Outcome::Idle);
     };
     let backoff = &cx.running.backoff;
-    if !force
-        && backoff
-            .lock()
-            .unwrap()
-            .get(&inputs)
-            .is_some_and(|(_, until)| Instant::now() < *until)
-    {
-        return Ok(Outcome::Idle);
-    }
     let req = JobRequest {
         project_id: p.clone(),
         kind,
@@ -203,9 +199,10 @@ async fn one(cx: &CompactCtx, p: &ProjectId, force: bool) -> Result<Outcome, Ing
         b.remove(&inputs);
     } else {
         let n = b.get(&inputs).map_or(0, |e| e.0) + 1;
-        // Bounded: entries whose backoff is over go (this set keeps its count, read above).
+        // Bounded: entries go MAX_BACKOFF after their backoff ended, so a set failing again within that keeps its
+        // count (this set's was read above).
         let now = Instant::now();
-        b.retain(|_, (_, until)| *until > now);
+        b.retain(|_, (_, until)| *until + MAX_BACKOFF > now);
         let wait = cx
             .cfg
             .interval

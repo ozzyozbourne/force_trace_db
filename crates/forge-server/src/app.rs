@@ -16,6 +16,9 @@ pub struct Forge {
     pub query: Arc<forge_query::QueryEngine>,
     pub ready: AtomicBool,
     pub shutdown: CancellationToken,
+    /// `<data dir>/LOCK` (`ForgeConfig::data_lock_dir`), held for the process lifetime: no offline `forge compact`
+    /// or `forge gc` runs beside this server, whatever the WAL layout (D2).
+    pub data_lock: Option<std::fs::File>,
 }
 
 pub type AppState = Arc<Forge>;
@@ -23,13 +26,23 @@ pub type AppState = Arc<Forge>;
 impl Forge {
     /// Opens (and migrates) the metastore, then builds the object store and segment store.
     pub async fn open(config: ForgeConfig) -> anyhow::Result<Arc<Self>> {
+        let data_lock = match config.data_lock_dir() {
+            Some(d) => Some(forge_ingest::wal::lock_dir(&d).map_err(|e| match e {
+                forge_ingest::wal::WalError::Locked(_) => anyhow::anyhow!(
+                    "the data dir is in use ({}/LOCK is held by another forge process, e.g. forge gc)",
+                    d.display()
+                ),
+                e => e.into(),
+            })?),
+            None => None,
+        };
         let meta = forge_meta::open(&config.metastore).await?;
         // Directory creation is blocking work, like the metastore open.
         let storage = config.storage.clone();
         let built = tokio::task::spawn_blocking(move || forge_storage::build_object_store(&storage)).await??;
         let segments: Arc<dyn forge_storage::SegmentStore> = Arc::new(forge_storage::VortexSegmentStore::new(built));
         let (ingest, _report) = forge_ingest::Pipeline::open(&config, meta.clone(), segments.clone()).await?;
-        // One process per data dir (the WAL LOCK is held now): no compaction job of an earlier process is still
+        // One process per data dir (the data dir and WAL LOCKs are held now): no compaction job of an earlier process is still
         // running (plans/phase-4 D2).
         let n = meta.reset_compactions(&[]).await?;
         if n > 0 {
@@ -49,6 +62,7 @@ impl Forge {
             ingest,
             ready: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
+            data_lock,
         }))
     }
 

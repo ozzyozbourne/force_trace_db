@@ -142,19 +142,26 @@ pub struct CompactionConfig {
     pub orphan_grace: Duration,
 }
 
-/// `put_blobs` rewrites a reused blob older than this (bumps last_modified), so the orphan sweep spares it until
-/// its row is flushed; `orphan_grace` must be at least this.
+/// The longest blob refresh age (`CompactionConfig::blob_refresh`).
 pub const BLOB_REFRESH: Duration = Duration::from_secs(3600);
-/// Smallest `orphan_grace` `ForgeConfig::load` accepts (review 1 #11): a compaction job must commit within half of
-/// it (D15), and a flush's upload must be committed before the orphan sweep may take it. Configs built in code
-/// (tests) are not checked.
-pub const MIN_ORPHAN_GRACE: Duration = Duration::from_secs(600);
+/// `ForgeConfig::load` requires `orphan_grace >= 4 x memtable.flush_interval + ORPHAN_GRACE_MARGIN` (review 1 #11,
+/// review 2 R2-1): a compaction job must commit within half of it (D15), a flush's upload must be committed before
+/// the orphan sweep may take it, and a reused blob refreshed at `orphan_grace / 4` keeps 3/4 of the grace for its
+/// row's flush. Configs built in code (tests) are not checked.
+pub const ORPHAN_GRACE_MARGIN: Duration = Duration::from_secs(600);
 
 impl CompactionConfig {
     /// D15: a compaction job older than this cannot commit, so the orphan sweep (`orphan_grace` = 2 x this) never
     /// deletes an upload that is about to be committed.
     pub fn commit_max_age(&self) -> Duration {
         self.orphan_grace / 2
+    }
+
+    /// `put_blobs` rewrites a reused blob older than this (bumps last_modified), so the orphan sweep spares it until
+    /// its row is flushed: `min(BLOB_REFRESH, orphan_grace / 4)` leaves at least 3/4 of the grace for the flush
+    /// (review 2 R2-1).
+    pub fn blob_refresh(&self) -> Duration {
+        BLOB_REFRESH.min(self.orphan_grace / 4)
     }
 }
 
@@ -212,6 +219,17 @@ impl ForgeConfig {
         c
     }
 
+    /// The data dir's lock directory: the one holding `meta.db` (`sqlite://<path>`), whose `LOCK` file `forge serve`
+    /// and the offline `forge compact`/`forge gc` hold, independent of the WAL layout (D2, review 2 R2-2). None for
+    /// an in-memory metastore.
+    pub fn data_lock_dir(&self) -> Option<PathBuf> {
+        let db = Path::new(self.metastore.url.strip_prefix("sqlite://")?);
+        Some(match db.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        })
+    }
+
     /// defaults <- `path` (must exist) | `./forge.toml` if it is a file (cwd only) <- `FORGE_<SECTION>__<KEY>` env.
     pub fn load(path: Option<&Path>) -> Result<Self, figment::Error> {
         use figment::{
@@ -246,10 +264,11 @@ impl ForgeConfig {
         ProjectId::new(cfg.ingest.default_project.clone())
             .map_err(|e| figment::Error::from(format!("ingest.default_project: {e}")))?;
         let og = cfg.compaction.orphan_grace;
-        if og < MIN_ORPHAN_GRACE || og < BLOB_REFRESH {
+        let min = cfg.memtable.flush_interval.saturating_mul(4) + ORPHAN_GRACE_MARGIN;
+        if og < min {
             return Err(figment::Error::from(format!(
-                "compaction.orphan_grace ({og:?}) must be at least {BLOB_REFRESH:?} (the blob refresh interval) and \
-                 {MIN_ORPHAN_GRACE:?} (compaction jobs and flush uploads commit before the orphan sweep)"
+                "compaction.orphan_grace ({og:?}) must be at least 4 x memtable.flush_interval + {ORPHAN_GRACE_MARGIN:?} \
+                 = {min:?}, so flush uploads, reused blobs and compaction jobs are committed before the orphan sweep"
             )));
         }
         if cfg.memtable.flush_bytes > cfg.memtable.memory_budget {

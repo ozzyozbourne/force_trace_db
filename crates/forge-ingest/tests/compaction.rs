@@ -825,3 +825,118 @@ async fn kind_a_folds_beside_kind_b_with_a_flush_in_between() {
     assert!(segs.iter().all(|s| s.state == SegmentState::Live), "{segs:?}");
     assert_eq!(w.l1().await.len(), 2, "one output per hour");
 }
+
+/// Review 2 R2-3: 40 small, disjoint, single-version groups of time-ordered traces in one hour. The small-groups
+/// trigger rewrites them into rotated outputs (possibly several version groups), and the picker then settles: no
+/// runaway rewrites over many ticks.
+#[tokio::test]
+async fn time_ordered_small_groups_settle() {
+    let mut w = W::new();
+    for k in 0..40u64 {
+        let rows: Vec<SpanRow> = (0..10u64)
+            .map(|j| {
+                let n = k * 10 + j + 1;
+                SpanRow {
+                    start_time_ns: Some(at(0, n as i64)),
+                    inputs: Some(
+                        (0..64u64)
+                            .map(|i| {
+                                format!(
+                                    "{:016x}",
+                                    n.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                                )
+                            })
+                            .collect(),
+                    ),
+                    trace_id: forge_model::ids::TraceId(u128::from(n).to_be_bytes()), // time-ordered
+                    // One version per trace: rotated outputs are version-disjoint (several groups).
+                    ..row(0, 1, n)
+                }
+            })
+            .collect();
+        w.flush(&rows).await;
+        w.compact_l0(CompactionConfig::default()).await;
+    }
+    let cfg = CompactionConfig {
+        target_segment: bytesize::ByteSize::kib(64),
+        slice_bytes: bytesize::ByteSize::kib(16),
+        ..Default::default()
+    };
+    assert!(
+        w.l1()
+            .await
+            .iter()
+            .all(|s| s.byte_size < cfg.target_segment.as_u64() / 2)
+    );
+    let want = w.read().await;
+    let cx = w.cx(cfg);
+    let mut jobs = 0;
+    while forge_ingest::compact::run_next(&cx).await.unwrap().is_some() {
+        jobs += 1;
+        assert!(
+            jobs <= 4,
+            "runaway rewrites: {:?}",
+            w.l1()
+                .await
+                .iter()
+                .map(|s| (s.byte_size, s.min_version, s.max_version))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(jobs >= 1, "the small groups were never rewritten");
+    assert_eq!(w.read().await, want);
+}
+
+/// Review 2 R2-4: while the project's kind-A set backs off after a failure, the next tick picks the project's next
+/// candidate (here kind B on another hour) instead of idling.
+#[tokio::test]
+async fn backed_off_set_lets_the_next_candidate_run() {
+    let mut w = W::new();
+    for k in 0..2u64 {
+        // Hour 0: two overlapping runs (kind B is due: the hour is closed).
+        let rows: Vec<SpanRow> = [1, 100]
+            .map(|t| SpanRow {
+                start_time_ns: Some(at(0, k as i64)),
+                ..row(t, k + 1, k + 1)
+            })
+            .to_vec();
+        w.flush(&rows).await;
+        w.compact_l0(CompactionConfig::default()).await;
+    }
+    w.flush(&[SpanRow {
+        start_time_ns: Some(at(5, 0)),
+        ..row(500, 1, 10)
+    }])
+    .await;
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let f = fail.clone();
+    let store = Arc::new(HookedSegmentStore::new(
+        w.store.clone(),
+        Box::new(move |_| {
+            let r = if f.load(Ordering::SeqCst) {
+                Err(StorageError::InvalidInput("injected upload failure".into()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { r })
+        }),
+    ));
+    let cx = CompactCtx {
+        segments: store,
+        ..w.cx(CompactionConfig {
+            l0_trigger: 1,
+            ..Default::default()
+        })
+    };
+    assert!(forge_ingest::compact::run_next(&cx).await.is_err(), "kind A fails");
+    fail.store(false, Ordering::SeqCst);
+    let r = forge_ingest::compact::run_next(&cx)
+        .await
+        .unwrap()
+        .expect("the next candidate runs");
+    assert_eq!((r.kind, r.l1_inputs), ("l1", 2), "{r:?}");
+    assert!(
+        w.segs().await.iter().any(|s| s.level == Level::L0),
+        "kind A is still backing off"
+    );
+}

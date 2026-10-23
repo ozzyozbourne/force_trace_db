@@ -497,3 +497,40 @@ async fn offline_commands_leave_the_wal_alone() {
         assert_eq!(nodes, ["node-x"], "{args:?}");
     }
 }
+
+/// Review 2 R2-2: the data-dir LOCK (next to meta.db) excludes server and offline commands even with no WAL node
+/// dir under the data dir: a server whose WAL lives elsewhere refuses `compact`/`gc` (exit 3), and a server cannot
+/// start while an offline command holds the lock.
+#[tokio::test]
+async fn data_dir_lock_without_a_wal_node_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_elsewhere = tempfile::tempdir().unwrap();
+    let cfg = common::write_config(tmp.path(), "2s");
+    let wal = wal_elsewhere.path().join("wal");
+    let env = [("FORGE_WAL__DIR", wal.to_str().unwrap())];
+    let (mut s, _) = common::spawn_ready(tmp.path(), Some(&cfg), &env).await;
+    let dir = tmp.path().to_str().unwrap();
+    assert!(!tmp.path().join("wal").exists());
+    for a in [
+        &["compact", "--project", "p", "--data-dir", dir][..],
+        &["gc", "--data-dir", dir],
+    ] {
+        let o = forge(a);
+        assert_eq!(o.status.code(), Some(3), "{a:?}: {o:?}");
+        let e = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            e.contains(&format!(
+                "a server is running on this data dir ({dir}/LOCK is held); stop it first"
+            )),
+            "{e}"
+        );
+    }
+    s.stop_ok(std::time::Duration::from_secs(10)).await;
+    // An offline command holds the lock (as `forge gc` does while it runs): the server refuses to start.
+    let held = forge_ingest::wal::lock_dir(tmp.path()).unwrap();
+    let mut s = common::ServerProc::spawn(tmp.path(), Some(&cfg), &env);
+    let st = s.wait_exit(std::time::Duration::from_secs(20)).await;
+    assert!(!st.success(), "server started beside an offline command");
+    assert!(s.logs().contains("the data dir is in use"), "{}", s.logs());
+    drop(held);
+}

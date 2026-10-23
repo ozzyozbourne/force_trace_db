@@ -244,7 +244,7 @@ impl Pipeline {
                 inflight: Arc::default(),
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
-                blob_guard: BlobGuard::default(),
+                blob_guard: BlobGuard::with_refresh(cfg.compaction.blob_refresh()),
             }),
             OpenReport {
                 replay,

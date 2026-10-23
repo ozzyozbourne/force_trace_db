@@ -20,8 +20,10 @@ fn hour_end_ns(h: HourBucket) -> i64 {
     h.0.saturating_add(1).saturating_mul(HourBucket::NANOS)
 }
 
-/// One hour's L1 segments grouped by overlapping `[min_version, max_version]`, oldest group first. A group is a
-/// union of whole jobs' outputs: one job's files overlap in version, different jobs are version-disjoint (§3).
+/// One hour's L1 segments grouped by overlapping `[min_version, max_version]`, oldest group first. Different jobs are
+/// version-disjoint (§3), so a group never splits a job's file from an overlapping one. One job's files usually
+/// overlap in version, but rotated files of time-ordered traces can be version-disjoint: one job's output can then
+/// be several groups (review 2 R2-3).
 pub fn groups<'a>(segs: &[&'a SegmentMeta]) -> Vec<Vec<&'a SegmentMeta>> {
     let mut v = segs.to_vec();
     v.sort_by_key(|s| s.min_version);
@@ -42,7 +44,9 @@ pub fn groups<'a>(segs: &[&'a SegmentMeta]) -> Vec<Vec<&'a SegmentMeta>> {
 /// - the longest such suffix (at least 2 groups), if some class (main / orphan) has two segments with intersecting
 ///   trace ranges in it and the hour is closed, forced, or that class has more than `L1_MAX_RUNS` segments there; or
 /// - (review 1 #12: time-ordered traces give disjoint runs) the newest `L1_MAX_RUNS` or more groups made only of
-///   segments below `small` bytes. Its output is one group rotated at the target size, so it cannot retrigger.
+///   segments below `small` bytes. It cannot retrigger on its own output: the output rotates at about the target
+///   size, so only the last file of each run (main, orphan) can be below `small` (target / 2), which adds at most 2
+///   small groups (< `L1_MAX_RUNS`). Rewriting stops once the merged runs reach target / 2 (review 2 R2-3).
 ///
 /// Never because the hour merely has several segments, nor for one group (one job's files).
 fn rewrite(segs: &[&SegmentMeta], closed: bool, force: bool, max_bytes: u64, small: u64) -> Option<Vec<SegmentId>> {
@@ -94,6 +98,16 @@ pub fn layout<'a>(segs: &[&'a SegmentMeta]) -> (Vec<&'a SegmentMeta>, BTreeMap<H
 }
 
 pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<SegmentId>)> {
+    pick_excluding(i, cfg, |_| false)
+}
+
+/// `pick`, passing over candidates whose input set is `excluded` (backing off after a failure, review 2 R2-4): kind A
+/// then goes on to kind B, and kind B to the next hour.
+pub fn pick_excluding(
+    i: &PickInput<'_>,
+    cfg: &CompactionConfig,
+    excluded: impl Fn(&[SegmentId]) -> bool,
+) -> Option<(JobKind, Vec<SegmentId>)> {
     let segs: Vec<&SegmentMeta> = i.segs.iter().filter(|s| s.state.is_visible()).collect();
     let expired = |h: HourBucket| i.expired_before_ns.is_some_and(|c| h.expired_by(c));
     let (l0, hours) = layout(&segs);
@@ -133,7 +147,9 @@ pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<S
                     }
                 }
             }
-            return Some((JobKind::L0, inputs));
+            if !excluded(&inputs) {
+                return Some((JobKind::L0, inputs));
+            }
         }
     }
     // Kind B: a newest version suffix of one hour.
@@ -142,7 +158,9 @@ pub fn pick(i: &PickInput<'_>, cfg: &CompactionConfig) -> Option<(JobKind, Vec<S
             continue;
         }
         let closed = hour_end_ns(*h) < i.data_now_ns.saturating_sub(HourBucket::NANOS);
-        if let Some(ids) = rewrite(runs, closed, i.force, max_bytes, cfg.target_segment.as_u64() / 2) {
+        if let Some(ids) = rewrite(runs, closed, i.force, max_bytes, cfg.target_segment.as_u64() / 2)
+            && !excluded(&ids)
+        {
             return Some((JobKind::L1, ids));
         }
     }

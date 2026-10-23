@@ -514,7 +514,8 @@ async fn soak_scaled_48_data_hours() {
     c.l0_max_age = Duration::from_secs(10);
     c.gc_interval = Duration::from_secs(15);
     c.gc_grace = Duration::from_secs(120);
-    c.orphan_grace = Duration::from_secs(600); // below the 1 h load-time floor: built in code, and no blobs here
+    // Below the load-time floor (4 x flush_interval + 10 min = 620 s): built in code, and no blobs here.
+    c.orphan_grace = Duration::from_secs(600);
     // Retention steady state (review 1 #8): the first data hour expires at 25 data hours (data starts 24 h back),
     // and its deleted rows are purged within gc_grace + gc_interval; plus 10 s of slack.
     let steady = (25 * 3600) as f64 / SPEED as f64 + (c.gc_grace + c.gc_interval).as_secs_f64() + 10.0;
