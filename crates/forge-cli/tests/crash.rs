@@ -504,6 +504,10 @@ const FULL_S: [&str; 4] = [
     "gc_after_object_delete@1",
 ];
 
+/// Flush interval of the `upload_*@1` cases: the first upload of a flush is now often the small `.fts` (it lands
+/// before the `.vortex` encode ends), so the kill comes earlier; 600 ms leaves the load time for MIN_ACKED acks.
+const UPLOAD_FLUSH: &str = "600ms";
+
 async fn crash_case(fp: &str, interval: &str, orphans: Orphans, compaction: Option<fn(&Path)>) -> Replay {
     let c = Case::new("5s");
     let extra: &[_] = if compaction.is_some() { &COMPACTION_ON } else { &[] };
@@ -672,12 +676,18 @@ async fn crash_flush_before_upload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_upload_before_fsync() {
-    timed(crash_case("upload_before_fsync@1", "300ms", Orphans::AtLeastOne, None)).await;
+    timed(crash_case(
+        "upload_before_fsync@1",
+        UPLOAD_FLUSH,
+        Orphans::AtLeastOne,
+        None,
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_upload_lose_unsynced() {
-    timed(crash_case("upload_lose_unsynced@1", "300ms", Orphans::Zero, None)).await;
+    timed(crash_case("upload_lose_unsynced@1", UPLOAD_FLUSH, Orphans::Zero, None)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
