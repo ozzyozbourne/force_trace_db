@@ -1,4 +1,4 @@
-//! `forge inspect segment <path>` (paste target: forge-storage/src/inspect.rs, called from forge-cli).
+//! `forge inspect segment <path>`.
 //! Footer-only facts first (no data I/O), then a key-column scan that re-checks the segment
 //! contract (invariant 3) and summarizes traces/versions.
 use arrow::array::{Array, AsArray};
@@ -33,7 +33,8 @@ pub async fn inspect_segment(path: &std::path::Path, o: &InspectOptions) -> crat
     let fields = file
         .dtype()
         .as_struct_fields_opt()
-        .expect("spans segments are structs")
+        .filter(|f| f.names().iter().any(|n| n.to_string() == col::PROJECT_ID))
+        .ok_or_else(|| crate::StorageError::InvalidInput("not a spans segment".into()))?
         .clone();
     writeln!(out, "file:      {} ({size} bytes)", path.display()).unwrap();
     writeln!(out, "rows:      {}", file.row_count()).unwrap();

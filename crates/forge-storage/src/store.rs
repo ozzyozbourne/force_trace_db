@@ -117,6 +117,11 @@ impl ObjectStore for DurableLocalFs {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
         let r = self.inner.put_opts(location, payload, opts).await?;
         forge_model::failpoint::hit("upload_before_fsync");
+        if forge_model::failpoint::fires("upload_lose_unsynced") {
+            // Power-loss model: the unsynced object is gone.
+            let _ = std::fs::remove_file(self.inner.path_to_filesystem(location)?);
+            forge_model::failpoint::kill("upload_lose_unsynced");
+        }
         self.sync(location).await?;
         Ok(r)
     }

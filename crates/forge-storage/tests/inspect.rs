@@ -147,3 +147,47 @@ async fn durable_local_fs_put_get_copy_multipart() {
     up.complete().await.unwrap();
     assert_eq!(std::fs::read(dir.path().join("m/n/o.bin")).unwrap(), vec![1u8; 10]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_rejects_a_non_spans_vortex_file() {
+    use vortex::VortexSessionDefault;
+    use vortex::array::stream::ArrayStreamAdapter;
+    use vortex::arrow::ArrowSessionExt;
+    use vortex::file::WriteOptionsSessionExt;
+    use vortex::io::session::RuntimeSessionExt;
+    let session = vortex::session::VortexSession::default().with_tokio();
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "x",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+    let b = arrow::array::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![1i64, 2, 3]))],
+    )
+    .unwrap();
+    let dtype = session.arrow().from_arrow_schema(&schema).unwrap();
+    let array = session.arrow().from_arrow_record_batch(b, &schema).unwrap();
+    let mut buf = Vec::new();
+    session
+        .write_options()
+        .write(
+            &mut buf,
+            ArrayStreamAdapter::new(dtype, futures::stream::iter([Ok(array)])),
+        )
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("other.vortex");
+    std::fs::write(&path, buf).unwrap();
+    let e = inspect_segment(
+        &path,
+        &InspectOptions {
+            layout: false,
+            verify: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, StorageError::InvalidInput(_)), "{e}");
+}
