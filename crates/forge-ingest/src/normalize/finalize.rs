@@ -12,14 +12,15 @@ pub struct Measured {
 }
 
 /// Fills `prompt/completion/total_tokens`, a missing `provider` from a `vendor/model` name, and `cost_usd`.
+///
+/// `total_tokens` is the producer's total, else prompt + completion only when BOTH are on this post: a sparse
+/// post (one count) must not write a partial total that would win the merge over a full post's total (the same
+/// rule as P9(c) for cost).
 pub fn finalize_span(r: &mut SpanRow, m: Measured, pricing: &Pricing) {
     let u = m.usage;
     r.prompt_tokens = u.prompt;
     r.completion_tokens = u.completion;
-    r.total_tokens = m.producer_total.or(match (u.prompt, u.completion) {
-        (None, None) => None,
-        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
-    });
+    r.total_tokens = m.producer_total.or(u.prompt.zip(u.completion).map(|(p, c)| p + c));
     if r.provider.is_none() {
         r.provider = r.model.as_deref().and_then(provider_from_model);
     }

@@ -51,7 +51,9 @@ pub struct WalOptions {
     /// Close a group this long after its first request even if more are queued (default 10 ms).
     /// The group also closes as soon as the queue is empty (no linger).
     pub group_commit_max_delay: Duration,
-    /// Bounded request queue (default 4096): a full queue makes `append` wait.
+    /// Bounded request queue (default 256): a full queue makes `append` wait. Queued bytes are bounded by the
+    /// memtable budget (forge-ingest reserves a request's bytes before it is queued), so this only has to keep
+    /// the writer busy: a group closes at `group_commit_max_bytes` (1 MiB), which 256 requests of >= 4 KiB fill.
     pub queue: usize,
 }
 
@@ -62,7 +64,7 @@ impl WalOptions {
             segment_bytes: 64 << 20,
             group_commit_max_bytes: 1 << 20,
             group_commit_max_delay: Duration::from_millis(10),
-            queue: 4096,
+            queue: 256,
         }
     }
 }
@@ -501,6 +503,15 @@ pub fn encode_batch(b: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, arr
     w.finish()?;
     drop(w);
     Ok(out)
+}
+
+/// `encode_batch` + `version_offset` for a validated spans batch. Both can only fail on a Forge bug (e.g. a schema
+/// change `version_offset` does not know), so a failure is Internal, never the client's InvalidInput.
+pub fn encode_payload(b: &arrow::record_batch::RecordBatch) -> Result<(Vec<u8>, usize), crate::IngestError> {
+    let internal = |e: arrow::error::ArrowError| crate::IngestError::Internal(format!("wal encode: {e}"));
+    let payload = encode_batch(b).map_err(internal)?;
+    let at = version_offset(&payload, b.num_rows()).map_err(internal)?;
+    Ok((payload, at))
 }
 
 /// Offset in an `encode_batch` payload of the values buffer of the spans `version` column (Int64, no nulls,

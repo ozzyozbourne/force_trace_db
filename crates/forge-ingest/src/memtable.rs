@@ -119,8 +119,9 @@ impl MemtableSet {
         a.batches.push(batch);
         let full = a.bytes >= self.flush_bytes;
         s.snapshot = None;
-        drop(s);
+        // Under the lock: once unlocked, a flush can freeze and `release` this batch, which subtracts its bytes.
         self.unflushed.fetch_add(bytes, Ordering::Relaxed);
+        drop(s);
         if full {
             self.flush_wanted.notify_one();
         }
@@ -139,6 +140,17 @@ impl MemtableSet {
         s.frozen.is_some()
             || !a.batches.is_empty()
                 && (a.bytes >= self.flush_bytes || now.duration_since(a.created) >= self.flush_interval)
+    }
+
+    /// Makes the active memtable due now (age trigger). After replay: replayed rows are as old as the crash, so a
+    /// restart loop shorter than `flush_interval` must not keep postponing them.
+    pub fn mark_due(&self) {
+        let mut s = self.lock();
+        if !s.active.batches.is_empty()
+            && let Some(t) = Instant::now().checked_sub(self.flush_interval)
+        {
+            s.active.created = t;
+        }
     }
 
     pub fn flush_interval(&self) -> Duration {
@@ -177,8 +189,7 @@ impl MemtableSet {
         if s.frozen.as_ref().is_some_and(|x| Arc::ptr_eq(x, f)) {
             s.frozen = None;
             s.snapshot = None;
-            drop(s);
-            self.unflushed.fetch_sub(f.bytes, Ordering::Relaxed);
+            self.unflushed.fetch_sub(f.bytes, Ordering::Relaxed); // under the lock, like `insert`'s add
         }
     }
 

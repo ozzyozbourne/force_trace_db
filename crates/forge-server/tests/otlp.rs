@@ -101,10 +101,16 @@ async fn grpc_export() {
     );
     assert_eq!(h.ingest.rows.lock().unwrap().len(), 27);
 
-    // bad project header -> INVALID_ARGUMENT
+    // bad project header -> INVALID_ARGUMENT; also when it is not UTF-8 (obs-text)
     let mut req = tonic::Request::new(fixture());
     req.metadata_mut().insert("x-forge-project", "a/b".parse().unwrap());
     assert_eq!(c.export(req).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    let mut req = tonic::Request::new(fixture());
+    let obs = tonic::metadata::AsciiMetadataValue::try_from(&b"caf\xe9"[..]).unwrap();
+    req.metadata_mut().insert("x-forge-project", obs);
+    let e = c.export(req).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
+    assert_eq!(h.ingest.rows.lock().unwrap().len(), 27, "nothing ingested");
 
     // ingest errors map to codes
     for (f, code) in [
@@ -113,8 +119,9 @@ async fn grpc_export() {
             tonic::Code::ResourceExhausted,
         ),
         (
+            // Io only happens at startup (write/fsync failures abort): not retryable.
             || IngestError::Wal(WalError::Io(std::io::Error::other("disk"))),
-            tonic::Code::Unavailable,
+            tonic::Code::Internal,
         ),
         (|| IngestError::Wal(WalError::Closed), tonic::Code::Unavailable),
         (|| IngestError::Internal("bug".into()), tonic::Code::Internal),
@@ -189,6 +196,17 @@ async fn http_export() {
     );
 
     // errors
+    let obs = reqwest::header::HeaderValue::from_bytes(b"caf\xe9").unwrap();
+    let r = c
+        .post(&h.http)
+        .header("content-type", "application/json")
+        .header("x-forge-project", obs)
+        .body(fixture_json())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "a non-UTF-8 project header is invalid, not ignored");
+    assert_eq!(h.ingest.rows.lock().unwrap().len(), 27, "nothing ingested");
     let r = post("text/plain", None, b"x".to_vec()).await.unwrap();
     assert_eq!(r.status(), 415);
     assert_eq!(r.headers()["content-type"], "application/json");
@@ -236,4 +254,59 @@ async fn http_export() {
         post("application/json", None, fixture_json()).await.unwrap().status(),
         400
     );
+}
+
+// ---- logging: Internal -> error, Transient -> warn (like ApiError) ----
+
+static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+struct Capture;
+impl Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        LOGS.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn log_lines() -> Vec<String> {
+    String::from_utf8_lossy(&LOGS.lock().unwrap())
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+#[tokio::test]
+async fn export_errors_are_logged() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| Capture)
+            .finish();
+        tracing::subscriber::set_global_default(sub).unwrap();
+    });
+    let h = start().await;
+    let has = |level: &str, needle: &str| log_lines().iter().any(|l| l.contains(level) && l.contains(needle));
+
+    *h.ingest.fail.lock().unwrap() = Some(|| IngestError::Internal("grpc-bug-7d1".into()));
+    let mut c = TraceServiceClient::connect(h.grpc.clone()).await.unwrap();
+    assert_eq!(c.export(fixture()).await.unwrap_err().code(), tonic::Code::Internal);
+    assert!(has("ERROR", "grpc-bug-7d1"), "{:#?}", log_lines());
+
+    *h.ingest.fail.lock().unwrap() = Some(|| IngestError::Internal("http-bug-7d1".into()));
+    let r = reqwest::Client::new()
+        .post(&h.http)
+        .header("content-type", "application/json")
+        .body(fixture_json())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500);
+    assert!(has("ERROR", "http-bug-7d1"), "{:#?}", log_lines());
+
+    *h.ingest.fail.lock().unwrap() = Some(|| IngestError::Wal(WalError::Closed));
+    assert_eq!(c.export(fixture()).await.unwrap_err().code(), tonic::Code::Unavailable);
+    let closed = IngestError::Wal(WalError::Closed).to_string();
+    assert!(has("WARN", &closed), "{:#?}", log_lines());
 }

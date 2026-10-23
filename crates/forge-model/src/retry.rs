@@ -21,9 +21,11 @@ impl Default for Backoff {
 /// at the max backoff (an operator can fix permissions/disk/metastore without losing data). The
 /// caller bounds the total time with `tokio::time::timeout` on shutdown.
 ///
-/// Known limit (L4): a deterministic non-transient error (a bug) retries forever. Ingest then returns 429 once
-/// over the memory budget, and on restart `Pipeline::open` keeps retrying the replay-time flush. Signals still
-/// stop the process (during `Forge::open` too), and the rows stay safe in the WAL.
+/// Known limit (L4): a deterministic non-transient upload or commit error (a bug) retries forever, here. Ingest
+/// then returns 429 once over the memory budget, and on restart `Pipeline::open` keeps retrying the replay-time
+/// flush. A merge error or panic is not retried here: the background flusher logs it and retries the whole flush
+/// after `backoff.max`, but during replay it fails `Pipeline::open` (startup exits 1). Signals still stop the
+/// process (during `Forge::open` too), and the rows stay safe in the WAL either way.
 pub async fn retry<T, E, F, Fut>(what: &str, backoff: Backoff, mut op: F) -> T
 where
     E: Classify,

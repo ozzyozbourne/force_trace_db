@@ -379,3 +379,42 @@ fn stamped_payload_equals_encoding_the_stamped_batch() {
         assert_eq!(payload, wal::encode_batch(&batch_from_rows(&rows)).unwrap(), "{n} rows");
     }
 }
+
+/// `version_offset` is pinned to `spans_schema`: the 8-byte values it points at are exactly the version column,
+/// for a batch whose other Int64 columns hold other non-zero values. A schema edit that moves buffers fails here.
+#[test]
+fn version_offset_points_at_the_version_column() {
+    let mut r = Rng(17);
+    let rows: Vec<_> = (0..50u64)
+        .map(|i| {
+            let mut row = random_row(&mut r, "p", i % 4, i, 7_000 + i);
+            row.prompt_tokens = Some(1_000 + i as i64);
+            row.completion_tokens = Some(2_000 + i as i64);
+            row.total_tokens = Some(3_000 + i as i64);
+            row
+        })
+        .collect();
+    let (payload, at) = wal::encode_payload(&batch_from_rows(&rows)).unwrap();
+    let got: Vec<u64> = payload[at..at + 8 * rows.len()]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c) as u64)
+        .collect();
+    assert_eq!(got, (7_000..7_050).collect::<Vec<_>>());
+}
+
+/// A payload that cannot be encoded or located is a Forge bug: Internal (500), never the client's 400.
+#[test]
+fn encode_failure_is_internal() {
+    use forge_model::error::{Classify, ErrorKind};
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "x",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+    let col: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+    let not_spans = arrow::array::RecordBatch::try_new(schema, vec![col]).unwrap();
+    let e = wal::encode_payload(&not_spans).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Internal, "{e}");
+}

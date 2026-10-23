@@ -30,6 +30,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 reqwest.workspace = true
 flate2.workspace = true
 zstd.workspace = true

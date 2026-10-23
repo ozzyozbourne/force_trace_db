@@ -426,3 +426,65 @@ fn transient_errors() {
     assert!(!StorageError::Io(Error::from(ErrorKind::PermissionDenied)).is_transient());
     assert!(!StorageError::EmptySegment.is_transient());
 }
+
+/// Plan §5.4: random multi-version rows over 3 projects -> the flush's merge (bounded batches) and per-project
+/// split -> the real segment writer. The merge equals the reference; each slice is accepted (strict order, one row
+/// per span), scans back unchanged, and its trace ranges tile it exactly, each range holding only its trace.
+#[tokio::test]
+async fn random_merge_passes_write_segment() {
+    use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
+    use forge_model::testing::{Rng, random_row, reference_merge, rows_from_batch};
+    let st = store("memory://");
+    for seed in 1..=12u64 {
+        let mut r = Rng(seed * 7919 + 1);
+        let mut rows = Vec::new();
+        let mut version = 0;
+        for _ in 0..(200 + r.below(1500)) {
+            version += 1 + r.below(3);
+            let project = ["alpha", "beta", "gamma"][r.below(3) as usize];
+            let trace = r.below(25);
+            let span = trace * 100 + r.below(12);
+            rows.push(random_row(&mut r, project, trace, span, version));
+        }
+        // Memtable = unsorted batches in arrival order.
+        for i in (1..rows.len()).rev() {
+            rows.swap(i, r.below(i as u64 + 1) as usize);
+        }
+        let mut batches = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            let n = (1 + r.below(40) as usize).min(rows.len() - i);
+            batches.push(batch_from_rows(&rows[i..i + n]));
+            i += n;
+        }
+        let merged = merge_versions_chunked(&batches, Tombstones::Keep, 8 << 10).unwrap();
+        let all: Vec<SpanRow> = merged.iter().flat_map(|b| rows_from_batch(b).unwrap()).collect();
+        assert_eq!(all, reference_merge(&rows), "seed {seed}");
+
+        let parts = split_chunks_by_project(&merged).unwrap();
+        assert_eq!(parts.len(), 3, "seed {seed}");
+        for (p, slices) in parts {
+            let want = concat_batches(&spans_schema(), &slices).unwrap();
+            let w = st
+                .write_segment(spec(p.as_str()), input(slices))
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed} {p}: {e}"));
+            assert_eq!(w.meta.row_count as usize, want.num_rows());
+            let got = collect(st.scan(&w.meta, ScanRequest::default()).await.unwrap(), spans_schema()).await;
+            assert_eq!(got, want, "seed {seed} {p}: scan");
+            let want_rows = rows_from_batch(&want).unwrap();
+            let mut next = 0;
+            for t in &w.traces {
+                assert_eq!(t.row_start, next, "seed {seed} {p}: ranges tile the slice");
+                let range = t.row_start as usize..(t.row_start + t.row_count) as usize;
+                assert!(
+                    want_rows[range].iter().all(|x| x.trace_id == t.trace_id),
+                    "seed {seed} {p}: range of {:?} holds other traces",
+                    t.trace_id
+                );
+                next += t.row_count;
+            }
+            assert_eq!(next, w.meta.row_count, "seed {seed} {p}: ranges cover the slice");
+        }
+    }
+}

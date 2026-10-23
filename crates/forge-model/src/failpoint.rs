@@ -4,7 +4,7 @@
 //!
 //! Names: wal_torn_write, wal_lose_unsynced, wal_before_fsync, wal_after_fsync, flush_before_upload,
 //! upload_before_fsync, upload_lose_unsynced, flush_after_upload, meta_commit_in_txn, flush_after_commit,
-//! flush_after_truncate.
+//! flush_after_truncate. Not a kill: flush_merge_panic panics inside the flush's merge task (`fires`).
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 

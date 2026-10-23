@@ -23,6 +23,10 @@ const CLIENTS: u64 = 4;
 const MAX_REQUESTS: u64 = 300;
 const SPANS: u64 = 20;
 const BASE_NS: u64 = 1_790_000_000_000_000_000;
+/// Every case (and every random-SIGKILL round) must ack at least this many load posts.
+const MIN_ACKED: usize = CLIENTS as usize * 2;
+/// `Post::round` of the single post `restart_and_post` makes.
+const POST_RESTART_ROUND: u64 = 99;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Load
@@ -50,7 +54,9 @@ fn span_id(client: u64, req: u64, i: u64) -> Vec<u8> {
 }
 
 /// 20 spans of trace (round, client, req): a small tree with LLM spans and ~600 B payloads. `update` re-posts them
-/// as end posts: end time, status OK and `forge.test.updated=true`, without the payloads.
+/// as end posts: end time, status OK and `forge.test.updated=true`, without the payloads, and with new output
+/// tokens on the LLM spans (a column null on the other spans and non-null in both posts, so check O tells
+/// "newest non-null wins" from "oldest non-null wins").
 fn request(round: u64, client: u64, req: u64, update: bool) -> ExportTraceServiceRequest {
     let spans = (0..SPANS)
         .map(|i| {
@@ -59,6 +65,12 @@ fn request(round: u64, client: u64, req: u64, update: bool) -> ExportTraceServic
             let llm = i % 4 == 1;
             if update {
                 attributes.push(kv("forge.test.updated", any_value::Value::BoolValue(true)));
+                if llm {
+                    attributes.push(kv(
+                        "gen_ai.usage.output_tokens",
+                        any_value::Value::IntValue(1_000 + req as i64),
+                    ));
+                }
             } else {
                 if llm {
                     attributes.extend([
@@ -228,7 +240,7 @@ async fn restart_and_post(dir: &Path, ledger: &Ledger) -> Replay {
         project: "post-restart".into(),
         req,
         acked: true,
-        round: 99,
+        round: POST_RESTART_ROUND,
     });
     s.stop_ok(Duration::from_secs(20)).await;
     replay
@@ -373,7 +385,13 @@ async fn verify(dir: &Path, ledger: &Ledger, orphans: Orphans, ctx: &str) {
         Orphans::AtLeastOne => assert!(n >= 1, "{ctx} H: expected an orphan"),
         Orphans::Any => {}
     }
+    // Not vacuous: if every post were rejected (429/4xx/503), A would check nothing and B/O would accept anything.
     let acked_n = posts.iter().filter(|p| p.acked).count();
+    let load_acked = posts
+        .iter()
+        .filter(|p| p.acked && p.round != POST_RESTART_ROUND)
+        .count();
+    assert!(load_acked >= MIN_ACKED, "{ctx}: only {load_acked} load posts acked");
     eprintln!(
         "{ctx}: {} posts ({acked_n} acked), {} segments, {} rows, {n} orphans",
         posts.len(),
@@ -549,6 +567,17 @@ async fn crash_random_sigkill() {
             join(tasks).await;
             drop(s);
             let ctx = format!("seed {seed} round {round} (kill after {ms} ms)");
+            let round_acked = c
+                .ledger
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.acked && p.round == round)
+                .count();
+            assert!(
+                round_acked >= MIN_ACKED,
+                "{ctx}: only {round_acked} posts acked this round"
+            );
             // A per round: a graceful start/stop flushes the replayed WAL.
             let (mut s, _) = spawn_ready(dir, cfg, &env(None, "300ms", &[])).await;
             s.stop_ok(Duration::from_secs(20)).await;

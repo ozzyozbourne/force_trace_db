@@ -486,3 +486,160 @@ fn failed_frozen_flush_is_retried_while_idle() {
     m.release(&f);
     assert!(!m.flush_due(now));
 }
+
+/// Rows replayed from the WAL are as old as the crash, not the restart: they are due at once, so a crash loop
+/// shorter than `flush_interval` still flushes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replayed_rows_are_due_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let mut o = options(root, 1 << 30, 1 << 20);
+    o.memtable.flush_interval = Duration::from_millis(200);
+    let (ing, _) = Pipeline::open(&o, s.meta.clone(), s.segs.clone()).await.unwrap();
+    ing.submit(vec![start("alpha", 1, 1)]).await.unwrap();
+    drop(ing); // no flush: the row is only in the WAL
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (ing, rep) = Pipeline::open(&o, s.meta.clone(), s.segs.clone()).await.unwrap();
+    assert_eq!(rep.replay.applied, 1);
+    assert!(
+        ing.memtable().flush_due(std::time::Instant::now()),
+        "replayed rows are due right after open"
+    );
+}
+
+/// The budget counts requests between the check and the memtable insert: concurrent submits cannot all pass a
+/// check that sees an empty memtable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_submits_over_budget_get_429() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let mut o = options(root, 1 << 30, 1 << 20);
+    o.memtable.memory_budget = ByteSize::b(1); // below one request
+    let (ing, _) = Pipeline::open(&o, s.meta.clone(), s.segs.clone()).await.unwrap();
+    let tasks: Vec<_> = (0..16u64)
+        .map(|i| {
+            let ing = ing.clone();
+            tokio::spawn(async move { ing.submit(vec![start("alpha", 1, i)]).await })
+        })
+        .collect();
+    let (mut ok, mut busy) = (0, 0);
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(()) => ok += 1,
+            Err(IngestError::Backpressure) => busy += 1,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!((ok, busy), (1, 15), "only the first request fits the budget");
+}
+
+/// Child of `failed_flush_is_retried_after_the_configured_backoff` (runs only with FLUSH_RETRY_CHILD_DIR set, and
+/// FORGE_FAILPOINT=flush_merge_panic@1): the first flush's merge panics. The flusher must survive it (an error,
+/// not a dead task) and retry after the configured backoff (100 ms here, not the default 30 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_retry_child() {
+    let Ok(dir) = std::env::var("FLUSH_RETRY_CHILD_DIR") else {
+        return;
+    };
+    let root = Path::new(&dir);
+    let s = stack(root);
+    let backoff = forge_model::retry::Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(100),
+    };
+    let o = options(root, 16 << 10, 64 << 20);
+    let (ing, _) = Pipeline::open_with_backoff(&o, s.meta.clone(), s.segs.clone(), backoff)
+        .await
+        .unwrap();
+    let tasks = ing.start_background();
+    for i in 0..40u64 {
+        let mut r = start("alpha", 1, i);
+        r.inputs = Some(format!("{{\"pad\":\"{}\"}}", "x".repeat(1000)));
+        ing.submit(vec![r]).await.unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    while s
+        .meta
+        .list_segments(&SegmentFilter::default())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(t0.elapsed() < Duration::from_secs(5), "no flush within 5 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tasks.shutdown(Duration::from_secs(10)).await.unwrap().unwrap();
+    println!("FLUSH_RETRY_CHILD_OK");
+}
+
+#[test]
+fn failed_flush_is_retried_after_the_configured_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["flush_retry_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env("FLUSH_RETRY_CHILD_DIR", tmp.path())
+        .env("FORGE_FAILPOINT", "flush_merge_panic@1")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.status.success() && stdout.contains("FLUSH_RETRY_CHILD_OK"),
+        "{}\n{stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains("flush_merge_panic hit"),
+        "the failpoint fired: {stderr}"
+    );
+}
+
+/// `unflushed` never wraps: an insert's bytes are counted before a racing flush can freeze and release them.
+#[test]
+fn unflushed_bytes_never_wrap_under_concurrent_release() {
+    use forge_ingest::memtable::{MemtableSet, accounted_bytes};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const N: u64 = 100_000;
+    let m = Arc::new(MemtableSet::new(0, 1 << 40, Duration::from_secs(3600)));
+    let b = batch_from_rows(&[start("alpha", 1, 1)]);
+    let bytes = accounted_bytes(&b);
+    let max = N as usize * bytes;
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (m, done) = (m.clone(), done.clone());
+        std::thread::spawn(move || {
+            for seq in 1..=N {
+                m.insert(seq, b.clone(), bytes).unwrap();
+            }
+            done.store(true, Ordering::Release);
+        })
+    };
+    let flusher = {
+        let (m, done) = (m.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut worst = 0;
+            while !done.load(Ordering::Acquire) {
+                if let Some(f) = m.freeze() {
+                    m.release(&f);
+                }
+                worst = worst.max(m.unflushed_bytes());
+            }
+            worst
+        })
+    };
+    let mut worst = 0;
+    while !done.load(Ordering::Acquire) {
+        worst = worst.max(m.unflushed_bytes());
+    }
+    writer.join().unwrap();
+    worst = worst.max(flusher.join().unwrap());
+    assert!(worst <= max, "unflushed wrapped: {worst} > {max}");
+    if let Some(f) = m.freeze() {
+        m.release(&f);
+    }
+    assert_eq!(m.unflushed_bytes(), 0);
+}

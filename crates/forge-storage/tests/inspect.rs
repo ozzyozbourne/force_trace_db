@@ -182,3 +182,29 @@ async fn inspect_rejects_a_non_spans_vortex_file() {
     .unwrap_err();
     assert!(matches!(e, StorageError::InvalidInput(_)), "{e}");
 }
+
+/// `AlreadyExists` on a Create put means another writer's object is acked as ours (content-addressed blobs), so the
+/// existing file is fsynced first. Seen through a file that cannot be opened: the error surfaces instead of the
+/// bare `AlreadyExists`.
+#[tokio::test]
+async fn durable_local_fs_already_exists_syncs_the_existing_object() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let s = DurableLocalFs::new(dir.path().to_path_buf()).unwrap();
+    let p = object_store::path::Path::from("blobs/p/abc");
+    let create = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    s.put_opts(&p, b"v".to_vec().into(), create.clone()).await.unwrap();
+    let e = s.put_opts(&p, b"v".to_vec().into(), create.clone()).await.unwrap_err();
+    assert!(matches!(e, object_store::Error::AlreadyExists { .. }), "{e}");
+    let file = dir.path().join("blobs/p/abc");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let e = s.put_opts(&p, b"v".to_vec().into(), create).await.unwrap_err();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !matches!(e, object_store::Error::AlreadyExists { .. }),
+        "AlreadyExists returned without syncing the existing object"
+    );
+}

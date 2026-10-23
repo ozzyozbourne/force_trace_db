@@ -20,7 +20,8 @@ use tonic::codec::CompressionEncoding;
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
-/// A client-facing failure: classification + message. Built from any `Classify` error.
+/// A client-facing failure: classification + message. Built from any `Classify` error, which is logged like
+/// `ApiError` does (Internal at error, Transient at warn): OTLP exporters drop the data on a 500/INTERNAL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportError {
     pub kind: ErrorKind,
@@ -28,10 +29,13 @@ pub struct ExportError {
 }
 impl<E: Classify> From<E> for ExportError {
     fn from(e: E) -> Self {
-        Self {
-            kind: e.kind(),
-            msg: e.message(),
+        let kind = e.kind();
+        match kind {
+            ErrorKind::Internal => tracing::error!(error = %e, "otlp export failed (internal)"),
+            ErrorKind::Transient => tracing::warn!(error = %e, "otlp export failed (transient)"),
+            _ => {}
         }
+        Self { kind, msg: e.message() }
     }
 }
 impl ExportError {
@@ -42,9 +46,11 @@ impl ExportError {
         }
     }
     fn internal(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        tracing::error!(error = %msg, "otlp export failed (internal)");
         Self {
             kind: ErrorKind::Internal,
-            msg: msg.into(),
+            msg,
         }
     }
 }
@@ -88,11 +94,18 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| ExportError::internal(format!("normalize task: {e}")))?
 }
 
-fn parse_project(h: Option<&str>) -> Result<Option<ProjectId>, ExportError> {
-    h.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| ProjectId::new(s).map_err(|e| ExportError::invalid(format!("{PROJECT_HEADER}: {e}"))))
-        .transpose()
+/// The project header's raw bytes (both transports): absent or blank = None; not UTF-8 or not a valid project id
+/// = InvalidInput (P8), never silently ignored.
+fn parse_project(h: Option<&[u8]>) -> Result<Option<ProjectId>, ExportError> {
+    let Some(b) = h else { return Ok(None) };
+    let s = std::str::from_utf8(b).map_err(|_| ExportError::invalid(format!("{PROJECT_HEADER}: not UTF-8")))?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    ProjectId::new(s)
+        .map(Some)
+        .map_err(|e| ExportError::invalid(format!("{PROJECT_HEADER}: {e}")))
 }
 
 fn response(n_rejected: u64, first_error: Option<String>) -> ExportTraceServiceResponse {
@@ -122,7 +135,7 @@ impl TraceService for OtlpReceiver {
         req: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
         let project =
-            parse_project(req.metadata().get(PROJECT_HEADER).and_then(|v| v.to_str().ok())).map_err(to_status)?;
+            parse_project(req.metadata().get(PROJECT_HEADER).map(|v| v.as_encoded_bytes())).map_err(to_status)?;
         let (req, cfg) = (req.into_inner(), self.cfg.clone());
         let n = blocking(move || Ok(normalize_request(req, project.as_ref(), &cfg)))
             .await
@@ -221,7 +234,7 @@ async fn otlp_http(State(r): State<OtlpReceiver>, headers: HeaderMap, body: Byte
         *r.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
         return r;
     };
-    let project = match parse_project(headers.get(PROJECT_HEADER).and_then(|v| v.to_str().ok())) {
+    let project = match parse_project(headers.get(PROJECT_HEADER).map(|v| v.as_bytes())) {
         Ok(p) => p,
         Err(e) => return encode_err(enc, e),
     };

@@ -425,7 +425,7 @@ fn genai_semconv_agent() {
             run_type: Embedding,
             model: Some("text-embedding-3-small"),
             provider: Some("openai"),
-            tokens: (Some(5), None, Some(5)),
+            tokens: (Some(5), None, None), // one count: no derived total
             status: Some(SOk),
             session: None,
         },
@@ -562,7 +562,7 @@ fn openllmetry_legacy() {
             run_type: Embedding,
             model: Some("text-embedding-ada-002"),
             provider: Some("openai"),
-            tokens: (Some(3), None, Some(3)),
+            tokens: (Some(3), None, Some(3)), // the producer total
             status: Some(SOk),
             session: None,
         },

@@ -35,6 +35,8 @@ pub enum IngestError {
     Backpressure,
     #[error(transparent)]
     Unimplemented(#[from] Unimplemented),
+    /// `Closed` (shutting down) is Transient. Everything else is Internal: `Io` only at startup (open, replay,
+    /// truncate), because write/fsync failures abort the process.
     #[error(transparent)]
     Wal(#[from] wal::WalError),
     #[error("internal: {0}")]
@@ -51,7 +53,9 @@ impl Classify for IngestError {
             Self::Invalid(_) => ErrorKind::InvalidInput,
             Self::Backpressure => ErrorKind::Backpressure,
             Self::Unimplemented(e) => e.kind(),
-            Self::Wal(wal::WalError::Closed | wal::WalError::Io(_)) => ErrorKind::Transient,
+            // Closed = shutting down: retry elsewhere/later. `Io` comes only from startup (open, replay, truncate);
+            // write/fsync failures abort the process, so an `Io` here is not retryable.
+            Self::Wal(wal::WalError::Closed) => ErrorKind::Transient,
             Self::Wal(_) | Self::Internal(_) => ErrorKind::Internal,
         }
     }

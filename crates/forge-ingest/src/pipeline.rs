@@ -18,6 +18,7 @@ use forge_storage::{SegmentStore, StorageError};
 use object_store::ObjectStore;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +30,9 @@ struct Item {
     rows: Rows,
     payload: Vec<u8>,
     version_at: usize,
+    /// The request's bytes in the in-flight count until the rows are in the memtable (dropped after the insert),
+    /// or until the item is dropped unqueued.
+    reserved: Option<Reservation>,
 }
 
 /// Builds and validates the batch (version 0) and encodes its WAL payload. CPU work: call off the async workers.
@@ -41,13 +45,38 @@ fn build_item(mut rows: Vec<SpanRow>) -> Result<Item, IngestError> {
     let batch = bb.finish()?;
     validate_batch(&batch)?;
     let bytes = accounted_bytes(&batch);
-    let payload = wal::encode_batch(&batch).map_err(forge_model::error::ModelError::from)?;
-    let version_at = wal::version_offset(&payload, batch.num_rows()).map_err(forge_model::error::ModelError::from)?;
+    let (payload, version_at) = wal::encode_payload(&batch)?;
     Ok(Item {
         rows: (batch, bytes),
         payload,
         version_at,
+        reserved: None,
     })
+}
+
+/// Accounted bytes of requests admitted by the budget check but not yet in the memtable; released on drop.
+struct Reservation {
+    inflight: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Reservation {
+    /// Admits `bytes` unless memtable + in-flight bytes (other requests) are already over `budget`. The first
+    /// request into an empty pipeline is always admitted, whatever its size.
+    fn try_new(inflight: &Arc<AtomicUsize>, bytes: usize, unflushed: usize, budget: usize) -> Option<Self> {
+        let others = inflight.fetch_add(bytes, Ordering::Relaxed);
+        let r = Self {
+            inflight: inflight.clone(),
+            bytes,
+        };
+        (unflushed + others <= budget).then_some(r) // dropping `r` releases a refused reservation
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -63,6 +92,8 @@ pub struct Pipeline {
     blobs: Arc<dyn ObjectStore>,
     blob_threshold: usize,
     memory_budget: usize,
+    /// See `Reservation`.
+    inflight: Arc<AtomicUsize>,
     flush: FlushCtx,
     flush_lock: tokio::sync::Mutex<()>,
 }
@@ -81,6 +112,16 @@ impl Pipeline {
         cfg: &ForgeConfig,
         meta: Arc<dyn Metastore>,
         segments: Arc<dyn SegmentStore>,
+    ) -> Result<(Arc<Self>, OpenReport), IngestError> {
+        Self::open_with_backoff(cfg, meta, segments, Backoff::default()).await
+    }
+
+    /// `open` with the flush retry backoff (the flush steps, and the flusher's wait after a failed flush).
+    pub async fn open_with_backoff(
+        cfg: &ForgeConfig,
+        meta: Arc<dyn Metastore>,
+        segments: Arc<dyn SegmentStore>,
+        backoff: Backoff,
     ) -> Result<(Arc<Self>, OpenReport), IngestError> {
         let internal = |e: &dyn std::fmt::Display| IngestError::Internal(e.to_string());
         let node_id = cfg.node.id.clone();
@@ -104,7 +145,7 @@ impl Pipeline {
             mem: mem.clone(),
             wal: log.clone(),
             versions: versions.clone(),
-            backoff: Backoff::default(),
+            backoff,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Rows)>(64);
@@ -127,11 +168,13 @@ impl Pipeline {
             // Never a frozen memtable during replay (each one is flushed right here), so this is the size trigger.
             if mem.unflushed_bytes() >= flush_bytes {
                 let f = mem.freeze().expect("non-empty");
-                watermark = flush_frozen(&flush, f).await.map_err(|e| internal(&e))?.watermark;
+                watermark = flush_frozen(&flush, f).await?.watermark;
                 replay_flushes += 1;
             }
         }
         let replay = reader.await.map_err(|e| internal(&e))??;
+        // Replayed rows are as old as the crash: flush them on the flusher's first tick.
+        mem.mark_due();
 
         // P2 / invariant 9: versions are reserved here, on the WAL thread, in seq order.
         let v = versions.clone();
@@ -149,11 +192,17 @@ impl Pipeline {
         };
         let m2 = mem.clone();
         let on_durable = move |items: &mut Vec<(u64, Item)>| {
-            for (seq, Item { rows: (b, len), .. }) in items.drain(..) {
+            for (seq, item) in items.drain(..) {
+                let Item {
+                    rows: (b, len),
+                    reserved,
+                    ..
+                } = item;
                 if let Err(e) = m2.insert(seq, b, len) {
                     tracing::error!(error = %e, "memtable invariant broken; aborting");
                     std::process::abort();
                 }
+                drop(reserved); // now counted in `unflushed`
             }
         };
         let wal: Wal<Item> = log.start(replay.next_seq, encode, on_durable)?;
@@ -175,6 +224,7 @@ impl Pipeline {
                 blobs,
                 blob_threshold: cfg.ingest.blob_threshold.as_u64() as usize,
                 memory_budget: cfg.memtable.memory_budget.as_u64() as usize,
+                inflight: Arc::default(),
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
             }),
@@ -190,10 +240,7 @@ impl Pipeline {
     pub async fn flush_now(&self) -> Result<Option<FlushReport>, IngestError> {
         let _g = self.flush_lock.lock().await;
         let Some(f) = self.mem.freeze() else { return Ok(None) };
-        flush_frozen(&self.flush, f)
-            .await
-            .map(Some)
-            .map_err(|e| IngestError::Internal(e.to_string()))
+        flush_frozen(&self.flush, f).await.map(Some)
     }
     /// Spawns the background flusher. Stop it with `IngestTasks::shutdown`.
     pub fn start_background(self: &Arc<Self>) -> IngestTasks {
@@ -225,7 +272,8 @@ impl Ingest for Pipeline {
         if rows.is_empty() {
             return Err(IngestError::Invalid("empty batch".into()));
         }
-        if self.mem.unflushed_bytes() > self.memory_budget {
+        // Cheap early check; the binding one is the reservation below, once the request's size is known.
+        if self.mem.unflushed_bytes() + self.inflight.load(Ordering::Relaxed) > self.memory_budget {
             return Err(IngestError::Backpressure);
         }
         let join = |e: tokio::task::JoinError| IngestError::Internal(e.to_string());
@@ -244,7 +292,7 @@ impl Ingest for Pipeline {
         })
         .await
         .map_err(join)??;
-        let item = match planned {
+        let mut item = match planned {
             Ok(item) => item,
             Err(rows) => {
                 let put = async {
@@ -260,6 +308,16 @@ impl Ingest for Pipeline {
                 tokio::try_join!(put, build)?.1
             }
         };
+        // Bytes between here and the memtable insert count against the budget (they are queued or being written).
+        // Rows of a refused request may have uploaded blobs: unreferenced blobs are harmless (content-addressed).
+        let reserved = Reservation::try_new(
+            &self.inflight,
+            item.rows.1,
+            self.mem.unflushed_bytes(),
+            self.memory_budget,
+        )
+        .ok_or(IngestError::Backpressure)?;
+        item.reserved = Some(reserved);
         self.wal.append(item).await?;
         Ok(())
     }
@@ -311,7 +369,7 @@ async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
             tracing::error!(error = %e, "flush failed; retrying after backoff");
             tokio::select! {
                 _ = stop.cancelled() => break,
-                _ = tokio::time::sleep(Backoff::default().max) => {}
+                _ = tokio::time::sleep(p.flush.backoff.max) => {}
             }
         }
     }

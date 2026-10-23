@@ -3,13 +3,14 @@
 //! merge (spawn_blocking) -> one L0 segment per project (fresh SegmentId per attempt) -> ONE
 //! commit_flush{segments, flushed_wal_seq = frozen.last_seq, max_version} (same FlushCommit on every
 //! retry: idempotent) -> release the frozen memtable from the view -> truncate the WAL.
+use crate::IngestError;
 use crate::memtable::{Frozen, MemtableSet};
 use crate::version::VersionAllocator;
 use crate::wal::WalLog;
 use forge_meta::{FlushCommit, Metastore, NewSegment};
 use forge_model::catalog::{HourBucket, Level, SegmentId};
 use forge_model::failpoint;
-use forge_model::merge::{Tombstones, merge_versions, split_by_project};
+use forge_model::merge::{Tombstones, merge_versions_chunked, split_chunks_by_project};
 use forge_model::retry::{Backoff, retry};
 use forge_storage::{SegmentSpec, SegmentStore};
 use futures::StreamExt;
@@ -17,6 +18,8 @@ use std::sync::Arc;
 
 /// Rows per batch handed to the segment writer (zero-copy slices; Vortex re-chunks anyway).
 const WRITE_BATCH_ROWS: usize = 8192;
+/// Bound on each merged output batch's variable-length bytes, far below the 2 GiB i32-offset limit per column.
+const MERGE_CHUNK_BYTES: usize = 256 << 20;
 
 pub struct FlushCtx {
     pub node_id: String,
@@ -37,14 +40,22 @@ pub struct FlushReport {
     pub wal_segments_deleted: usize,
 }
 
-pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, forge_model::error::ModelError> {
-    // 1. Merge + physical sort: CPU work, off the async workers. A merge error is a bug (inserts are
-    //    validated), so it is returned and the caller retries later at max backoff.
+/// Errors are Internal: merge errors and panics are bugs (inserts are validated). The upload and commit steps
+/// retry inside (`retry`), so only the merge returns an error; the flusher logs it and retries after backoff.
+pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, IngestError> {
+    let internal = |e: &dyn std::fmt::Display| IngestError::Internal(format!("merge: {e}"));
+    // 1. Merge + physical sort: CPU work, off the async workers. Bounded output batches (no offset overflow).
     let batches = f.batches.clone();
-    let merged = tokio::task::spawn_blocking(move || merge_versions(&batches, Tombstones::Keep))
-        .await
-        .expect("merge task panicked")?;
-    let parts = split_by_project(&merged)?;
+    let merged = tokio::task::spawn_blocking(move || {
+        if failpoint::fires("flush_merge_panic") {
+            panic!("FORGE_FAILPOINT flush_merge_panic hit");
+        }
+        merge_versions_chunked(&batches, Tombstones::Keep, MERGE_CHUNK_BYTES)
+    })
+    .await
+    .map_err(|e| internal(&e))?
+    .map_err(|e| internal(&e))?;
+    let parts = split_chunks_by_project(&merged).map_err(|e| internal(&e))?;
     failpoint::hit("flush_before_upload");
 
     // 2. One L0 segment per project. A fresh SegmentId per ATTEMPT: a put that landed but reported
@@ -52,9 +63,13 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
     let hour = HourBucket::from_nanos(forge_model::time::now_ms().saturating_mul(1_000_000));
     let mut written = Vec::with_capacity(parts.len());
     for (project, rows) in parts {
-        let chunks: Vec<_> = (0..rows.num_rows())
-            .step_by(WRITE_BATCH_ROWS)
-            .map(|o| rows.slice(o, WRITE_BATCH_ROWS.min(rows.num_rows() - o)))
+        let chunks: Vec<_> = rows
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .step_by(WRITE_BATCH_ROWS)
+                    .map(|o| b.slice(o, WRITE_BATCH_ROWS.min(b.num_rows() - o)))
+            })
             .collect();
         let w = retry("write_segment", cx.backoff, || {
             let spec = SegmentSpec {

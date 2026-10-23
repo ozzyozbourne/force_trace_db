@@ -19,12 +19,14 @@
 //! - **Delete is not a barrier** (L2): a re-post after a tombstone is live again, and its null fields are filled
 //!   from versions older than the tombstone. Tombstones first appear in M6; revisit then.
 //! - Cost is per post: a post computes `cost_usd` only from its own model and tokens. M3/M6 recompute it after the
-//!   merge.
+//!   merge. Likewise `total_tokens`: a post sets it only from the producer's total or from BOTH of its own counts,
+//!   so a sparse post (one count) never overwrites a full post's total.
 //! - **M4** (L8): the FTS builder must skip values that are blob refs (`blob::parse_blob_ref`). Blob-backed
 //!   payloads are not searchable in v1.
 //!
 //! No `concat_batches`: rows are addressed as `(batch, row)` and gathered with `interleave`, so the
-//! input is never copied twice and no intermediate Utf8 column can overflow i32 offsets.
+//! input is never copied twice. The output can still exceed i32 Utf8/Binary offsets (2 GiB per column);
+//! `merge_versions_chunked` bounds every output batch (the flush uses it).
 use crate::error::Result;
 use crate::ids::ProjectId;
 use crate::row::validate_batch;
@@ -47,11 +49,27 @@ const ASC_NULLS_LAST: SortOptions = SortOptions {
     nulls_first: false,
 };
 
+/// `merge_versions_chunked` as ONE batch: for bounded inputs (tests, queries over small ranges). A column whose
+/// merged values exceed 2 GiB fails with an offset overflow; the flush uses the chunked form.
 pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result<RecordBatch> {
+    Ok(merge_versions_chunked(batches, tombstones, usize::MAX)?
+        .pop()
+        .unwrap_or_else(|| RecordBatch::new_empty(spans_schema())))
+}
+
+/// The merged rows in physical order, as consecutive batches. A batch ends before the variable-length bytes of
+/// its source rows (every version of every key in it, all columns) would pass `max_chunk_bytes`, so each column of
+/// each batch holds at most that many bytes, unless one key alone is larger. Empty input or all keys dropped:
+/// no batches.
+pub fn merge_versions_chunked(
+    batches: &[RecordBatch],
+    tombstones: Tombstones,
+    max_chunk_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
     let schema = spans_schema();
     let batches: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
     if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
+        return Ok(Vec::new());
     }
     for b in &batches {
         validate_batch(b)?;
@@ -117,23 +135,24 @@ pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result
     //    NOT NULL columns (key, version, deleted) always take the newest row.
     let newest: Vec<(usize, usize)> = groups.iter().map(|g| at(g.start)).collect();
     let all_singletons = groups.len() == total;
-    let arrays = |c: usize| -> Vec<&dyn Array> { batches.iter().map(|b| b.column(c).as_ref()).collect() };
-    let pick = |c: usize| -> std::borrow::Cow<'_, [(usize, usize)]> {
-        let arrays = arrays(c);
-        let no_nulls = !schema.field(c).is_nullable() || arrays.iter().all(|a| a.null_count() == 0);
-        if no_nulls || all_singletons {
-            return std::borrow::Cow::Borrowed(&newest);
+    let arrays: Vec<Vec<&dyn Array>> = (0..schema.fields().len())
+        .map(|c| batches.iter().map(|b| b.column(c).as_ref()).collect())
+        .collect();
+    let newest_only: Vec<bool> = arrays
+        .iter()
+        .enumerate()
+        .map(|(c, a)| all_singletons || !schema.field(c).is_nullable() || a.iter().all(|a| a.null_count() == 0))
+        .collect();
+    // The source row of column `c` for group `g`.
+    let pick = |c: usize, g: usize| -> (usize, usize) {
+        if newest_only[c] {
+            return newest[g];
         }
-        groups
-            .iter()
-            .map(|g| {
-                g.clone()
-                    .map(at)
-                    .find(|&(b, r)| arrays[b].is_valid(r))
-                    .unwrap_or_else(|| at(g.start))
-            })
-            .collect::<Vec<_>>()
-            .into()
+        groups[g]
+            .clone()
+            .map(at)
+            .find(|&(b, r)| arrays[c][b].is_valid(r))
+            .unwrap_or(newest[g])
     };
 
     // 4. The groups to emit: Drop skips keys whose newest row is a tombstone.
@@ -146,33 +165,86 @@ pub fn merge_versions(batches: &[RecordBatch], tombstones: Tombstones) -> Result
         keep.retain(|&g| !deleted[newest[g].0].value(newest[g].1));
     }
 
-    // 5. Physical order of the kept groups, from their merged sort-key columns only.
-    let gather = |c: usize, order: &[usize]| -> Result<ArrayRef> {
-        let idx = pick(c);
-        let idx: Vec<(usize, usize)> = order.iter().map(|&g| idx[g]).collect();
-        Ok(interleave(&arrays(c), &idx)?)
+    // 5. Physical order of the kept groups, from their merged sort-key columns only (gathered in bounded chunks).
+    let weights: Vec<Vec<usize>> = batches.iter().map(|b| row_weights(b)).collect();
+    let group_weight = |g: usize| -> usize { groups[g].clone().map(at).map(|(b, r)| weights[b][r]).sum() };
+    let chunks = |order: &[usize]| -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let (mut start, mut acc) = (0, 0usize);
+        for (i, &g) in order.iter().enumerate() {
+            let w = group_weight(g);
+            if i > start && acc.saturating_add(w) > max_chunk_bytes {
+                out.push(start..i);
+                (start, acc) = (i, 0);
+            }
+            acc += w;
+        }
+        if start < order.len() {
+            out.push(start..order.len());
+        }
+        out
     };
-    let sort_cols = SORT_COLUMNS
-        .iter()
-        .map(|c| gather(col_idx(c), &keep))
-        .collect::<Result<Vec<_>>>()?;
-    let order: Vec<usize> = physical_order(&sort_cols)?
+    let gather = |c: usize, order: &[usize]| -> Result<ArrayRef> {
+        let idx: Vec<(usize, usize)> = order.iter().map(|&g| pick(c, g)).collect();
+        Ok(interleave(&arrays[c], &idx)?)
+    };
+    let sort_chunks = chunks(&keep)
+        .into_iter()
+        .map(|r| {
+            SORT_COLUMNS
+                .iter()
+                .map(|c| gather(col_idx(c), &keep[r.clone()]))
+                .collect()
+        })
+        .collect::<Result<Vec<Vec<ArrayRef>>>>()?;
+    let order: Vec<usize> = physical_order(&sort_chunks)?
         .into_iter()
         .map(|i| keep[i as usize])
         .collect();
 
-    // 6. One gather per column, in physical order.
-    let out = (0..schema.fields().len())
-        .map(|c| gather(c, &order))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema.clone(), out)?)
+    // 6. One gather per column and chunk, in physical order.
+    chunks(&order)
+        .into_iter()
+        .map(|r| {
+            let out = (0..schema.fields().len())
+                .map(|c| gather(c, &order[r.clone()]))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RecordBatch::try_new(schema.clone(), out)?)
+        })
+        .collect()
+}
+
+/// Per row: the bytes of its variable-length values over all columns (Utf8/Binary values, list items' values).
+/// An upper bound on what the row contributes to any one merged column.
+fn row_weights(b: &RecordBatch) -> Vec<usize> {
+    let mut w = vec![0usize; b.num_rows()];
+    let mut add = |offsets: &[i32]| {
+        for (r, o) in offsets.windows(2).enumerate() {
+            w[r] += (o[1] - o[0]) as usize;
+        }
+    };
+    for c in b.columns() {
+        match c.data_type() {
+            DataType::Utf8 => add(c.as_string::<i32>().value_offsets()),
+            DataType::Binary => add(c.as_binary::<i32>().value_offsets()),
+            DataType::List(_) => {
+                let l = c.as_list::<i32>();
+                let v = l.values().as_string::<i32>().value_offsets();
+                let rows: Vec<i32> = l.value_offsets().iter().map(|&i| v[i as usize]).collect();
+                add(&rows);
+            }
+            _ => {}
+        }
+    }
+    w
 }
 
 const SORT_COLUMNS: [&str; 4] = [col::PROJECT_ID, col::TRACE_ID, col::DOTTED_ORDER, col::SPAN_ID];
 
-/// The row order of `SORT_COLUMNS` arrays: `(project_id, trace_id, dotted_order NULLS LAST, span_id)`, byte-wise.
-fn physical_order(cols: &[ArrayRef]) -> Result<Vec<u32>> {
-    let n = cols[0].len();
+/// The row order of `SORT_COLUMNS` arrays, given as consecutive chunks: `(project_id, trace_id, dotted_order NULLS
+/// LAST, span_id)`, byte-wise. Indexes count rows across the chunks.
+fn physical_order(chunks: &[Vec<ArrayRef>]) -> Result<Vec<u32>> {
+    let n: usize = chunks.iter().map(|c| c[0].len()).sum();
     let mut idx: Vec<u32> = (0..n as u32).collect();
     if n <= 1 {
         return Ok(idx);
@@ -183,7 +255,10 @@ fn physical_order(cols: &[ArrayRef]) -> Result<Vec<u32>> {
         SortField::new_with_options(DataType::Utf8, ASC_NULLS_LAST),
         SortField::new_with_options(DataType::Binary, ASC_NULLS_LAST),
     ])?;
-    let rows = conv.convert_columns(cols)?;
+    let mut rows = conv.empty_rows(n, 0);
+    for c in chunks {
+        conv.append(&mut rows, c)?;
+    }
     idx.sort_unstable_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
     Ok(idx)
 }
@@ -195,8 +270,23 @@ pub fn sort_physical(b: &RecordBatch) -> Result<RecordBatch> {
         return Ok(b.clone());
     }
     let cols: Vec<ArrayRef> = SORT_COLUMNS.iter().map(|c| b.column(col_idx(c)).clone()).collect();
-    let idx = physical_order(&cols)?;
+    let idx = physical_order(&[cols])?;
     Ok(take_record_batch(b, &UInt32Array::from(idx))?)
+}
+
+/// `split_by_project` over consecutive project-sorted batches (`merge_versions_chunked`): per project, its slices
+/// of every batch, in order. A project can span batches.
+pub fn split_chunks_by_project(chunks: &[RecordBatch]) -> Result<Vec<(ProjectId, Vec<RecordBatch>)>> {
+    let mut out: Vec<(ProjectId, Vec<RecordBatch>)> = Vec::new();
+    for c in chunks {
+        for (p, slice) in split_by_project(c)? {
+            match out.last_mut() {
+                Some((last, v)) if *last == p => v.push(slice),
+                _ => out.push((p, vec![slice])),
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Zero-copy slices of a project-sorted batch, one per project (one L0 segment each).
@@ -366,6 +456,40 @@ mod tests {
 
     fn chunked(rows: &[SpanRow], chunk: usize) -> Vec<RecordBatch> {
         rows.chunks(chunk).map(batch_from_rows).collect()
+    }
+
+    /// Small `max_chunk_bytes`: several batches, each within the bound (unless one key alone exceeds it), and
+    /// together exactly the one-batch merge; the per-project split across batch boundaries matches too.
+    #[test]
+    fn chunked_merge_bounds_every_batch() {
+        for seed in 1..=8u64 {
+            let rows = g1(seed, 400);
+            for t in [Tombstones::Keep, Tombstones::Drop] {
+                let input = chunked(&rows, 1 + seed as usize * 5);
+                let one = merge_versions(&input, t).unwrap();
+                let max = 2048;
+                let chunks = merge_versions_chunked(&input, t, max).unwrap();
+                assert!(chunks.len() > 2, "seed {seed}: {} batches", chunks.len());
+                for c in &chunks {
+                    let w: usize = row_weights(c).iter().sum();
+                    assert!(
+                        w <= max || c.num_rows() == 1,
+                        "seed {seed}: {w} bytes in {} rows",
+                        c.num_rows()
+                    );
+                }
+                let all: Vec<SpanRow> = chunks.iter().flat_map(|c| rows_from_batch(c).unwrap()).collect();
+                assert_eq!(all, rows_from_batch(&one).unwrap(), "seed {seed} {t:?}");
+                let split = split_chunks_by_project(&chunks).unwrap();
+                let want = split_by_project(&one).unwrap();
+                assert_eq!(split.len(), want.len());
+                for ((p, parts), (wp, w)) in split.iter().zip(&want) {
+                    let got: Vec<SpanRow> = parts.iter().flat_map(|b| rows_from_batch(b).unwrap()).collect();
+                    assert_eq!((p, got), (wp, rows_from_batch(w).unwrap()));
+                }
+            }
+        }
+        assert!(merge_versions_chunked(&[], Tombstones::Keep, 1).unwrap().is_empty());
     }
 
     proptest! {

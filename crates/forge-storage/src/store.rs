@@ -115,7 +115,15 @@ impl std::fmt::Display for DurableLocalFs {
 #[async_trait]
 impl ObjectStore for DurableLocalFs {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
-        let r = self.inner.put_opts(location, payload, opts).await?;
+        let r = match self.inner.put_opts(location, payload, opts).await {
+            // Create on an existing object: the caller may treat it as written (content-addressed blobs), but the
+            // first writer may not have fsynced it yet. Sync it before reporting AlreadyExists.
+            Err(e @ object_store::Error::AlreadyExists { .. }) => {
+                self.sync(location).await?;
+                return Err(e);
+            }
+            r => r?,
+        };
         forge_model::failpoint::hit("upload_before_fsync");
         if forge_model::failpoint::fires("upload_lose_unsynced") {
             // Power-loss model: the unsynced object is gone.

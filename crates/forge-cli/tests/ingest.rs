@@ -23,7 +23,8 @@ fn parse(json: &str) -> ExportTraceServiceRequest {
     serde_json::from_str(json).expect("OTLP JSON")
 }
 
-/// The genai fixture's second post: b106 ends (OK), b102 is renamed, b103 drops `gen_ai.input.messages`.
+/// The genai fixture's second post: b106 ends (OK), b102 is renamed, b103 drops `gen_ai.input.messages`, b101's
+/// output tokens go 18 -> 25 (a column null on other spans, non-null in both posts: newest non-null must win).
 fn genai_repost(src: &str) -> String {
     let mut v: Value = serde_json::from_str(src).expect("json");
     for s in v["resourceSpans"][0]["scopeSpans"][0]["spans"]
@@ -37,6 +38,13 @@ fn genai_repost(src: &str) -> String {
                 s["status"] = json!({"code": 1});
             }
             "eee19b7ec3c1b102" => s["name"] = json!("execute_tool get_weather v2"),
+            "eee19b7ec3c1b101" => {
+                for a in s["attributes"].as_array_mut().expect("attributes") {
+                    if a["key"] == "gen_ai.usage.output_tokens" {
+                        a["value"] = json!({"intValue": "25"});
+                    }
+                }
+            }
             "eee19b7ec3c1b103" => s["attributes"]
                 .as_array_mut()
                 .expect("attributes")
@@ -126,7 +134,7 @@ async fn run() {
     let resp = plain.export(req).await.expect("legacy export").into_inner();
     assert_eq!(resp.partial_success, None);
 
-    // 5. genai re-post: HTTP JSON (end post of b106, changed b102 name, b103 without input messages).
+    // 5. genai re-post: HTTP JSON (end post of b106, changed b102 name, b103 without input messages, b101 output tokens).
     let r = post_otlp(&http, &p, "application/json", None, None, repost.into())
         .await
         .expect("post repost");
@@ -172,6 +180,12 @@ async fn run() {
     assert_eq!(
         span("eee19b7ec3c1b102").name.as_deref(),
         Some("execute_tool get_weather v2")
+    );
+    let b101 = span("eee19b7ec3c1b101");
+    assert_eq!(
+        (b101.prompt_tokens, b101.completion_tokens, b101.total_tokens),
+        (Some(120), Some(25), Some(145)),
+        "the newest non-null token counts win"
     );
     let first_b103 = normalized[2]
         .iter()
