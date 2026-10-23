@@ -307,40 +307,48 @@ fn unidentified_span_has_null_run_type_and_cost() {
     assert_eq!(r.prompt_tokens, Some(10));
 }
 
-/// A sparse later post (one token count) must not overwrite the full post's total with a partial one.
+/// Decision 15: `total_tokens` is never derived per post. Without a producer total it is null on every post and
+/// after the merge (readers derive it from the merged counts); a producer total is stored as sent and survives a
+/// sparse later post.
 #[test]
-fn sparse_post_keeps_the_full_total() {
+fn total_tokens_is_only_the_producer_total() {
     let cfg = NormalizeConfig::default();
-    let full = span(
-        7,
-        1,
-        None,
-        0,
-        vec![
+    let merged = |producer_total: Option<i64>| {
+        let mut attrs = vec![
             kv("gen_ai.operation.name", s("chat")),
             kv("gen_ai.request.model", s("gpt-4o")),
             kv("gen_ai.usage.input_tokens", i(100)),
             kv("gen_ai.usage.output_tokens", i(50)),
-        ],
-    );
-    let sparse = span(7, 1, None, 0, vec![kv("gen_ai.usage.output_tokens", i(60))]);
-    let mut rows = Vec::new();
-    for (v, sp) in [full, sparse].into_iter().enumerate() {
-        let mut n = normalize_request(req(vec![], vec![sp]), None, &cfg);
-        stamp(&mut n.rows, v as u64 + 1..v as u64 + 2);
-        rows.extend(n.rows);
-    }
-    assert_eq!(rows[1].total_tokens, None, "one count on the post: no total");
-    let merged = forge_model::merge::merge_versions(
-        &[forge_model::testing::batch_from_rows(&rows)],
-        forge_model::merge::Tombstones::Keep,
-    )
-    .unwrap();
-    let m = &forge_model::testing::rows_from_batch(&merged).unwrap()[0];
+        ];
+        if let Some(t) = producer_total {
+            attrs.push(kv("gen_ai.usage.total_tokens", i(t)));
+        }
+        let full = span(7, 1, None, 0, attrs);
+        let sparse = span(7, 1, None, 0, vec![kv("gen_ai.usage.output_tokens", i(60))]);
+        let mut rows = Vec::new();
+        for (v, sp) in [full, sparse].into_iter().enumerate() {
+            let mut n = normalize_request(req(vec![], vec![sp]), None, &cfg);
+            stamp(&mut n.rows, v as u64 + 1..v as u64 + 2);
+            rows.extend(n.rows);
+        }
+        assert_eq!(
+            rows[0].total_tokens, producer_total,
+            "full post stores only the producer total"
+        );
+        assert_eq!(rows[1].total_tokens, None, "sparse post");
+        let m = forge_model::merge::merge_versions(
+            &[forge_model::testing::batch_from_rows(&rows)],
+            forge_model::merge::Tombstones::Keep,
+        )
+        .unwrap();
+        let m = &forge_model::testing::rows_from_batch(&m).unwrap()[0];
+        (m.prompt_tokens, m.completion_tokens, m.total_tokens)
+    };
+    assert_eq!(merged(None), (Some(100), Some(60), None), "no derived total");
     assert_eq!(
-        (m.prompt_tokens, m.completion_tokens, m.total_tokens),
+        merged(Some(150)),
         (Some(100), Some(60), Some(150)),
-        "the full post's total survives"
+        "producer total as sent"
     );
 }
 

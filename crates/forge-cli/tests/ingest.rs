@@ -184,7 +184,7 @@ async fn run() {
     let b101 = span("eee19b7ec3c1b101");
     assert_eq!(
         (b101.prompt_tokens, b101.completion_tokens, b101.total_tokens),
-        (Some(120), Some(25), Some(145)),
+        (Some(120), Some(25), None), // no producer total: never derived (decision 15)
         "the newest non-null token counts win"
     );
     let first_b103 = normalized[2]

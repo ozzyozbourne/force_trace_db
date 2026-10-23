@@ -19,8 +19,11 @@
 //! - **Delete is not a barrier** (L2): a re-post after a tombstone is live again, and its null fields are filled
 //!   from versions older than the tombstone. Tombstones first appear in M6; revisit then.
 //! - Cost is per post: a post computes `cost_usd` only from its own model and tokens. M3/M6 recompute it after the
-//!   merge. Likewise `total_tokens`: a post sets it only from the producer's total or from BOTH of its own counts,
-//!   so a sparse post (one count) never overwrites a full post's total.
+//!   merge.
+//! - `total_tokens` holds only a producer-sent total, never a derived one (master decision 15), so the per-field
+//!   rule stays pure. Readers compute `COALESCE(total_tokens, prompt_tokens + completion_tokens)` AFTER the merge
+//!   (M2, one shared helper; either count may be null there). Known limit: a stored producer total from an older
+//!   post is not updated when a later post changes only a count.
 //! - **M4** (L8): the FTS builder must skip values that are blob refs (`blob::parse_blob_ref`). Blob-backed
 //!   payloads are not searchable in v1.
 //!

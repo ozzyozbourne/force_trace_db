@@ -365,7 +365,7 @@ fn genai_semconv_agent() {
             run_type: Agent,
             model: Some("gpt-4o"),
             provider: Some("openai"),
-            tokens: (Some(230), Some(31), Some(261)),
+            tokens: (Some(230), Some(31), None), // no producer total: never derived (decision 15)
             status: Some(SOk),
             session: c,
         },
@@ -380,7 +380,7 @@ fn genai_semconv_agent() {
             run_type: ChatModel,
             model: Some("gpt-4o-2024-08-06"),
             provider: Some("openai"),
-            tokens: (Some(120), Some(18), Some(138)),
+            tokens: (Some(120), Some(18), None), // no producer total
             status: Some(SOk),
             session: c,
         },
@@ -410,7 +410,7 @@ fn genai_semconv_agent() {
             run_type: ChatModel,
             model: Some("gpt-4o-2024-08-06"),
             provider: Some("openai"),
-            tokens: (Some(110), Some(13), Some(123)),
+            tokens: (Some(110), Some(13), None), // no producer total
             status: Some(SOk),
             session: c,
         },
@@ -425,7 +425,7 @@ fn genai_semconv_agent() {
             run_type: Embedding,
             model: Some("text-embedding-3-small"),
             provider: Some("openai"),
-            tokens: (Some(5), None, None), // one count: no derived total
+            tokens: (Some(5), None, None), // no producer total
             status: Some(SOk),
             session: None,
         },

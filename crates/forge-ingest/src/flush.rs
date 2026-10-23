@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 /// Rows per batch handed to the segment writer (zero-copy slices; Vortex re-chunks anyway).
 const WRITE_BATCH_ROWS: usize = 8192;
-/// Bound on each merged output batch's variable-length bytes, far below the 2 GiB i32-offset limit per column.
-const MERGE_CHUNK_BYTES: usize = 256 << 20;
+/// Default bound on each merged output batch's variable-length bytes, far below the 2 GiB i32-offset limit per
+/// column.
+pub const MERGE_CHUNK_BYTES: usize = 256 << 20;
 
 pub struct FlushCtx {
     pub node_id: String,
@@ -29,6 +30,25 @@ pub struct FlushCtx {
     pub wal: Arc<WalLog>,
     pub versions: Arc<VersionAllocator>,
     pub backoff: Backoff,
+    /// `merge_versions_chunked`'s bound for this flush's merged batches.
+    pub merge_chunk_bytes: usize,
+}
+
+/// The flush knobs `Pipeline::open_with` takes (`Pipeline::open` uses the defaults).
+#[derive(Clone, Copy, Debug)]
+pub struct FlushOptions {
+    /// The flush steps' retry, and the flusher's wait after a failed flush.
+    pub backoff: Backoff,
+    pub merge_chunk_bytes: usize,
+}
+
+impl Default for FlushOptions {
+    fn default() -> Self {
+        Self {
+            backoff: Backoff::default(),
+            merge_chunk_bytes: MERGE_CHUNK_BYTES,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +58,8 @@ pub struct FlushReport {
     pub rows_in: usize,
     pub rows_out: u64,
     pub wal_segments_deleted: usize,
+    /// Batches the merge produced (> 1 when the frozen memtable exceeded `merge_chunk_bytes`).
+    pub merged_batches: usize,
 }
 
 /// Errors are Internal: merge errors and panics are bugs (inserts are validated). The upload and commit steps
@@ -45,12 +67,12 @@ pub struct FlushReport {
 pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, IngestError> {
     let internal = |e: &dyn std::fmt::Display| IngestError::Internal(format!("merge: {e}"));
     // 1. Merge + physical sort: CPU work, off the async workers. Bounded output batches (no offset overflow).
-    let batches = f.batches.clone();
+    let (batches, max_chunk) = (f.batches.clone(), cx.merge_chunk_bytes);
     let merged = tokio::task::spawn_blocking(move || {
         if failpoint::fires("flush_merge_panic") {
             panic!("FORGE_FAILPOINT flush_merge_panic hit");
         }
-        merge_versions_chunked(&batches, Tombstones::Keep, MERGE_CHUNK_BYTES)
+        merge_versions_chunked(&batches, Tombstones::Keep, max_chunk)
     })
     .await
     .map_err(|e| internal(&e))?
@@ -121,5 +143,6 @@ pub async fn flush_frozen(cx: &FlushCtx, f: Arc<Frozen>) -> Result<FlushReport, 
         watermark,
         rows_in: f.batches.iter().map(|b| b.num_rows()).sum(),
         wal_segments_deleted: deleted,
+        merged_batches: merged.len(),
     })
 }

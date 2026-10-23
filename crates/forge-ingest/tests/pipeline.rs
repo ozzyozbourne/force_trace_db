@@ -545,12 +545,15 @@ async fn flush_retry_child() {
     };
     let root = Path::new(&dir);
     let s = stack(root);
-    let backoff = forge_model::retry::Backoff {
-        initial: Duration::from_millis(10),
-        max: Duration::from_millis(100),
+    let fo = forge_ingest::flush::FlushOptions {
+        backoff: forge_model::retry::Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(100),
+        },
+        ..Default::default()
     };
     let o = options(root, 16 << 10, 64 << 20);
-    let (ing, _) = Pipeline::open_with_backoff(&o, s.meta.clone(), s.segs.clone(), backoff)
+    let (ing, _) = Pipeline::open_with(&o, s.meta.clone(), s.segs.clone(), fo)
         .await
         .unwrap();
     let tasks = ing.start_background();
@@ -642,4 +645,55 @@ fn unflushed_bytes_never_wrap_under_concurrent_release() {
         m.release(&f);
     }
     assert_eq!(m.unflushed_bytes(), 0);
+}
+
+/// `mark_due` makes the active memtable due whatever `flush_interval` is: a flag, not a backdated start time (which
+/// `Instant::checked_sub` cannot always represent; here it cannot at all), and the next memtable after `freeze` is
+/// not due.
+#[test]
+fn mark_due_is_a_flag_cleared_by_freeze() {
+    let m = forge_ingest::memtable::MemtableSet::new(0, 1 << 30, Duration::MAX);
+    let row = |seq| {
+        let b = batch_from_rows(&[start("alpha", 1, seq)]);
+        let bytes = forge_ingest::memtable::accounted_bytes(&b);
+        m.insert(seq, b, bytes).unwrap();
+    };
+    m.mark_due();
+    row(1);
+    assert!(
+        !m.flush_due(std::time::Instant::now()),
+        "mark_due on an empty memtable does nothing"
+    );
+    m.mark_due();
+    assert!(m.flush_due(std::time::Instant::now()), "due right after mark_due");
+    let f = m.freeze().unwrap();
+    m.release(&f);
+    row(2);
+    assert!(!m.flush_due(std::time::Instant::now()), "the next memtable is not due");
+}
+
+/// L2: the flush merges in bounded batches (`FlushOptions::merge_chunk_bytes`), and the result is unchanged: one
+/// segment per project holding exactly the one-batch merge of the frozen rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_merges_in_bounded_batches() {
+    use forge_model::MemtableView;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = stack(root);
+    let fo = forge_ingest::flush::FlushOptions {
+        merge_chunk_bytes: 2 << 10,
+        ..Default::default()
+    };
+    let o = options(root, 1 << 30, 64 << 20);
+    let (ing, _) = Pipeline::open_with(&o, s.meta.clone(), s.segs.clone(), fo)
+        .await
+        .unwrap();
+    ingest_spans(&ing, 0, 300, true).await;
+    let want = rows_from_batch(&merge_versions(&ing.memtable().snapshot().batches, Tombstones::Keep).unwrap());
+    let r = ing.flush_now().await.unwrap().unwrap();
+    assert!(r.merged_batches > 1, "unbounded merge: {} batch(es)", r.merged_batches);
+    assert_eq!(r.segments.len(), 3, "one segment per project");
+    let mut got: Vec<SpanRow> = visible_raw(&s).await.iter().flat_map(rows_from_batch).collect();
+    got.sort_by_key(forge_model::testing::physical_key);
+    assert_eq!(got, want);
 }

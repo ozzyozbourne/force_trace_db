@@ -41,6 +41,8 @@ struct Active {
     bytes: usize,
     /// When the first batch went in; meaningless while `batches` is empty.
     created: Instant,
+    /// Due regardless of size and age (`mark_due`); cleared by `freeze` (a fresh `Active`).
+    due: bool,
 }
 
 impl Active {
@@ -49,6 +51,7 @@ impl Active {
             batches: Vec::new(),
             bytes: 0,
             created: Instant::now(),
+            due: false,
         }
     }
 }
@@ -120,7 +123,7 @@ impl MemtableSet {
         let full = a.bytes >= self.flush_bytes;
         s.snapshot = None;
         // Under the lock: once unlocked, a flush can freeze and `release` this batch, which subtracts its bytes.
-        self.unflushed.fetch_add(bytes, Ordering::Relaxed);
+        self.unflushed.fetch_add(bytes, Ordering::SeqCst);
         drop(s);
         if full {
             self.flush_wanted.notify_one();
@@ -130,7 +133,7 @@ impl MemtableSet {
 
     /// Bytes not yet in a committed segment (active + frozen). Backpressure: > memory_budget -> 429.
     pub fn unflushed_bytes(&self) -> usize {
-        self.unflushed.load(Ordering::Relaxed)
+        self.unflushed.load(Ordering::SeqCst)
     }
 
     /// A frozen memtable is left over (its flush failed), or the size/age trigger on the active one.
@@ -139,18 +142,15 @@ impl MemtableSet {
         let a = &s.active;
         s.frozen.is_some()
             || !a.batches.is_empty()
-                && (a.bytes >= self.flush_bytes || now.duration_since(a.created) >= self.flush_interval)
+                && (a.due || a.bytes >= self.flush_bytes || now.duration_since(a.created) >= self.flush_interval)
     }
 
-    /// Makes the active memtable due now (age trigger). After replay: replayed rows are as old as the crash, so a
-    /// restart loop shorter than `flush_interval` must not keep postponing them.
+    /// Makes the active memtable due now, until it is frozen. After replay: replayed rows are as old as the crash,
+    /// so a restart loop shorter than `flush_interval` must not keep postponing them. No effect when empty.
     pub fn mark_due(&self) {
         let mut s = self.lock();
-        if !s.active.batches.is_empty()
-            && let Some(t) = Instant::now().checked_sub(self.flush_interval)
-        {
-            s.active.created = t;
-        }
+        let a = &mut s.active;
+        a.due = !a.batches.is_empty();
     }
 
     pub fn flush_interval(&self) -> Duration {
@@ -189,7 +189,7 @@ impl MemtableSet {
         if s.frozen.as_ref().is_some_and(|x| Arc::ptr_eq(x, f)) {
             s.frozen = None;
             s.snapshot = None;
-            self.unflushed.fetch_sub(f.bytes, Ordering::Relaxed); // under the lock, like `insert`'s add
+            self.unflushed.fetch_sub(f.bytes, Ordering::SeqCst); // under the lock, like `insert`'s add
         }
     }
 

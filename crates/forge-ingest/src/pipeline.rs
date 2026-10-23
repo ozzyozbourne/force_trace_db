@@ -1,6 +1,6 @@
 //! The write path: WAL + memtable + flush behind the `Ingest` trait.
 use crate::blob::{plan_blobs, put_blobs};
-use crate::flush::{FlushCtx, FlushReport, flush_frozen};
+use crate::flush::{FlushCtx, FlushOptions, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
 use crate::version::VersionAllocator;
 use crate::wal::{self, Wal, WalLog};
@@ -11,7 +11,6 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use forge_meta::Metastore;
 use forge_model::config::ForgeConfig;
-use forge_model::retry::Backoff;
 use forge_model::row::{SpanBatchBuilder, SpanRow, validate_batch};
 use forge_model::schema::{col, col_idx};
 use forge_storage::{SegmentStore, StorageError};
@@ -61,21 +60,31 @@ struct Reservation {
 }
 
 impl Reservation {
-    /// Admits `bytes` unless memtable + in-flight bytes (other requests) are already over `budget`. The first
-    /// request into an empty pipeline is always admitted, whatever its size.
-    fn try_new(inflight: &Arc<AtomicUsize>, bytes: usize, unflushed: usize, budget: usize) -> Option<Self> {
-        let others = inflight.fetch_add(bytes, Ordering::Relaxed);
+    /// Admits `bytes` iff memtable + OTHER requests' in-flight bytes are within `budget` (this request's own size
+    /// is not checked), so memtable + in-flight exceeds the budget by at most one request; a request larger than
+    /// the budget still gets in when nothing else is pending.
+    ///
+    /// The reservation is added BEFORE `unflushed()` is read (both SeqCst, like the memtable's add before the
+    /// writer releases a reservation): bytes moving from in-flight to the memtable meanwhile are counted twice,
+    /// never zero times.
+    fn try_new(
+        inflight: &Arc<AtomicUsize>,
+        bytes: usize,
+        unflushed: impl FnOnce() -> usize,
+        budget: usize,
+    ) -> Option<Self> {
+        let others = inflight.fetch_add(bytes, Ordering::SeqCst);
         let r = Self {
             inflight: inflight.clone(),
             bytes,
         };
-        (unflushed + others <= budget).then_some(r) // dropping `r` releases a refused reservation
+        (unflushed() + others <= budget).then_some(r) // dropping `r` releases a refused reservation
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.inflight.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.inflight.fetch_sub(self.bytes, Ordering::SeqCst);
     }
 }
 
@@ -113,15 +122,15 @@ impl Pipeline {
         meta: Arc<dyn Metastore>,
         segments: Arc<dyn SegmentStore>,
     ) -> Result<(Arc<Self>, OpenReport), IngestError> {
-        Self::open_with_backoff(cfg, meta, segments, Backoff::default()).await
+        Self::open_with(cfg, meta, segments, FlushOptions::default()).await
     }
 
-    /// `open` with the flush retry backoff (the flush steps, and the flusher's wait after a failed flush).
-    pub async fn open_with_backoff(
+    /// `open` with explicit flush knobs (tests: a short backoff, a small merge chunk).
+    pub async fn open_with(
         cfg: &ForgeConfig,
         meta: Arc<dyn Metastore>,
         segments: Arc<dyn SegmentStore>,
-        backoff: Backoff,
+        flush_opts: FlushOptions,
     ) -> Result<(Arc<Self>, OpenReport), IngestError> {
         let internal = |e: &dyn std::fmt::Display| IngestError::Internal(e.to_string());
         let node_id = cfg.node.id.clone();
@@ -145,7 +154,8 @@ impl Pipeline {
             mem: mem.clone(),
             wal: log.clone(),
             versions: versions.clone(),
-            backoff,
+            backoff: flush_opts.backoff,
+            merge_chunk_bytes: flush_opts.merge_chunk_bytes,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Rows)>(64);
@@ -313,7 +323,7 @@ impl Ingest for Pipeline {
         let reserved = Reservation::try_new(
             &self.inflight,
             item.rows.1,
-            self.mem.unflushed_bytes(),
+            || self.mem.unflushed_bytes(),
             self.memory_budget,
         )
         .ok_or(IngestError::Backpressure)?;
@@ -372,5 +382,35 @@ async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
                 _ = tokio::time::sleep(p.flush.backoff.max) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L1: the memtable size is read only after this request's bytes are in flight, so a batch moving from
+    /// in-flight to the memtable in between is never missed by both.
+    #[test]
+    fn reservation_counts_itself_before_reading_the_memtable() {
+        let inflight = Arc::new(AtomicUsize::new(5));
+        let seen = std::cell::Cell::new(0);
+        let r = Reservation::try_new(
+            &inflight,
+            10,
+            || {
+                seen.set(inflight.load(Ordering::SeqCst));
+                0
+            },
+            100,
+        );
+        assert_eq!(seen.get(), 15, "own bytes reserved before the memtable read");
+        assert!(r.is_some());
+        drop(r);
+        assert_eq!(inflight.load(Ordering::SeqCst), 5);
+        // Admission: memtable + others within the budget, whatever this request's size.
+        assert!(Reservation::try_new(&inflight, 1_000, || 95, 100).is_some());
+        assert!(Reservation::try_new(&inflight, 1, || 96, 100).is_none());
+        assert_eq!(inflight.load(Ordering::SeqCst), 5, "refused reservations are released");
     }
 }
