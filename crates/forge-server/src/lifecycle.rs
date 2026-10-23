@@ -75,7 +75,7 @@ async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, data_clock: Clock, stop: Cancel
     let mut jobs: JoinSet<()> = JoinSet::new();
     let mut compact_tick = ticker(c.interval, false);
     let mut gc_tick = ticker(c.gc_interval, true);
-    let blob_gc = f.ingest.blob_gc();
+    let blobs = f.ingest.blob_guard();
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
@@ -94,7 +94,7 @@ async fn run(f: Arc<Forge>, cx: Arc<CompactCtx>, data_clock: Clock, stop: Cancel
             _ = tick(&mut gc_tick) => {
                 let o = GcOptions { gc_grace: c.gc_grace, orphan_grace: c.orphan_grace, sweep_blobs: true, dry_run: false };
                 let store = f.segments.object_store();
-                match run_gc(f.meta.as_ref(), store.as_ref(), data_clock(), now_ms(), &o, Some(&blob_gc)).await {
+                match run_gc(f.meta.as_ref(), store.as_ref(), data_clock(), now_ms(), &o, Some(&blobs)).await {
                     Ok(r) => tracing::info!(?r, "gc pass done"),
                     Err(e) => tracing::warn!(error = %e, "gc pass failed; retried next interval"),
                 }

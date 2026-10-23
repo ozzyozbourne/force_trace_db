@@ -6,6 +6,7 @@
 //!   forgets their rows (trace_index, blob_refs, segments). A crash in between re-runs: NotFound = success;
 //! - the orphan sweep deletes objects that no segments row names and blobs that no blob_refs row names, both
 //!   older than `orphan_grace` (object last_modified).
+use crate::blob::BlobGuard;
 use forge_meta::{MetaError, Metastore};
 use forge_model::catalog::{Level, SegmentMeta, SegmentState, paths};
 use forge_model::ids::ProjectId;
@@ -17,6 +18,8 @@ use std::time::Duration;
 
 /// Rows per purge batch, L1 hours per retention txn.
 pub const BATCH: usize = 1000;
+/// Blobs deleted per write-lock hold of the `BlobGuard` (no HEAD under the lock; RA m11).
+pub const BLOB_CHUNK: usize = 64;
 const DAY_NS: i64 = 86_400 * 1_000_000_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -192,7 +195,7 @@ pub async fn sweep_orphans(
     now_ms: i64,
     o: &GcOptions,
     r: &mut GcReport,
-    blob_lock: Option<&tokio::sync::RwLock<()>>,
+    blobs: Option<&BlobGuard>,
 ) -> Result<(), GcError> {
     let cutoff = chrono::DateTime::from_timestamp_millis(now_ms.saturating_sub(o.orphan_grace.as_millis() as i64))
         .unwrap_or_default();
@@ -218,30 +221,42 @@ pub async fn sweep_orphans(
     if !o.sweep_blobs {
         return Ok(());
     }
+    if let Some(g) = blobs {
+        g.clear_recent();
+    }
     for p in projects_under(store, "blobs").await? {
         let old = old_objects(store, &format!("blobs/{p}"), cutoff).await?;
         if old.is_empty() {
             continue;
         }
         let refs = meta.blob_refs(&p).await?;
-        // put_blobs refreshes under the read lock: no refresh lands between our head and delete.
-        let _guard = match blob_lock {
-            Some(l) => Some(l.write().await),
-            None => None,
-        };
-        let mut doomed = Vec::new();
+        // Re-check each candidate (no lock held): ingest refreshes an old blob it reuses (`put_blobs`).
+        let mut doomed: Vec<ObjectMeta> = Vec::new();
         for m in old.into_iter().filter(|m| !refs.contains(m.location.as_ref())) {
-            // Re-check right before the delete: ingest refreshes an old blob it reuses (`put_blobs`).
             match store.head(&m.location).await {
                 Ok(h) if h.last_modified < cutoff => doomed.push(m),
                 Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        r.orphan_blobs += doomed.len();
-        r.freed_bytes += doomed.iter().map(|m| m.size).sum::<u64>();
-        if !o.dry_run {
-            delete_all(store, doomed.into_iter().map(|m| m.location).collect()).await?;
+        if o.dry_run {
+            r.orphan_blobs += doomed.len();
+            r.freed_bytes += doomed.iter().map(|m| m.size).sum::<u64>();
+            continue;
+        }
+        // Chunks under the guard's write lock, minus the paths a `put_blobs` touched since the sweep began.
+        for chunk in doomed.chunks(BLOB_CHUNK) {
+            let paths: Vec<Path> = chunk.iter().map(|m| m.location.clone()).collect();
+            let gone: HashSet<Path> = match blobs {
+                Some(g) => g.delete_unless_recent(store, paths).await?.into_iter().collect(),
+                None => {
+                    delete_all(store, paths.clone()).await?;
+                    paths.into_iter().collect()
+                }
+            };
+            let deleted: Vec<&ObjectMeta> = chunk.iter().filter(|m| gone.contains(&m.location)).collect();
+            r.orphan_blobs += deleted.len();
+            r.freed_bytes += deleted.iter().map(|m| m.size).sum::<u64>();
         }
     }
     Ok(())
@@ -254,14 +269,14 @@ pub async fn run_gc(
     data_now_ms: i64,
     wall_now_ms: i64,
     o: &GcOptions,
-    blob_lock: Option<&tokio::sync::RwLock<()>>,
+    blobs: Option<&BlobGuard>,
 ) -> Result<GcReport, GcError> {
     let mut r = GcReport {
         expired_segments: expire(meta, data_now_ms, o.dry_run).await?,
         ..Default::default()
     };
     purge(meta, store, wall_now_ms, o, &mut r).await?;
-    sweep_orphans(meta, store, wall_now_ms, o, &mut r, blob_lock).await?;
+    sweep_orphans(meta, store, wall_now_ms, o, &mut r, blobs).await?;
     if !o.dry_run {
         let keep = crate::compact::JOB_RETENTION.as_millis() as i64;
         meta.prune_compaction_jobs(wall_now_ms.saturating_sub(keep)).await?;

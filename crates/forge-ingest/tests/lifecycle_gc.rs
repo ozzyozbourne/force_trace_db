@@ -4,7 +4,7 @@ use forge_model::catalog::*;
 use forge_model::ids::TraceId;
 use forge_model::testing::{pid, segment_meta};
 use forge_storage::DurableLocalFs;
-use object_store::{ObjectStoreExt, path::Path};
+use object_store::{ObjectMeta, ObjectStoreExt, path::Path};
 use std::time::{Duration, SystemTime};
 
 fn age(root: &std::path::Path, key: &str, hours: u64) {
@@ -187,14 +187,118 @@ async fn data_clock_expires_wall_clock_purges() {
         sweep_blobs: true,
         dry_run: false,
     };
-    let lock = tokio::sync::RwLock::new(());
-    let r = run_gc(&m, &store, now + 2 * 86_400_000, now, &o, Some(&lock))
+    let guard = forge_ingest::blob::BlobGuard::default();
+    let r = run_gc(&m, &store, now + 2 * 86_400_000, now, &o, Some(&guard))
         .await
         .unwrap();
     assert_eq!((r.expired_segments, r.purged_segments), (1, 0), "{r:?}");
     assert!(store.head(&Path::from(s.meta.path.as_str())).await.is_ok());
-    let r = run_gc(&m, &store, now + 2 * 86_400_000, now + 2 * 3_600_000, &o, Some(&lock))
+    let r = run_gc(&m, &store, now + 2 * 86_400_000, now + 2 * 3_600_000, &o, Some(&guard))
         .await
         .unwrap();
     assert_eq!(r.purged_segments, 1, "{r:?}");
+}
+
+/// RA m11 / RD #13: a blob that `put_blobs` writes or reuses after the sweep began is kept, even when it is an
+/// old unreferenced candidate; without such a put it is deleted.
+#[tokio::test]
+async fn blob_guard_keeps_blobs_put_during_the_sweep() {
+    use forge_ingest::blob::{BlobGuard, put_blobs};
+    let store = object_store::memory::InMemory::new();
+    let (a, b) = (Path::from("blobs/p/a"), Path::from("blobs/p/b"));
+    for p in [&a, &b] {
+        store.put(p, "x".into()).await.unwrap();
+    }
+    let g = BlobGuard::default();
+    g.clear_recent(); // the sweep starts; it lists and heads a and b as candidates ...
+    let puts = std::collections::HashMap::from([(a.to_string(), bytes::Bytes::from("x"))]);
+    put_blobs(puts, &store, &g).await.unwrap(); // ... ingest reuses a ...
+    let gone = g
+        .delete_unless_recent(&store, vec![a.clone(), b.clone()])
+        .await
+        .unwrap();
+    assert_eq!(gone, vec![b.clone()]);
+    assert!(store.head(&a).await.is_ok(), "a was reused during the sweep");
+    assert!(store.head(&b).await.is_err());
+}
+
+/// A store whose next `PutMode::Create` of `path` reports AlreadyExists without writing (the blob was swept
+/// between the put and the head).
+#[derive(Debug)]
+struct VanishingBlob {
+    inner: object_store::memory::InMemory,
+    path: Path,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Display for VanishingBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VanishingBlob")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for VanishingBlob {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if *location == self.path
+            && matches!(opts.mode, object_store::PutMode::Create)
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(object_store::Error::AlreadyExists {
+                path: location.to_string(),
+                source: "test".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// RD #13: AlreadyExists, then `head` NotFound -> the blob is written again.
+#[tokio::test]
+async fn reused_blob_gone_before_head_is_put_again() {
+    let path = Path::from("blobs/p/c");
+    let store = VanishingBlob {
+        inner: object_store::memory::InMemory::new(),
+        path: path.clone(),
+        fired: Default::default(),
+    };
+    let puts = std::collections::HashMap::from([(path.to_string(), bytes::Bytes::from("x"))]);
+    forge_ingest::blob::put_blobs(puts, &store, &Default::default())
+        .await
+        .unwrap();
+    assert!(store.head(&path).await.is_ok());
 }

@@ -1,5 +1,5 @@
 //! The write path: WAL + memtable + flush behind the `Ingest` trait.
-use crate::blob::{plan_blobs, put_blobs};
+use crate::blob::{BlobGuard, plan_blobs, put_blobs};
 use crate::flush::{FlushCtx, FlushOptions, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
 use crate::version::VersionAllocator;
@@ -105,8 +105,8 @@ pub struct Pipeline {
     inflight: Arc<AtomicUsize>,
     flush: FlushCtx,
     flush_lock: tokio::sync::Mutex<()>,
-    /// Blob sweep (write) vs reused-blob refresh in `put_blobs` (read).
-    blob_gc: Arc<tokio::sync::RwLock<()>>,
+    /// Blob sweep vs `put_blobs` (plans/phase-4 §2.9).
+    blob_guard: Arc<BlobGuard>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -119,9 +119,9 @@ impl std::fmt::Debug for Pipeline {
 }
 
 impl Pipeline {
-    /// The lock the blob sweep takes for writing (`lifecycle::run_gc`).
-    pub fn blob_gc(&self) -> Arc<tokio::sync::RwLock<()>> {
-        self.blob_gc.clone()
+    /// The guard the blob sweep uses (`lifecycle::run_gc`).
+    pub fn blob_guard(&self) -> Arc<BlobGuard> {
+        self.blob_guard.clone()
     }
 
     pub async fn open(
@@ -244,7 +244,7 @@ impl Pipeline {
                 inflight: Arc::default(),
                 flush,
                 flush_lock: tokio::sync::Mutex::new(()),
-                blob_gc: Arc::new(tokio::sync::RwLock::new(())),
+                blob_guard: Arc::default(),
             }),
             OpenReport {
                 replay,
@@ -319,8 +319,7 @@ impl Ingest for Pipeline {
             Ok(item) => item,
             Err(rows) => {
                 let put = async {
-                    let _sweep = self.blob_gc.read().await;
-                    put_blobs(puts, self.blobs.as_ref())
+                    put_blobs(puts, self.blobs.as_ref(), &self.blob_guard)
                         .await
                         .map_err(|e| IngestError::from(StorageError::from(e)))
                 };

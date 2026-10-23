@@ -7,7 +7,7 @@ use forge_model::row::SpanRow;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A reused blob older than this is rewritten (Overwrite, same bytes) to bump last_modified. Far below the
 /// 24 h orphan grace.
@@ -36,28 +36,69 @@ pub fn plan_blobs(rows: &mut [SpanRow], threshold: usize) -> HashMap<String, Byt
     puts
 }
 
+/// Blob sweep vs ingest (plans/phase-4 §2.9). `put_blobs` holds the read lock for its whole call and records
+/// every path it writes or reuses; the sweep deletes each chunk under the write lock, minus the recorded paths.
+#[derive(Debug, Default)]
+pub struct BlobGuard {
+    lock: tokio::sync::RwLock<()>,
+    recent: std::sync::Mutex<HashSet<String>>,
+}
+
+impl BlobGuard {
+    /// Sweep start (before listing): forget the paths of earlier puts.
+    pub fn clear_recent(&self) {
+        self.recent.lock().unwrap().clear();
+    }
+
+    /// Deletes `paths` except those put since `clear_recent`, under the write lock (no `put_blobs` runs meanwhile).
+    /// Returns the paths it deleted.
+    pub async fn delete_unless_recent(
+        &self,
+        store: &dyn ObjectStore,
+        paths: Vec<Path>,
+    ) -> object_store::Result<Vec<Path>> {
+        let _sweep = self.lock.write().await;
+        let doomed: Vec<Path> = {
+            let recent = self.recent.lock().unwrap();
+            paths.into_iter().filter(|p| !recent.contains(p.as_ref())).collect()
+        };
+        crate::lifecycle::delete_all(store, doomed.clone()).await?;
+        Ok(doomed)
+    }
+}
+
 /// Writes the exact UTF-8 bytes of each planned blob. Content-addressed, so writes are idempotent:
 /// `PutMode::Create` + AlreadyExists = success. Returns the number of distinct blobs written (or found).
-pub async fn put_blobs(puts: HashMap<String, Bytes>, store: &dyn ObjectStore) -> object_store::Result<usize> {
+pub async fn put_blobs(
+    puts: HashMap<String, Bytes>,
+    store: &dyn ObjectStore,
+    guard: &BlobGuard,
+) -> object_store::Result<usize> {
+    let _sweep = guard.lock.read().await;
+    guard.recent.lock().unwrap().extend(puts.keys().cloned());
     let n = puts.len();
     futures::stream::iter(puts)
         .map(|(path, bytes)| async move {
             let path = Path::from(path);
-            let opts = PutOptions::from(PutMode::Create);
-            match store.put_opts(&path, bytes.clone().into(), opts).await {
+            let create = || PutOptions::from(PutMode::Create);
+            match store.put_opts(&path, bytes.clone().into(), create()).await {
                 Ok(_) => Ok(()),
                 // Reused blob: refresh it when old, so the orphan sweep (last_modified < now - 24 h and no
-                // blob_refs row) cannot take it before this row is flushed (lifecycle.md §1.4).
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    let stale = store
-                        .head(&path)
-                        .await
-                        .is_ok_and(|m| chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH);
-                    if stale {
-                        store.put(&path, bytes.into()).await?;
+                // blob_refs row) cannot take it before this row is flushed (lifecycle.md §1.4). Gone since the
+                // put (RD #13): write it again.
+                Err(object_store::Error::AlreadyExists { .. }) => match store.head(&path).await {
+                    Ok(m) if chrono::Utc::now().signed_duration_since(m.last_modified) > BLOB_REFRESH => {
+                        store.put(&path, bytes.into()).await.map(|_| ())
                     }
-                    Ok(())
-                }
+                    Ok(_) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        match store.put_opts(&path, bytes.into(), create()).await {
+                            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         })
@@ -73,5 +114,5 @@ pub async fn offload_blobs(
     store: &dyn ObjectStore,
     threshold: usize,
 ) -> object_store::Result<usize> {
-    put_blobs(plan_blobs(rows, threshold), store).await
+    put_blobs(plan_blobs(rows, threshold), store, &BlobGuard::default()).await
 }
