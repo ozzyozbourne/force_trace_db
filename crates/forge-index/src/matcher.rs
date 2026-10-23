@@ -3,13 +3,13 @@
 //! them. Phrases and concrete array indexes (which the index over-matches) are re-checked on the cell's nodes,
 //! walked by the same `for_each_node` (same 1 MiB budget cut). Used for memtable rows, segments without a
 //! sidecar, the `search` / `json_key_search` UDFs and the post-merge re-check.
-use crate::analyzer::{Analyzer, Cell, Node, key_path, key_path_token, key_token, normalize_path};
-use crate::query::{GroupSpec, Leaf, Query, parse};
-use crate::{FtsColumn, FtsPredicate, IndexError, IndexResult};
+use crate::analyzer::{Analyzer, Cell, Node, key_token, normalize_path};
+use crate::query::{GroupSpec, Leaf, Query, compile, json_path, json_query, parse};
+use crate::{FtsColumn, FtsExpr, FtsPredicate, IndexError, IndexResult};
 use std::collections::HashMap;
 
 /// Leaves per AND group (a u64 mask per group).
-pub const MAX_GROUP_TERMS: usize = 64;
+pub(crate) const MAX_GROUP_TERMS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Matcher {
@@ -29,23 +29,22 @@ pub struct Matcher {
 
 impl Matcher {
     pub fn new(an: &mut Analyzer, p: &FtsPredicate) -> IndexResult<Self> {
-        let (col, groups, path, exists) = match p {
-            FtsPredicate::Search { column, query } => (*column, parse(an, query), None, false),
+        let (col, groups, path, exists, query) = match p {
+            FtsPredicate::Search { column, query } => {
+                let groups = parse(an, query);
+                let q = compile(&groups, &|t| key_token(*column, t));
+                (*column, groups, None, false, q)
+            }
             FtsPredicate::JsonKeySearch { column, path, text } => {
-                if !column.is_json() {
-                    return Err(IndexError::Query(format!(
-                        "json_key_search on non-JSON column {}",
-                        column.name()
-                    )));
-                }
-                let (p, steps) = normalize_path(path).map_err(IndexError::Query)?;
+                let (p, steps) = json_path(*column, path)?;
                 let exists = text.trim().is_empty();
                 let groups = if exists {
                     vec![GroupSpec::default()]
                 } else {
                     parse(an, text)
                 };
-                (*column, groups, Some((p, steps)), exists)
+                let q = json_query(*column, &p, &steps, exists, &groups);
+                (*column, groups, Some((p, steps)), exists, q)
             }
         };
         if groups.iter().any(|g| g.terms.len() > MAX_GROUP_TERMS) {
@@ -53,38 +52,14 @@ impl Matcher {
                 "more than {MAX_GROUP_TERMS} terms in one AND group"
             )));
         }
-        let key = |t: &str| match &path {
-            None => key_token(col, t),
-            Some((p, _)) => key_path_token(col, p, t),
-        };
-        let mut query = Query {
-            groups: Vec::with_capacity(groups.len()),
-            needs_recheck: groups.iter().any(|g| !g.phrases.is_empty())
-                || path.as_ref().is_some_and(|(_, s)| s.iter().any(Option::is_some)),
-        };
         let (mut exact, mut prefixes) = (HashMap::<Vec<u8>, Vec<(usize, u64)>>::new(), Vec::new());
-        for (gi, g) in groups.iter().enumerate() {
-            let leaves: Vec<Leaf> = if exists {
-                vec![Leaf::Exact(key_path(col, &path.as_ref().expect("json_key_search").0))]
-            } else {
-                g.terms
-                    .iter()
-                    .map(|(t, prefix)| {
-                        if *prefix {
-                            Leaf::Prefix(key(t))
-                        } else {
-                            Leaf::Exact(key(t))
-                        }
-                    })
-                    .collect()
-            };
+        for (gi, leaves) in query.groups.iter().enumerate() {
             for (li, l) in leaves.iter().enumerate() {
                 match l {
                     Leaf::Exact(k) => exact.entry(k.clone()).or_default().push((gi, 1 << li)),
                     Leaf::Prefix(k) => prefixes.push((k.clone(), gi, 1 << li)),
                 }
             }
-            query.groups.push(leaves);
         }
         let must = groups
             .iter()
@@ -106,6 +81,11 @@ impl Matcher {
             exists,
             must,
         })
+    }
+
+    /// One matcher per predicate of `e`, in `FtsExpr::predicates` order.
+    pub fn for_expr(an: &mut Analyzer, e: &FtsExpr) -> IndexResult<Vec<Self>> {
+        e.predicates().into_iter().map(|p| Self::new(an, p)).collect()
     }
 
     pub fn column(&self) -> FtsColumn {
@@ -237,7 +217,7 @@ impl PrefixSeen {
 }
 
 /// The same error for an indexed segment and a brute-forced source.
-pub fn prefix_too_broad() -> IndexError {
+pub(crate) fn prefix_too_broad() -> IndexError {
     IndexError::Query(format!(
         "prefix too broad: it matches more than {} terms",
         crate::read::MAX_PREFIX_TERMS

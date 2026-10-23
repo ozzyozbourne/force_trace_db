@@ -1,7 +1,7 @@
 //! M4 SQL surface: `search`, `json_key_search` and `json_key` (brute-force row implementations sharing the index's
 //! analyzer, `forge_index::Matcher`), the filter shapes the provider answers from the index (`fts_filter`), and
 //! the `trace_tree` table function.
-use crate::filters::KeyFilters;
+use crate::filters::{KeyFilters, str_lit_expr};
 use crate::read::{ReadView, merge_or_filter, read_columns};
 use crate::trace::trace_columns;
 use crate::tree::TraceTree;
@@ -11,7 +11,7 @@ use arrow::compute::{cast, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider};
-use datafusion::common::{Result, ScalarValue, plan_err};
+use datafusion::common::{Result, plan_err};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -193,16 +193,6 @@ impl ScalarUDFImpl for JsonKeyUdf {
     }
 }
 
-fn str_lit(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::Literal(
-            ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)),
-            _,
-        ) => Some(s),
-        _ => None,
-    }
-}
-
 /// A filter the provider answers from the index: `search(c, 'q')` / `json_key_search(c, 'p', 't')` on an indexed
 /// column (json_key_search: a JSON one) with literal arguments, or AND / OR of those. NOT is never indexed.
 pub(crate) fn fts_filter(e: &Expr) -> Option<FtsExpr> {
@@ -212,12 +202,12 @@ pub(crate) fn fts_filter(e: &Expr) -> Option<FtsExpr> {
             match (func.name(), &args[1..]) {
                 (SEARCH, [q]) => Some(FtsExpr::Pred(FtsPredicate::Search {
                     column,
-                    query: str_lit(q)?.to_string(),
+                    query: str_lit_expr(q)?.to_string(),
                 })),
                 (JSON_KEY_SEARCH, [p, t]) if column.is_json() => Some(FtsExpr::Pred(FtsPredicate::JsonKeySearch {
                     column,
-                    path: str_lit(p)?.to_string(),
-                    text: str_lit(t)?.to_string(),
+                    path: str_lit_expr(p)?.to_string(),
+                    text: str_lit_expr(t)?.to_string(),
                 })),
                 _ => None,
             }
@@ -231,16 +221,6 @@ pub(crate) fn fts_filter(e: &Expr) -> Option<FtsExpr> {
             })
         }
         _ => None,
-    }
-}
-
-/// The columns an FTS expression reads (the post-merge re-check needs them).
-pub(crate) fn fts_columns(e: &FtsExpr, out: &mut BTreeSet<&'static str>) {
-    match e {
-        FtsExpr::Pred(FtsPredicate::Search { column, .. } | FtsPredicate::JsonKeySearch { column, .. }) => {
-            out.insert(column.name());
-        }
-        FtsExpr::And(v) | FtsExpr::Or(v) => v.iter().for_each(|c| fts_columns(c, out)),
     }
 }
 
@@ -278,7 +258,7 @@ impl TableFunctionImpl for TraceTreeFunc {
             [t, p] => (t, Some(p)),
             _ => return plan_err!("trace_tree(trace_id [, project]) takes 1 or 2 arguments"),
         };
-        let Some(t) = str_lit(trace) else {
+        let Some(t) = str_lit_expr(trace) else {
             return plan_err!("trace_tree: trace_id must be a string literal");
         };
         let trace = t
@@ -288,7 +268,7 @@ impl TableFunctionImpl for TraceTreeFunc {
         let project = match project {
             None => None,
             Some(p) => {
-                let Some(p) = str_lit(p) else {
+                let Some(p) = str_lit_expr(p) else {
                     return plan_err!("trace_tree: project must be a string literal");
                 };
                 Some(ProjectId::new(p).map_err(ext)?)
@@ -428,11 +408,12 @@ mod tests {
             fts_filter(&j.call(vec![dcol("error"), lit("$"), lit("x")])).is_none(),
             "error is not JSON"
         );
-        let mut cols = BTreeSet::new();
-        fts_columns(
-            &fts_filter(&search("name", "a").and(search("outputs", "b"))).unwrap(),
-            &mut cols,
-        );
+        let cols: BTreeSet<&str> = fts_filter(&search("name", "a").and(search("outputs", "b")))
+            .unwrap()
+            .columns()
+            .into_iter()
+            .map(FtsColumn::name)
+            .collect();
         assert_eq!(cols, [col::NAME, col::OUTPUTS].into());
         assert!(JSON_COLUMNS.contains(&col::ATTRIBUTES));
     }

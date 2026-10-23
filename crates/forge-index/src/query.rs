@@ -2,7 +2,7 @@
 //! AND; an uppercase `OR` separates AND groups; `word*` is a prefix on the word's last token; `"a b"` is AND(a, b)
 //! plus a re-check of the fetched rows (no positions in v1). A word the tokenizer splits (`foo-bar`, `user_id`)
 //! becomes AND of its tokens.
-use crate::analyzer::{Analyzer, key_path, key_path_token, key_token, normalize_path};
+use crate::analyzer::{Analyzer, key_path, key_path_token, normalize_path};
 use crate::{FtsColumn, IndexError, IndexResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,13 +49,13 @@ fn lex(q: &str) -> Vec<Item> {
 
 /// One AND group as written: its analyzed terms (`true` = prefix) and its phrases of 2+ tokens (re-checked).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GroupSpec {
+pub(crate) struct GroupSpec {
     pub terms: Vec<(String, bool)>,
     pub phrases: Vec<Vec<String>>,
 }
 
 /// The OR of AND groups of `q`; groups without terms are dropped (a query of no tokens has no groups).
-pub fn parse(an: &mut Analyzer, q: &str) -> Vec<GroupSpec> {
+pub(crate) fn parse(an: &mut Analyzer, q: &str) -> Vec<GroupSpec> {
     let mut groups = Vec::new();
     let mut g = GroupSpec::default();
     for it in lex(q) {
@@ -90,8 +90,8 @@ pub fn parse(an: &mut Analyzer, q: &str) -> Vec<GroupSpec> {
     groups
 }
 
-fn compile(an: &mut Analyzer, q: &str, mk: &dyn Fn(&str) -> Vec<u8>) -> Query {
-    let groups = parse(an, q);
+/// The index lookup of parsed `groups`, each term's key built by `mk`.
+pub(crate) fn compile(groups: &[GroupSpec], mk: &dyn Fn(&str) -> Vec<u8>) -> Query {
     Query {
         needs_recheck: groups.iter().any(|g| !g.phrases.is_empty()),
         groups: groups
@@ -112,29 +112,48 @@ fn compile(an: &mut Analyzer, q: &str, mk: &dyn Fn(&str) -> Vec<u8>) -> Query {
     }
 }
 
-/// `search(col, q)`. A query with no tokens has no groups (matches nothing).
-pub fn search_query(an: &mut Analyzer, col: FtsColumn, q: &str) -> Query {
-    compile(an, q, &|t| key_token(col, t))
-}
-
-/// `json_key_search(col, '$.path', text)`; empty text = the path exists.
-pub fn json_key_search_query(an: &mut Analyzer, col: FtsColumn, path: &str, text: &str) -> IndexResult<Query> {
+/// `json_key_search`'s path: normalized, with one step per `[*]` (Some(n) = a concrete index).
+pub(crate) fn json_path(col: FtsColumn, path: &str) -> IndexResult<(String, Vec<Option<u32>>)> {
     if !col.is_json() {
         return Err(IndexError::Query(format!(
             "json_key_search on non-JSON column {}",
             col.name()
         )));
     }
-    let (p, steps) = normalize_path(path).map_err(IndexError::Query)?;
-    let concrete = steps.iter().any(Option::is_some);
-    let mut q = if text.trim().is_empty() {
+    normalize_path(path).map_err(IndexError::Query)
+}
+
+/// The index lookup of `json_key_search(col, path, text)` (`groups` parsed from text; `exists`: empty text).
+pub(crate) fn json_query(
+    col: FtsColumn,
+    path: &str,
+    steps: &[Option<u32>],
+    exists: bool,
+    groups: &[GroupSpec],
+) -> Query {
+    let mut q = if exists {
         Query {
-            groups: vec![vec![Leaf::Exact(key_path(col, &p))]],
+            groups: vec![vec![Leaf::Exact(key_path(col, path))]],
             needs_recheck: false,
         }
     } else {
-        compile(an, text, &|t| key_path_token(col, &p, t))
+        compile(groups, &|t| key_path_token(col, path, t))
     };
-    q.needs_recheck |= concrete;
-    Ok(q)
+    q.needs_recheck |= steps.iter().any(Option::is_some);
+    q
+}
+
+/// `search(col, q)`. A query with no tokens has no groups (matches nothing).
+#[cfg(test)]
+pub(crate) fn search_query(an: &mut Analyzer, col: FtsColumn, q: &str) -> Query {
+    compile(&parse(an, q), &|t| crate::analyzer::key_token(col, t))
+}
+
+/// `json_key_search(col, '$.path', text)`; empty text = the path exists.
+#[cfg(test)]
+pub(crate) fn json_key_search_query(an: &mut Analyzer, col: FtsColumn, path: &str, text: &str) -> IndexResult<Query> {
+    let (p, steps) = json_path(col, path)?;
+    let exists = text.trim().is_empty();
+    let groups = if exists { Vec::new() } else { parse(an, text) };
+    Ok(json_query(col, &p, &steps, exists, &groups))
 }

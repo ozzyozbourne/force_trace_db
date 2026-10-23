@@ -292,18 +292,16 @@ proptest! {
         rows.dedup();
         let mut buf = Vec::new();
         encode_postings(&rows, &mut buf);
-        let all = decode_postings(&buf, &|_| true).unwrap();
+        let all = decode_postings(&buf).unwrap();
         prop_assert_eq!(all.iter().collect::<Vec<_>>(), rows.clone());
-        let even = decode_postings(&buf, &|rg| rg % 2 == 0).unwrap();
-        prop_assert_eq!(even.iter().collect::<Vec<_>>(), rows.iter().copied().filter(|r| (r >> 16) % 2 == 0).collect::<Vec<_>>());
         for cut in [0, 1, buf.len() / 2, buf.len() - 1] {
-            prop_assert!(decode_postings(&buf[..cut], &|_| true).is_err());
+            prop_assert!(decode_postings(&buf[..cut]).is_err());
         }
         // The entry's crc catches any flipped byte (a flipped delta would otherwise decode to wrong rows).
         for i in [0, 5, buf.len() / 3, buf.len() / 2, buf.len() - 5, buf.len() - 1] {
             let mut bad = buf.clone();
             bad[i] ^= 0x10;
-            prop_assert!(decode_postings(&bad, &|_| true).is_err(), "flip at {}", i);
+            prop_assert!(decode_postings(&bad).is_err(), "flip at {}", i);
         }
     }
 

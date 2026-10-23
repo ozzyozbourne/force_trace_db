@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::sync::Mutex;
 
 /// The speculative tail read: trailer + footer, and the whole dict of a small file.
-pub const TAIL_READ: u64 = 64 << 10;
+pub(crate) const TAIL_READ: u64 = 64 << 10;
 const COALESCE_GAP: u64 = 1 << 20;
 const MAX_GET: u64 = 16 << 20;
 /// A prefix leaf expanding to more terms is a query error.
@@ -162,7 +162,7 @@ impl FtsFile {
         }
         if !ranges.is_empty() {
             for (li, buf) in owners.into_iter().zip(wave(fetch, ranges, &mut io).await?) {
-                leaf_bm[li] |= decode_postings(&buf, &|_| true).map_err(|e| self.corrupt(&e))?;
+                leaf_bm[li] |= decode_postings(&buf).map_err(|e| self.corrupt(&e))?;
             }
         }
         let rows = live.into_iter().map(|r| leaf_bm[r].iter().intersection()).union();

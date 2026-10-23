@@ -61,13 +61,15 @@ fn literal(e: &Expr) -> Option<&ScalarValue> {
         _ => None,
     }
 }
-fn str_lit(v: &ScalarValue) -> Option<String> {
+fn str_lit(v: &ScalarValue) -> Option<&str> {
     match v {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            Some(s.clone())
-        }
+        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s),
         _ => None,
     }
+}
+/// A string literal expression's value.
+pub(crate) fn str_lit_expr(e: &Expr) -> Option<&str> {
+    literal(e).and_then(str_lit)
 }
 /// A key literal of the wrong length matches no row: `Some(None)`.
 fn trace_lit(v: &ScalarValue) -> Option<Option<TraceId>> {
@@ -133,7 +135,10 @@ pub(crate) fn classify(e: &Expr) -> Option<Pushed> {
     if let Some((name, vals)) = key_set(e) {
         match name.as_str() {
             c::PROJECT_ID => {
-                let names = vals.iter().map(str_lit).collect::<Option<Vec<_>>>()?;
+                let names = vals
+                    .iter()
+                    .map(|v| str_lit(v).map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?;
                 return Some(Pushed::Projects(
                     names.into_iter().filter_map(|n| ProjectId::new(n).ok()).collect(),
                 ));

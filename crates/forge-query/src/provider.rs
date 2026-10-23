@@ -4,7 +4,7 @@
 use crate::derived::effective_total_tokens_expr;
 use crate::ext;
 use crate::filters::{KeyFilters, classify};
-use crate::fts::{fts_columns, fts_filter};
+use crate::fts::fts_filter;
 use crate::merge_exec::MergeVersionsExec;
 use crate::read::{ReadView, SegmentPart, coalesce, needs_merge, read_columns};
 use crate::scan::SegmentScanExec;
@@ -143,7 +143,13 @@ impl TableProvider for SpansTableProvider {
         // The FTS filters' columns, read only where a re-check runs (merged candidates, fallback).
         let mut recheck_cols: BTreeSet<&'static str> = names.iter().copied().collect();
         for f in &fts {
-            fts_columns(&fts_filter(f).expect("fts filter"), &mut recheck_cols);
+            recheck_cols.extend(
+                fts_filter(f)
+                    .expect("fts filter")
+                    .columns()
+                    .into_iter()
+                    .map(|c| c.name()),
+            );
         }
         let wide: Vec<&'static str> = ALL_COLUMNS
             .iter()

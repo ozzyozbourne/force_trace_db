@@ -68,11 +68,6 @@ impl FtsBuilder {
         self.pairs.len() as u64
     }
 
-    /// Rows seen so far (`add_batch` row ids are 0..rows).
-    pub fn rows(&self) -> u32 {
-        self.rows
-    }
-
     /// Indexes one cell. Per column, `row` must not decrease (rows of different columns may interleave).
     pub fn add(&mut self, row: u32, col: FtsColumn, value: &str) -> IndexResult<()> {
         if row == NO_ROW {

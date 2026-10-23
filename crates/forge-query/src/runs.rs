@@ -149,36 +149,40 @@ impl RunsRequest {
         crc32fast::hash(norm.as_bytes())
     }
 
-    /// hex(`[1][start_ns BE][trace 16][span 8][filter_hash BE]`): 74 hex digits.
     fn encode_cursor(&self, c: &Cursor) -> String {
-        let (start, trace, span) = c.0;
-        let mut b = vec![1u8];
-        b.extend_from_slice(&start.to_be_bytes());
-        b.extend_from_slice(trace.as_bytes());
-        b.extend_from_slice(span.as_bytes());
-        b.extend_from_slice(&self.filter_hash().to_be_bytes());
-        hex::encode(b)
+        encode_cursor(1, c, self.filter_hash())
     }
 
     fn decode_cursor(&self, s: &str) -> Result<Cursor, QueryError> {
-        let b = hex::decode(s).map_err(|_| bad("bad cursor"))?;
-        if b.len() != 37 || b[0] != 1 {
-            return Err(bad("bad cursor"));
-        }
-        if b[33..37] != self.filter_hash().to_be_bytes() {
-            return Err(bad("cursor does not match the query's filters"));
-        }
-        let start = i64::from_be_bytes(b[1..9].try_into().expect("8 bytes"));
-        Ok(Cursor((
-            start,
-            TraceId::from_slice(&b[9..25])?,
-            SpanId::from_slice(&b[25..33])?,
-        )))
+        decode_cursor(1, s, self.filter_hash(), "cursor does not match the query's filters")
     }
+}
 
-    fn below_cursor(&self, p: &Pos) -> bool {
-        self.cursor.is_none_or(|Cursor(c)| *p < c)
+/// hex(`[tag][start_ns BE][trace 16][span 8][hash BE]`): 74 hex digits. `hash` binds the cursor to its request.
+pub(crate) fn encode_cursor(tag: u8, c: &Cursor, hash: u32) -> String {
+    let (start, trace, span) = c.0;
+    let mut b = vec![tag];
+    b.extend_from_slice(&start.to_be_bytes());
+    b.extend_from_slice(trace.as_bytes());
+    b.extend_from_slice(span.as_bytes());
+    b.extend_from_slice(&hash.to_be_bytes());
+    hex::encode(b)
+}
+
+pub(crate) fn decode_cursor(tag: u8, s: &str, hash: u32, mismatch: &str) -> Result<Cursor, QueryError> {
+    let b = hex::decode(s).map_err(|_| bad("bad cursor"))?;
+    if b.len() != 37 || b[0] != tag {
+        return Err(bad("bad cursor"));
     }
+    if b[33..37] != hash.to_be_bytes() {
+        return Err(bad(mismatch));
+    }
+    let start = i64::from_be_bytes(b[1..9].try_into().expect("8 bytes"));
+    Ok(Cursor((
+        start,
+        TraceId::from_slice(&b[9..25])?,
+        SpanId::from_slice(&b[25..33])?,
+    )))
 }
 
 pub struct RunsPage {
@@ -202,14 +206,14 @@ pub(crate) const VERIFY_GAP: u64 = 4096;
 const MAX_FILTER_SPANS: usize = 256;
 
 /// The id and start columns of a batch, by name.
-struct Ids<'a> {
-    start: &'a arrow::array::TimestampNanosecondArray,
-    trace: &'a arrow::array::BinaryArray,
-    span: &'a arrow::array::BinaryArray,
+pub(crate) struct Ids<'a> {
+    pub start: &'a arrow::array::TimestampNanosecondArray,
+    pub trace: &'a arrow::array::BinaryArray,
+    pub span: &'a arrow::array::BinaryArray,
 }
 
 impl<'a> Ids<'a> {
-    fn of(b: &'a RecordBatch) -> Result<Self, QueryError> {
+    pub fn of(b: &'a RecordBatch) -> Result<Self, QueryError> {
         let s = b.schema_ref();
         Ok(Self {
             start: b
@@ -218,6 +222,13 @@ impl<'a> Ids<'a> {
             trace: b.column(s.index_of(col::TRACE_ID)?).as_binary::<i32>(),
             span: b.column(s.index_of(col::SPAN_ID)?).as_binary::<i32>(),
         })
+    }
+    /// (trace, span) of row `i`.
+    pub fn key(&self, i: usize) -> Result<(TraceId, SpanId), QueryError> {
+        Ok((
+            TraceId::from_slice(self.trace.value(i))?,
+            SpanId::from_slice(self.span.value(i))?,
+        ))
     }
     /// (start, trace, span) of row `i`; None where start is null.
     fn pos(&self, i: usize) -> Option<Pos> {
@@ -264,16 +275,7 @@ impl QueryEngine {
         q.run(async {
             let (page, res) = self.list_runs_inner(&q, r).await?;
             let cursor = page.next_cursor.map(|c| r.encode_cursor(&c));
-            q.blocking("runs.json", move |cancel| {
-                // The body: reserved up front at the page's size, then at its real capacity.
-                let held = res.size();
-                res.try_grow(page.rows.get_array_memory_size())?;
-                let mut out = Vec::with_capacity(page.rows.get_array_memory_size());
-                crate::json::write_runs(&mut out, "runs", &page.rows, cursor.as_deref(), cancel)?;
-                res.try_resize(held + out.capacity())?;
-                Ok(out)
-            })
-            .await
+            page_json(&q, "runs.json", "runs", page, res, cursor).await
         })
         .await
     }
@@ -287,17 +289,48 @@ impl QueryEngine {
         let view = self.read_view(); // FIRST (invariant 1)
         let cols = read_columns(&RUN_COLUMNS);
         let hi = upper_bound(r.end_ns, r.cursor);
-        let filter = SegmentFilter {
-            project_id: Some(r.project.clone()),
-            start_ns: r.start_ns,
-            end_ns: hi,
-            newest_first: true,
-            ..Default::default()
-        };
-        let segs = view.list_segments(&filter).await?;
+        let segs = newest_first_segments(&view, &r.project, r.start_ns, hi).await?;
         let src = RootScan { r, hi, cols: &cols };
         page(q, &view, &src, segs, r.limit, &projected_schema(&cols)).await
     }
+}
+
+/// `{"<key>":[…],"next_cursor":hex|null}` on the blocking pool (`label`); the body is reserved up front at the
+/// page's size, then at its real capacity.
+pub(crate) async fn page_json(
+    q: &QueryCtx,
+    label: &'static str,
+    key: &'static str,
+    page: RunsPage,
+    res: MemoryReservation,
+    cursor: Option<String>,
+) -> Result<Vec<u8>, QueryError> {
+    q.blocking(label, move |cancel| {
+        let held = res.size();
+        res.try_grow(page.rows.get_array_memory_size())?;
+        let mut out = Vec::with_capacity(page.rows.get_array_memory_size());
+        crate::json::write_runs(&mut out, key, &page.rows, cursor.as_deref(), cancel)?;
+        res.try_resize(held + out.capacity())?;
+        Ok(out)
+    })
+    .await
+}
+
+/// The project's segments overlapping `[start_ns, hi)`, newest first (the input of `page`).
+pub(crate) async fn newest_first_segments(
+    view: &ReadView,
+    project: &ProjectId,
+    start_ns: Option<i64>,
+    hi: Option<i64>,
+) -> Result<Vec<SegmentMeta>, QueryError> {
+    let filter = SegmentFilter {
+        project_id: Some(project.clone()),
+        start_ns,
+        end_ns: hi,
+        newest_first: true,
+        ..Default::default()
+    };
+    Ok(view.list_segments(&filter).await?)
 }
 
 /// Exclusive upper bound on start: the window end and, via the cursor, start <= cursor.start.
@@ -610,7 +643,7 @@ async fn verify(
                 Some(
                     par.is_null(i)
                         && project.value(i) == r.project.as_str()
-                        && ids.pos(i).is_some_and(|p| in_window(&r, hi, &p))
+                        && ids.pos(i).is_some_and(|p| in_window(r.start_ns, hi, r.cursor, &p))
                         && in_set(&r.run_types, rt, i)
                         && in_set(&r.statuses, st, i)
                         && name_q
@@ -629,13 +662,13 @@ async fn verify(
 }
 
 /// Row `i` of `a` parses to a member of `set` (an empty set matches anything).
-fn in_set<T: Ord + std::str::FromStr>(set: &BTreeSet<T>, a: &StringArray, i: usize) -> bool {
+pub(crate) fn in_set<T: Ord + std::str::FromStr>(set: &BTreeSet<T>, a: &StringArray, i: usize) -> bool {
     set.is_empty() || a.is_valid(i) && a.value(i).parse().is_ok_and(|x| set.contains(&x))
 }
 
 /// start in `[start_ns, hi)` and strictly after the cursor.
-fn in_window(r: &RunsRequest, hi: Option<i64>, p: &Pos) -> bool {
-    r.start_ns.is_none_or(|x| p.0 >= x) && hi.is_none_or(|x| p.0 < x) && r.below_cursor(p)
+pub(crate) fn in_window(start_ns: Option<i64>, hi: Option<i64>, cursor: Option<Cursor>, p: &Pos) -> bool {
+    start_ns.is_none_or(|x| p.0 >= x) && hi.is_none_or(|x| p.0 < x) && cursor.is_none_or(|Cursor(c)| *p < c)
 }
 
 /// Pre-merge predicates used for candidate generation only (FP §2.2 safety argument, invariant 4): rows of the
@@ -649,7 +682,7 @@ fn candidates(r: &RunsRequest, hi: Option<i64>, b: &RecordBatch) -> Result<Vec<P
     Ok((0..b.num_rows())
         .filter(|&i| par.is_null(i) && p.value(i) == r.project.as_str())
         .filter_map(|i| ids.pos(i))
-        .filter(|pos| in_window(r, hi, pos))
+        .filter(|pos| in_window(r.start_ns, hi, r.cursor, pos))
         .collect())
 }
 

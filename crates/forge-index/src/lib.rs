@@ -20,7 +20,7 @@ use forge_model::catalog::SegmentMeta;
 use forge_model::error::{Classify, ErrorKind, Unimplemented};
 use forge_model::schema::{FTS_COLUMNS, JSON_COLUMNS};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("corrupt .fts {path}: {msg}")]
     Corrupt { path: String, msg: String },
@@ -44,7 +44,7 @@ impl Classify for IndexError {
 }
 
 /// FTS column id = position in forge_model::schema::FTS_COLUMNS (stored as u8 in .fts keys).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum FtsColumn {
     Name = 0,
@@ -80,6 +80,14 @@ pub enum FtsPredicate {
     },
 }
 
+impl FtsPredicate {
+    pub fn column(&self) -> FtsColumn {
+        match self {
+            Self::Search { column, .. } | Self::JsonKeySearch { column, .. } => *column,
+        }
+    }
+}
+
 /// Boolean combination of predicates pushed into one scan (AND of filters, OR inside a filter).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FtsExpr {
@@ -88,15 +96,43 @@ pub enum FtsExpr {
     Or(Vec<FtsExpr>),
 }
 
+impl FtsExpr {
+    /// `leaf` on every predicate in depth-first order (all of them: no short-circuit), combined by `and` / `or`
+    /// over the children's values.
+    pub fn fold<'a, T>(
+        &'a self,
+        leaf: &mut dyn FnMut(&'a FtsPredicate) -> T,
+        and: &dyn Fn(Vec<T>) -> T,
+        or: &dyn Fn(Vec<T>) -> T,
+    ) -> T {
+        match self {
+            Self::Pred(p) => leaf(p),
+            Self::And(v) => and(v.iter().map(|c| c.fold(leaf, and, or)).collect()),
+            Self::Or(v) => or(v.iter().map(|c| c.fold(leaf, and, or)).collect()),
+        }
+    }
+
+    /// The predicates in depth-first order (`fold`'s leaf order).
+    pub fn predicates(&self) -> Vec<&FtsPredicate> {
+        let mut out = Vec::new();
+        self.fold(&mut |p| out.push(p), &|_| (), &|_| ());
+        out
+    }
+
+    /// The columns the expression reads.
+    pub fn columns(&self) -> std::collections::BTreeSet<FtsColumn> {
+        self.predicates().into_iter().map(FtsPredicate::column).collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FtsHits {
     /// The segment has no usable index for some column in the expression: caller must scan + brute-force.
     NoIndex,
-    /// Candidate rows (file-relative). May be a superset (phrases, concrete array indexes): the
-    /// caller re-checks with `matches()` when `needs_recheck`.
+    /// Candidate rows (file-relative). May be a superset (phrases, concrete array indexes, see
+    /// `Query::needs_recheck`): the caller re-checks with `matches()`.
     Rows {
         rows: roaring::RoaringTreemap,
-        needs_recheck: bool,
         /// Some hit row has a null start_time (the footer's null-start bitmap): the segment's `max_start_ns` does not
         /// bound the merged start of its hits (plans/phase-5 D8).
         start_less: bool,
@@ -105,16 +141,16 @@ pub enum FtsHits {
 
 #[async_trait]
 pub trait IndexReader: Send + Sync + std::fmt::Debug + 'static {
-    /// ≤ 2 round trips with a cached footer. `limit_hint` lets the reader stop decoding row groups early.
-    async fn search(&self, seg: &SegmentMeta, expr: &FtsExpr, limit_hint: Option<u64>) -> IndexResult<FtsHits>;
+    /// ≤ 2 round trips with a cached footer.
+    async fn search(&self, seg: &SegmentMeta, expr: &FtsExpr) -> IndexResult<FtsHits>;
 }
 
-/// M0–M3: every segment reports "no index", so callers fall back to scan + brute force.
+/// A reader that never has an index: callers fall back to scan + brute force (tests).
 #[derive(Debug, Default)]
 pub struct NoopIndexReader;
 #[async_trait]
 impl IndexReader for NoopIndexReader {
-    async fn search(&self, _: &SegmentMeta, _: &FtsExpr, _: Option<u64>) -> IndexResult<FtsHits> {
+    async fn search(&self, _: &SegmentMeta, _: &FtsExpr) -> IndexResult<FtsHits> {
         Ok(FtsHits::NoIndex)
     }
 }
@@ -145,7 +181,7 @@ mod tests {
             query: "x".into(),
         });
         assert!(matches!(
-            NoopIndexReader.search(&seg, &expr, None).await,
+            NoopIndexReader.search(&seg, &expr).await,
             Ok(FtsHits::NoIndex)
         ));
     }

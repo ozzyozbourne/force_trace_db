@@ -41,7 +41,7 @@ impl Sidecars {
 
 #[async_trait]
 impl IndexReader for Sidecars {
-    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr, l: Option<u64>) -> IndexResult<FtsHits> {
+    async fn search(&self, seg: &SegmentMeta, e: &FtsExpr) -> IndexResult<FtsHits> {
         if self.hidden.lock().unwrap().contains(&seg.id) {
             return Ok(FtsHits::NoIndex);
         }
@@ -51,7 +51,7 @@ impl IndexReader for Sidecars {
         {
             f(&mut seg);
         }
-        self.inner.search(&seg, e, l).await
+        self.inner.search(&seg, e).await
     }
 }
 

@@ -11,12 +11,12 @@ use tantivy::tokenizer::{
 /// Indexed text per field per span (spec). JSON: shared by all leaves of the document.
 pub const MAX_FIELD_BYTES: usize = 1 << 20;
 /// Tokens of this many bytes or more are dropped (tantivy keeps `len < limit`).
-pub const MAX_TOKEN_BYTES: usize = 256;
+pub(crate) const MAX_TOKEN_BYTES: usize = 256;
 /// Leaves under a longer path are indexed as plain tokens only.
-pub const MAX_PATH_BYTES: usize = 512;
+pub(crate) const MAX_PATH_BYTES: usize = 512;
 
 /// Runs of `char::is_alphanumeric` -> drop long tokens -> lowercase -> ASCII folding (master decision 6).
-pub fn text_analyzer() -> TextAnalyzer {
+pub(crate) fn text_analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
         .filter(LowerCaser)
@@ -90,7 +90,7 @@ impl Analyzer {
     /// How one cell is indexed. For a JSON cell, `f` gets every node in index order with the leaf text already
     /// cut by the shared 1 MiB budget (the builder, `for_each_key` and the brute-force re-check all walk cells
     /// through here, so they cut at the same byte).
-    pub fn for_each_node<'v>(
+    pub(crate) fn for_each_node<'v>(
         &mut self,
         col: FtsColumn,
         value: &'v str,
@@ -124,7 +124,7 @@ impl Analyzer {
 /// One JSON node as indexed: the `[*]` path, the concrete array index of each `[*]` (outermost first), and for
 /// scalar leaves the text after the field budget (None for containers below the root and nulls).
 #[derive(Clone, Copy, Debug)]
-pub struct Node<'a> {
+pub(crate) struct Node<'a> {
     pub path: &'a str,
     pub indices: &'a [u32],
     pub text: Option<&'a str>,
@@ -132,7 +132,7 @@ pub struct Node<'a> {
 
 /// What `for_each_node` did with a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cell<'v> {
+pub(crate) enum Cell<'v> {
     /// A blob reference: nothing is indexed.
     Skipped,
     /// Walked as JSON (the nodes went to `f`).
@@ -149,12 +149,12 @@ fn set_key(key: &mut Vec<u8>, col: u8, kind: u8, parts: &[&[u8]]) {
     }
 }
 
-pub fn key_token(col: FtsColumn, token: &str) -> Vec<u8> {
+pub(crate) fn key_token(col: FtsColumn, token: &str) -> Vec<u8> {
     let mut k = Vec::new();
     set_key(&mut k, col as u8, KIND_TOKEN, &[token.as_bytes()]);
     k
 }
-pub fn key_path_token(col: FtsColumn, path: &str, token: &str) -> Vec<u8> {
+pub(crate) fn key_path_token(col: FtsColumn, path: &str, token: &str) -> Vec<u8> {
     let mut k = Vec::new();
     set_key(
         &mut k,
@@ -164,14 +164,14 @@ pub fn key_path_token(col: FtsColumn, path: &str, token: &str) -> Vec<u8> {
     );
     k
 }
-pub fn key_path(col: FtsColumn, path: &str) -> Vec<u8> {
+pub(crate) fn key_path(col: FtsColumn, path: &str) -> Vec<u8> {
     let mut k = Vec::new();
     set_key(&mut k, col as u8, KIND_PATH, &[path.as_bytes()]);
     k
 }
 
 /// The longest prefix of `s` of at most `max` bytes, cut at a char boundary.
-pub fn truncate(s: &str, max: usize) -> &str {
+pub(crate) fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -238,7 +238,7 @@ fn walk(v: &Value, path: &mut String, idx: &mut Vec<u32>, f: &mut dyn FnMut(&str
 /// A user path -> the indexed path: `$.a[3].b` -> `$.a[*].b`, `$['x.y']` / `$["x.y"]` -> `$["x.y"]`.
 /// The second value has one entry per array step: `None` for `[*]`, `Some(n)` for a concrete `[n]` (the index
 /// then over-matches: re-check the rows).
-pub fn normalize_path(p: &str) -> Result<(String, Vec<Option<u32>>), String> {
+pub(crate) fn normalize_path(p: &str) -> Result<(String, Vec<Option<u32>>), String> {
     let b = p.as_bytes();
     if b.first() != Some(&b'$') {
         return Err(format!("path must start with $: {p}"));

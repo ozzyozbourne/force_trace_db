@@ -15,17 +15,17 @@ pub const TRAILER_LEN: u64 = 12;
 pub const RG_SHIFT: u8 = 16;
 
 /// `[col][01] token`: `search(col, q)`.
-pub const KIND_TOKEN: u8 = 0x01;
+pub(crate) const KIND_TOKEN: u8 = 0x01;
 /// `[col][02] path 0x00 token`: `json_key_search(col, path, text)`.
-pub const KIND_PATH_TOKEN: u8 = 0x02;
+pub(crate) const KIND_PATH_TOKEN: u8 = 0x02;
 /// `[col][03] path`: path existence.
-pub const KIND_PATH: u8 = 0x03;
-pub const PATH_SEP: u8 = 0x00;
+pub(crate) const KIND_PATH: u8 = 0x03;
+pub(crate) const PATH_SEP: u8 = 0x00;
 
 /// Raw key bytes per FST block (fts.md §4: 64 KiB gives ~45-60 KB blocks).
 pub const FST_BLOCK_RAW_BUDGET: usize = 64 << 10;
 /// Posting lists of 2..=16 rows are delta varints; longer ones are roaring per 64K-row group.
-pub const SMALL_LIST_MAX: usize = 16;
+pub(crate) const SMALL_LIST_MAX: usize = 16;
 const ENC_VARINT: u8 = 1;
 const ENC_ROARING: u8 = 2;
 
@@ -35,10 +35,10 @@ const INLINE_FLAG: u64 = 1 << 63;
 const OFF_BITS: u32 = 37;
 const LEN_BITS: u32 = 26;
 
-pub type FmtResult<T> = Result<T, String>;
+pub(crate) type FmtResult<T> = Result<T, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TermValue {
+pub(crate) enum TermValue {
     Inline(u32),
     /// Relative to `Footer::postings.start`.
     Postings {
@@ -95,7 +95,7 @@ pub struct Footer {
 }
 
 impl Footer {
-    pub fn encode(&self, o: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, o: &mut Vec<u8>) {
         put_u16(o, VERSION);
         put_u16(o, 0); // flags: bit0 positions, bit1 zstd-framed postings (both 0 in v1)
         put_u32(o, self.num_rows);
@@ -123,7 +123,7 @@ impl Footer {
     }
 
     /// `file_len`: every range must lie inside the file, before the footer.
-    pub fn decode(b: &[u8], file_len: u64) -> FmtResult<Self> {
+    pub(crate) fn decode(b: &[u8], file_len: u64) -> FmtResult<Self> {
         let mut c = Cur::new(b);
         let version = c.u16()?;
         if version != VERSION {
@@ -193,7 +193,7 @@ impl Footer {
 /// `enc u8 | doc_freq u32 |` then `doc_freq x varint(delta)` (first delta absolute), or
 /// `n_rg u16 | n_rg x (rg u16, byte_len u32) | n_rg x portable roaring (global row ids, optimize()d)`;
 /// then `crc32 u32` of the entry's bytes. Returns true for the roaring form.
-pub fn encode_postings(rows: &[u32], o: &mut Vec<u8>) -> bool {
+pub(crate) fn encode_postings(rows: &[u32], o: &mut Vec<u8>) -> bool {
     let start = o.len();
     let roaring = encode_entry(rows, o);
     let crc = crc32fast::hash(&o[start..]);
@@ -236,8 +236,8 @@ fn encode_entry(rows: &[u32], o: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Decodes one posting entry; `keep(rg)` skips row groups already ruled out (e.g. by another predicate).
-pub fn decode_postings(buf: &[u8], keep: &dyn Fn(u16) -> bool) -> FmtResult<roaring::RoaringBitmap> {
+/// Decodes one posting entry.
+pub(crate) fn decode_postings(buf: &[u8]) -> FmtResult<roaring::RoaringBitmap> {
     let body = buf.len().checked_sub(4).ok_or("truncated")?;
     let (buf, crc) = buf.split_at(body);
     if crc32fast::hash(buf) != u32::from_le_bytes(crc.try_into().expect("4 bytes")) {
@@ -257,9 +257,7 @@ pub fn decode_postings(buf: &[u8], keep: &dyn Fn(u16) -> bool) -> FmtResult<roar
                 } else {
                     row.checked_add(d).ok_or("row id overflow")?
                 };
-                if keep((row >> RG_SHIFT) as u16) {
-                    bm.insert(row);
-                }
+                bm.insert(row);
             }
         }
         ENC_ROARING => {
@@ -268,11 +266,9 @@ pub fn decode_postings(buf: &[u8], keep: &dyn Fn(u16) -> bool) -> FmtResult<roar
             for _ in 0..n {
                 dir.push((c.u16()?, c.u32()? as usize));
             }
-            for (rg, len) in dir {
+            for (_, len) in dir {
                 let part = c.bytes(len)?;
-                if keep(rg) {
-                    bm |= roaring::RoaringBitmap::deserialize_from(part).map_err(|e| e.to_string())?;
-                }
+                bm |= roaring::RoaringBitmap::deserialize_from(part).map_err(|e| e.to_string())?;
             }
         }
         e => return Err(format!("unknown posting encoding {e}")),
@@ -283,13 +279,13 @@ pub fn decode_postings(buf: &[u8], keep: &dyn Fn(u16) -> bool) -> FmtResult<roar
     Ok(bm)
 }
 
-pub fn put_u16(o: &mut Vec<u8>, v: u16) {
+pub(crate) fn put_u16(o: &mut Vec<u8>, v: u16) {
     o.extend_from_slice(&v.to_le_bytes())
 }
-pub fn put_u32(o: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(o: &mut Vec<u8>, v: u32) {
     o.extend_from_slice(&v.to_le_bytes())
 }
-pub fn put_u64(o: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(o: &mut Vec<u8>, v: u64) {
     o.extend_from_slice(&v.to_le_bytes())
 }
 fn put_varint(o: &mut Vec<u8>, mut v: u32) {
@@ -301,7 +297,7 @@ fn put_varint(o: &mut Vec<u8>, mut v: u32) {
 }
 
 /// Bounds-checked reader: corrupt input is an error, never a panic.
-pub struct Cur<'a> {
+pub(crate) struct Cur<'a> {
     b: &'a [u8],
     p: usize,
 }
