@@ -336,8 +336,10 @@ fn openinference_langchain_rag() {
         json!({"ls_provider": "openai", "ls_model_name": "gpt-4o-mini", "env": "prod", "user.id": "user-123"})
     );
     let a = j(&llm.attributes);
-    // Losing payload sources stay in attributes (no data loss); winners and metadata/tags are consumed.
-    assert!(a["input.value"].as_str().unwrap().starts_with("{\"messages\""));
+    // P9: once inputs/outputs are extracted, the OpenInference `*.value` copies are dropped; winners and
+    // metadata/tags are consumed.
+    assert!(a.get("input.value").is_none() && a.get("input.mime_type").is_none());
+    assert!(a.get("output.value").is_none() && a.get("output.mime_type").is_none());
     assert!(
         a.get("llm.input_messages.0.message.role").is_none()
             && a.get("metadata").is_none()

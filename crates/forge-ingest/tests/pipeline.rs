@@ -399,3 +399,96 @@ async fn close_wal_and_flush_all_on_current_thread() {
     ing.flush_all().await.unwrap();
     assert_eq!(count(&visible_raw(&s).await), 1);
 }
+
+/// P2 / invariant 9: version order = WAL seq order, even with concurrent submitters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn versions_follow_wal_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 1 << 30, 64 << 20).await;
+    let mut tasks = Vec::new();
+    for w in 0..8u64 {
+        let ing = ing.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..200u64 {
+                let n = w * 1000 + i;
+                let rows = (0..1 + n % 3).map(|k| start("alpha", n, n * 10 + k)).collect();
+                ing.submit(rows).await.unwrap();
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    // Read a copy of the live WAL dir.
+    let copy = tmp.path().join("wal-copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for e in std::fs::read_dir(tmp.path().join("wal/node-1")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "wal") {
+            std::fs::copy(&p, copy.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let mut ranges = Vec::new();
+    let st = forge_ingest::wal::replay(&copy, 0, |_, payload| {
+        let rows = rows_from_batch(&forge_ingest::wal::decode_batch(payload).unwrap());
+        let v: Vec<u64> = rows.iter().map(|r| r.version).collect();
+        assert!(v.windows(2).all(|w| w[1] == w[0] + 1), "row order within a record");
+        ranges.push((v[0], *v.last().unwrap()));
+        Ok::<_, String>(())
+    })
+    .unwrap();
+    assert_eq!(st.applied, 1600);
+    assert!(
+        ranges.windows(2).all(|w| w[1].0 > w[0].1),
+        "each record's versions are above the previous record's"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_trigger_flushes_without_flush_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = stack(tmp.path());
+    let (ing, _) = open(tmp.path(), &s, 64 << 10, 64 << 20).await;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let flusher = tokio::spawn(forge_ingest::run_flusher(ing.clone(), stop.clone()));
+    for i in 0..100u64 {
+        let mut r = start("alpha", 1, i);
+        r.inputs = Some(format!("{{\"pad\":\"{}\"}}", "x".repeat(1000)));
+        ing.submit(vec![r]).await.unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    while s
+        .meta
+        .list_segments(&SegmentFilter::default())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "no size-triggered flush within 2 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.cancel();
+    flusher.await.unwrap();
+}
+
+#[test]
+fn failed_frozen_flush_is_retried_while_idle() {
+    // A frozen memtable left over by a failed flush makes the flusher try again even with nothing new.
+    let m = forge_ingest::memtable::MemtableSet::new(0, 1 << 30, Duration::from_secs(3600));
+    let b = batch(&[start("alpha", 1, 1)]);
+    let bytes = forge_ingest::memtable::accounted_bytes(&b);
+    m.insert(1, b, bytes).unwrap();
+    let now = std::time::Instant::now();
+    assert!(!m.flush_due(now), "not due yet: small and young");
+    let f = m.freeze().unwrap();
+    assert!(
+        m.has_frozen() && m.flush_due(now),
+        "the leftover frozen memtable is due"
+    );
+    m.release(&f);
+    assert!(!m.flush_due(now));
+}

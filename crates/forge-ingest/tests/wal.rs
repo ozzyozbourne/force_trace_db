@@ -5,13 +5,17 @@ use forge_ingest::wal::{self, REC_HDR, Wal, WalError, WalOptions, list_segments,
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 fn opts(dir: &std::path::Path, seg: u64) -> WalOptions {
     WalOptions {
         segment_bytes: seg,
         ..WalOptions::new(dir.to_path_buf())
     }
+}
+
+/// `encode` for tests whose items are already the payload.
+fn take(p: &mut Vec<u8>) -> Vec<u8> {
+    std::mem::take(p)
 }
 
 fn payload(i: u64) -> Vec<u8> {
@@ -25,9 +29,15 @@ async fn fill(dir: &std::path::Path, next_seq: u64, n: u64, seg: u64) -> (Vec<u6
     let s2 = seen.clone();
     let lock = lock_dir(dir).unwrap();
     let w = Arc::new(
-        Wal::start(opts(dir, seg), lock, next_seq, move |items: &mut Vec<(u64, u64)>| {
-            s2.lock().unwrap().extend(items.drain(..).map(|(seq, _)| seq));
-        })
+        Wal::start(
+            opts(dir, seg),
+            lock,
+            next_seq,
+            take,
+            move |items: &mut Vec<(u64, Vec<u8>)>| {
+                s2.lock().unwrap().extend(items.drain(..).map(|(seq, _)| seq));
+            },
+        )
         .unwrap(),
     );
     let mut tasks = Vec::new();
@@ -36,7 +46,7 @@ async fn fill(dir: &std::path::Path, next_seq: u64, n: u64, seg: u64) -> (Vec<u6
         tasks.push(tokio::spawn(async move {
             let mut acks = Vec::new();
             for i in (t..n).step_by(32) {
-                acks.push(w.append(payload(i), i).await.unwrap());
+                acks.push(w.append(payload(i)).await.unwrap());
             }
             acks
         }));
@@ -240,7 +250,16 @@ async fn child_writer() {
     let dir = std::path::PathBuf::from(dir);
     let st = replay(&dir, 0, |_, _| Ok::<_, String>(())).unwrap();
     let lock = lock_dir(&dir).unwrap();
-    let w = Arc::new(Wal::start(opts(&dir, 32 << 10), lock, st.next_seq, |_: &mut Vec<(u64, ())>| {}).unwrap());
+    let w = Arc::new(
+        Wal::start(
+            opts(&dir, 32 << 10),
+            lock,
+            st.next_seq,
+            take,
+            |_: &mut Vec<(u64, Vec<u8>)>| {},
+        )
+        .unwrap(),
+    );
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let mut tasks = Vec::new();
     for t in 0..16u64 {
@@ -249,7 +268,7 @@ async fn child_writer() {
             let mut i = 0;
             loop {
                 i += 1;
-                let seq = w.append(payload(t * 100_000 + i), ()).await.unwrap();
+                let seq = w.append(payload(t * 100_000 + i)).await.unwrap();
                 let mut o = out.lock().unwrap();
                 writeln!(o, "ACK {seq}").unwrap();
                 o.flush().unwrap();
@@ -267,9 +286,11 @@ fn abort_mid_write_loses_no_acked_record() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("n");
     let mut acked_total = std::collections::BTreeSet::new();
-    // Three crashes at different points, same WAL dir: torn write, before fsync, after fsync (pre-ack).
+    // Crashes at different points, same WAL dir: torn write, lost unsynced bytes, before fsync, after fsync
+    // (pre-ack).
     for (fp, nth) in [
         ("wal_torn_write", 40),
+        ("wal_lose_unsynced", 20),
         ("wal_before_fsync", 25),
         ("wal_after_fsync", 30),
     ] {
@@ -279,7 +300,12 @@ fn abort_mid_write_loses_no_acked_record() {
             .env("FORGE_FAILPOINT", format!("{fp}@{nth}"))
             .output()
             .unwrap();
-        assert!(!out.status.success(), "child must die");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&out.status),
+            Some(9),
+            "child must be SIGKILLed: {:?}",
+            out.status
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(&format!("FORGE_FAILPOINT {fp} hit")), "{stderr}");
         let acked: Vec<u64> = String::from_utf8_lossy(&out.stdout)
@@ -297,7 +323,46 @@ fn abort_mid_write_loses_no_acked_record() {
             st.truncated.as_ref().map(|t| t.1)
         );
         assert!(missing.is_empty());
+        if fp == "wal_torn_write" {
+            assert!(st.truncated.is_some(), "the torn write cuts inside a record");
+        }
         assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "contiguous after crash");
     }
-    let _ = Duration::ZERO;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encode_runs_in_seq_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("n");
+    let encoded = Arc::new(Mutex::new(Vec::new()));
+    let e2 = encoded.clone();
+    let lock = lock_dir(&dir).unwrap();
+    let encode = move |p: &mut Vec<u8>| {
+        e2.lock().unwrap().push(p[0]);
+        std::mem::take(p)
+    };
+    let w = Arc::new(Wal::start(opts(&dir, 1 << 20), lock, 1, encode, |_: &mut Vec<(u64, Vec<u8>)>| {}).unwrap());
+    let mut tasks = Vec::new();
+    for t in 0..16u8 {
+        let w = w.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut acks = Vec::new();
+            for _ in 0..20 {
+                acks.push((w.append(vec![t]).await.unwrap(), t));
+            }
+            acks
+        }));
+    }
+    let mut acks = Vec::new();
+    for t in tasks {
+        acks.extend(t.await.unwrap());
+    }
+    tokio::task::block_in_place(|| w.shutdown());
+    acks.sort();
+    let by_seq: Vec<u8> = acks.iter().map(|a| a.1).collect();
+    assert_eq!(
+        *encoded.lock().unwrap(),
+        by_seq,
+        "encode sees the items in ack seq order"
+    );
 }

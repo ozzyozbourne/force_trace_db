@@ -1,11 +1,11 @@
-//! Local segmented WAL (paste target: forge-ingest/src/wal.rs).
+//! Local segmented WAL.
 //!
 //! Layout: `<wal.dir>/<node_id>/<first_seq:020>.wal` + `LOCK`.
 //! Segment = `FORGWAL1` magic, then records `len:u32le | crc32:u32le | seq:u64le | payload[len]`,
 //! crc32 over `seq || payload`. A record never spans segments. Seqs are contiguous and increasing.
 //!
-//! One OS thread owns the active segment. Callers send `(payload, item, oneshot)`; the thread
-//! frames everything queued (up to `group_commit_max_bytes`, or until `group_commit_max_delay` since
+//! One OS thread owns the active segment. Callers send `(item, oneshot)`; the thread encodes each
+//! item's payload (`encode`, in seq order: Forge stamps versions there) and frames everything queued (up to `group_commit_max_bytes`, or until `group_commit_max_delay` since
 //! the first request of the group), does ONE `write_all` + `sync_data`, hands `(seq, item)` to
 //! `on_durable` **in seq order** (forge-ingest inserts into the memtable there: invariant 7), and
 //! only then acks. A failed write/fsync aborts the process (never retry fsync).
@@ -66,7 +66,6 @@ impl WalOptions {
 }
 
 struct Append<T> {
-    payload: Vec<u8>,
     item: T,
     ack: oneshot::Sender<u64>,
 }
@@ -135,12 +134,14 @@ fn frame(buf: &mut Vec<u8>, seq: u64, payload: &[u8]) {
 
 impl<T: Send + 'static> Wal<T> {
     /// `dir` must already hold `lock` (call `lock_dir` before `replay`). `next_seq` comes from
-    /// `replay`. `on_durable` runs on the WAL thread after each fsync with the group's records in seq
-    /// order, before the acks are sent.
+    /// `replay`. `encode` runs on the writer thread, in seq order, right before the record is framed
+    /// (P2: Forge stamps versions there). `on_durable` runs after the group fsync with the group's
+    /// records in seq order, before the acks are sent.
     pub fn start(
         opts: WalOptions,
         lock: File,
         next_seq: u64,
+        encode: impl FnMut(&mut T) -> Vec<u8> + Send + 'static,
         on_durable: impl FnMut(&mut Vec<(u64, T)>) + Send + 'static,
     ) -> Result<Self, WalError> {
         assert!(next_seq >= 1, "seq 0 is reserved for 'nothing flushed'");
@@ -149,7 +150,7 @@ impl<T: Send + 'static> Wal<T> {
         let dir = opts.dir.clone();
         let thread = std::thread::Builder::new()
             .name("forge-wal".into())
-            .spawn(move || writer_loop(opts, file, rx, next_seq, on_durable))?;
+            .spawn(move || writer_loop(opts, file, rx, next_seq, encode, on_durable))?;
         Ok(Self {
             tx: std::sync::Mutex::new(Some(tx)),
             thread: std::sync::Mutex::new(Some(thread)),
@@ -161,7 +162,7 @@ impl<T: Send + 'static> Wal<T> {
     /// Resolves after the record is fsynced and `on_durable` ran. Returns its seq.
     /// Cancel-safe in the sense that matters: if the caller is dropped after `send`, the record is
     /// still written and inserted (the client sees an error and retries; versions make that harmless).
-    pub async fn append(&self, payload: Vec<u8>, item: T) -> Result<u64, WalError> {
+    pub async fn append(&self, item: T) -> Result<u64, WalError> {
         let tx = self
             .tx
             .lock()
@@ -169,9 +170,7 @@ impl<T: Send + 'static> Wal<T> {
             .clone()
             .ok_or(WalError::Closed)?;
         let (ack, rx) = oneshot::channel();
-        tx.send(Append { payload, item, ack })
-            .await
-            .map_err(|_| WalError::Closed)?;
+        tx.send(Append { item, ack }).await.map_err(|_| WalError::Closed)?;
         rx.await.map_err(|_| WalError::Closed)
     }
 
@@ -204,6 +203,7 @@ fn writer_loop<T>(
     mut file: File,
     mut rx: mpsc::Receiver<Append<T>>,
     mut next_seq: u64,
+    mut encode: impl FnMut(&mut T) -> Vec<u8>,
     mut on_durable: impl FnMut(&mut Vec<(u64, T)>),
 ) -> WriterStats {
     let mut stats = WriterStats {
@@ -224,10 +224,13 @@ fn writer_loop<T>(
 
     while let Some(first) = rx.blocking_recv() {
         let started = Instant::now();
-        let mut push = |a: Append<T>, buf: &mut Vec<u8>| {
+        let mut last_start = 0;
+        let mut push = |mut a: Append<T>, buf: &mut Vec<u8>| {
             let seq = next_seq;
             next_seq += 1;
-            frame(buf, seq, &a.payload);
+            let payload = encode(&mut a.item);
+            last_start = buf.len();
+            frame(buf, seq, &payload);
             items.push((seq, a.item));
             acks.push((a.ack, seq));
         };
@@ -240,12 +243,20 @@ fn writer_loop<T>(
             }
         }
         if failpoint::fires("wal_torn_write") {
-            // A crash in the middle of the group's write(2): half the bytes reach disk.
-            let _ = file.write_all(&buf[..buf.len() / 2]).and_then(|()| file.sync_data());
-            failpoint::abort("wal_torn_write");
+            // A crash in the middle of the group's write(2): the disk holds a prefix that ends inside the
+            // group's last record.
+            let cut = last_start + (buf.len() - last_start) / 2;
+            let _ = file.write_all(&buf[..cut]).and_then(|()| file.sync_data());
+            failpoint::kill("wal_torn_write");
         }
         if let Err(e) = file.write_all(&buf) {
             die("write", e);
+        }
+        if failpoint::fires("wal_lose_unsynced") {
+            // Power-loss model: the bytes written since the last fsync never reach the disk.
+            let _ = file.set_len(seg_len);
+            let _ = file.sync_all();
+            failpoint::kill("wal_lose_unsynced");
         }
         failpoint::hit("wal_before_fsync");
         if let Err(e) = file.sync_data() {

@@ -256,8 +256,18 @@ pub fn normalize_span(
     let mut session_id = a.first_str(SESSION_KEYS).map(str::to_owned);
 
     // ---- consumed attributes (removed) ----
+    // P9: once a payload is extracted, the OpenInference `*.value` copies are redundant (and would push a
+    // large prompt into `attributes` a second time).
     let inputs = extract_inputs(&mut a, &mut events);
+    if inputs.is_some() {
+        a.take("input.value");
+        a.take("input.mime_type");
+    }
     let outputs = extract_outputs(&mut a, &mut events);
+    if outputs.is_some() {
+        a.take("output.value");
+        a.take("output.mime_type");
+    }
     let metadata = extract_metadata(&mut a);
     let tags = extract_tags(&mut a);
 
@@ -282,7 +292,7 @@ pub fn normalize_span(
     }
 
     // Master decision 14: only leaf model calls carry cost; agent/chain tokens are aggregates.
-    let cost_usd = if run_type.is_costed() {
+    let cost_usd = if run_type.is_some_and(|r| r.is_costed()) {
         producer_cost.or_else(|| model.as_deref().and_then(|m| cfg.pricing.cost(m, &usage)))
     } else {
         None
@@ -329,7 +339,7 @@ pub fn normalize_span(
         parent_span_id,
         dotted_order: None, // resolve_dotted_orders
         name: (!span.name.is_empty()).then_some(span.name),
-        run_type: Some(run_type),
+        run_type,
         start_time_ns: start,
         end_time_ns: end,
         status,
@@ -361,8 +371,9 @@ fn has_input_messages(a: &Attrs) -> bool {
 }
 
 /// Explicit producer kinds first (most specific), then gen_ai.operation.name, then llm.request.type,
-/// then attribute sniffing; `other` last.
-pub fn derive_run_type(a: &Attrs) -> RunType {
+/// then attribute sniffing. None when nothing identifies the span (P9: a sparse post never
+/// overwrites a known run_type; readers use `COALESCE(run_type, 'other')`).
+pub fn derive_run_type(a: &Attrs) -> Option<RunType> {
     use RunType::*;
     let chat_or_llm = || if has_input_messages(a) { ChatModel } else { Llm };
     if let Some(r) = a
@@ -378,10 +389,10 @@ pub fn derive_run_type(a: &Attrs) -> RunType {
             _ => None,
         })
     {
-        return r;
+        return Some(r);
     }
     if let Some(k) = a.str("openinference.span.kind") {
-        return match k.to_ascii_uppercase().as_str() {
+        return Some(match k.to_ascii_uppercase().as_str() {
             "LLM" => chat_or_llm(),
             "EMBEDDING" => Embedding,
             "CHAIN" | "PROMPT" => Chain,
@@ -389,7 +400,7 @@ pub fn derive_run_type(a: &Attrs) -> RunType {
             "TOOL" => Tool,
             "AGENT" => Agent,
             _ => Other, // GUARDRAIL, EVALUATOR, DECISION, UNKNOWN
-        };
+        });
     }
     if let Some(r) = a.str("traceloop.span.kind").and_then(|k| match k {
         "workflow" | "task" => Some(Chain),
@@ -397,10 +408,10 @@ pub fn derive_run_type(a: &Attrs) -> RunType {
         "tool" => Some(Tool),
         _ => None, // "unknown": keep looking
     }) {
-        return r;
+        return Some(r);
     }
     if let Some(op) = a.str("gen_ai.operation.name") {
-        return match op {
+        return Some(match op {
             "chat" => ChatModel,
             "text_completion" => Llm,
             "generate_content" | "llm_request" => chat_or_llm(),
@@ -410,7 +421,7 @@ pub fn derive_run_type(a: &Attrs) -> RunType {
             "invoke_agent" | "create_agent" | "plan" => Agent,
             "fetch_response" => Other,
             _ => Chain, // invoke_workflow, execute_task, other memory ops, future ops
-        };
+        });
     }
     if let Some(r) = a.str("llm.request.type").and_then(|t| match t {
         "chat" => Some(ChatModel),
@@ -419,15 +430,15 @@ pub fn derive_run_type(a: &Attrs) -> RunType {
         "rerank" => Some(Retriever),
         _ => None,
     }) {
-        return r;
+        return Some(r);
     }
     if a.has("gen_ai.tool.call.arguments") || a.has("gen_ai.tool.call.result") {
-        return Tool;
+        return Some(Tool);
     }
     if a.first_str(MODEL_KEYS).is_some() || a.first_str(PROVIDER_KEYS).is_some() {
-        return chat_or_llm();
+        return Some(chat_or_llm());
     }
-    Other
+    None
 }
 
 // -------------------------------------------------------------------------------------------------

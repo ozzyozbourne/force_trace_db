@@ -2,11 +2,12 @@
 use crate::blob::offload_blobs;
 use crate::flush::{Backoff, FlushCtx, FlushReport, flush_frozen};
 use crate::memtable::{MemtableSet, accounted_bytes};
-use crate::version::{VersionAllocator, stamp};
+use crate::version::VersionAllocator;
 use crate::wal::{self, Wal, WalOptions};
 use crate::{Ingest, IngestError};
-use arrow::array::AsArray;
+use arrow::array::{AsArray, Int64Array};
 use arrow::datatypes::Int64Type;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use forge_meta::Metastore;
 use forge_model::config::{ForgeConfig, WalMode};
@@ -15,11 +16,12 @@ use forge_model::row::{SpanBatchBuilder, SpanRow, validate_batch};
 use forge_model::schema::{col, col_idx};
 use forge_storage::{SegmentStore, StorageError};
 use object_store::ObjectStore;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-type Item = (RecordBatch, usize); // (batch, accounted bytes)
+type Item = (RecordBatch, usize); // (batch, accounted bytes); version column stamped on the WAL thread
 
 #[derive(Debug)]
 pub struct OpenReport {
@@ -31,7 +33,6 @@ pub struct OpenReport {
 pub struct Pipeline {
     wal: Wal<Item>,
     mem: Arc<MemtableSet>,
-    versions: Arc<VersionAllocator>,
     blobs: Arc<dyn ObjectStore>,
     blob_threshold: usize,
     memory_budget: usize,
@@ -114,15 +115,33 @@ impl Pipeline {
             group_commit_max_delay: cfg.wal.group_commit_max_delay,
             queue: 4096,
         };
+        // P2 / invariant 9: versions are reserved here, on the WAL thread, in seq order.
+        let v = versions.clone();
+        let encode = move |item: &mut Item| -> Vec<u8> {
+            let r = v.reserve(item.0.num_rows() as u64);
+            match with_versions(&item.0, r).and_then(|b| {
+                let p = wal::encode_batch(&b)?;
+                item.0 = b;
+                Ok(p)
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Unreachable: the batch was validated in `submit`.
+                    tracing::error!(error = %e, "WAL encode failed; aborting");
+                    std::process::abort()
+                }
+            }
+        };
         let m2 = mem.clone();
-        let wal = Wal::start(opts, lock, replay.next_seq, move |items: &mut Vec<(u64, Item)>| {
+        let on_durable = move |items: &mut Vec<(u64, Item)>| {
             for (seq, (b, len)) in items.drain(..) {
                 if let Err(e) = m2.insert(seq, b, len) {
                     tracing::error!(error = %e, "memtable invariant broken; aborting");
                     std::process::abort();
                 }
             }
-        })?;
+        };
+        let wal = Wal::start(opts, lock, replay.next_seq, encode, on_durable)?;
         let watermark = flush.meta.wal_checkpoint(&node_id).await?.map_or(0, |c| c.flushed_seq);
         wal::truncate(&dir, watermark).map_err(wal::WalError::from)?;
         let next_version = versions.high_water() + 1;
@@ -139,7 +158,6 @@ impl Pipeline {
             Arc::new(Self {
                 wal,
                 mem,
-                versions,
                 blobs,
                 blob_threshold: cfg.ingest.blob_threshold.as_u64() as usize,
                 memory_budget: cfg.memtable.memory_budget.as_u64() as usize,
@@ -191,27 +209,32 @@ impl Ingest for Pipeline {
         offload_blobs(&mut rows, self.blobs.as_ref(), self.blob_threshold)
             .await
             .map_err(StorageError::from)?;
-        let versions = self.versions.reserve(rows.len() as u64);
-        stamp(&mut rows, versions);
-        let (batch, payload, bytes) = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
+        let item = tokio::task::spawn_blocking(move || -> Result<Item, IngestError> {
             let mut bb = SpanBatchBuilder::with_capacity(rows.len());
-            for r in &rows {
+            for r in &mut rows {
+                r.version = 0; // stamped on the WAL thread
                 bb.push(r)?;
             }
             let batch = bb.finish()?;
             validate_batch(&batch)?;
-            let payload = wal::encode_batch(&batch).map_err(|e| IngestError::Internal(e.to_string()))?;
             let bytes = accounted_bytes(&batch);
-            Ok((batch, payload, bytes))
+            Ok((batch, bytes))
         })
         .await
         .map_err(|e| IngestError::Internal(e.to_string()))??;
-        self.wal.append(payload, (batch, bytes)).await?;
+        self.wal.append(item).await?;
         Ok(())
     }
 }
 
-/// Background flusher (supervised by forge-server). Cancellation is observed only BETWEEN flushes.
+/// Replaces the version column with `r` in row order.
+fn with_versions(b: &RecordBatch, r: Range<u64>) -> Result<RecordBatch, ArrowError> {
+    let mut cols = b.columns().to_vec();
+    cols[col_idx(col::VERSION)] = Arc::new(Int64Array::from_iter_values(r.map(|v| v as i64)));
+    RecordBatch::try_new(b.schema(), cols)
+}
+
+/// Background flusher. Cancellation is observed only BETWEEN flushes.
 pub async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
     let tick = (p.flush_interval / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
     loop {
@@ -223,7 +246,11 @@ pub async fn run_flusher(p: Arc<Pipeline>, stop: CancellationToken) {
         if p.mem.flush_due(Instant::now())
             && let Err(e) = p.flush_now().await
         {
-            tracing::error!(error = %e, "flush failed; retried on the next tick");
+            tracing::error!(error = %e, "flush failed; retrying after backoff");
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(Backoff::default().max) => {}
+            }
         }
     }
 }

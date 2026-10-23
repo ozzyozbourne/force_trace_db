@@ -1,4 +1,4 @@
-//! Memtable set: one active + at most one frozen memtable (paste target: forge-ingest/src/memtable.rs).
+//! Memtable set: one active + at most one frozen memtable.
 //!
 //! Inserts come ONLY from the WAL writer thread (after fsync, in seq order) and from replay (in seq
 //! order), so every memtable holds a contiguous run of WAL seqs and `Frozen::last_seq` is a valid
@@ -135,12 +135,18 @@ impl MemtableSet {
         self.unflushed.load(Ordering::Relaxed)
     }
 
-    /// Size or age trigger on the active memtable.
+    /// A frozen memtable is left over (its flush failed), or the size/age trigger on the active one.
     pub fn flush_due(&self, now: Instant) -> bool {
         let s = self.lock();
         let a = &s.active;
-        !a.batches.is_empty()
-            && (a.bytes >= self.flush_bytes || a.created.is_some_and(|c| now.duration_since(c) >= self.flush_interval))
+        s.frozen.is_some()
+            || !a.batches.is_empty()
+                && (a.bytes >= self.flush_bytes
+                    || a.created.is_some_and(|c| now.duration_since(c) >= self.flush_interval))
+    }
+
+    pub fn has_frozen(&self) -> bool {
+        self.lock().frozen.is_some()
     }
 
     /// Freezes the active memtable. Returns the pending frozen one instead if a flush has not

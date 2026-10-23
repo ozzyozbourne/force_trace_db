@@ -283,3 +283,15 @@ async fn blob_offload() {
     assert_eq!(fresh.rows[0].inputs, n.rows[0].inputs);
     assert!(n.rows[0].outputs.is_none() && n.rows[0].attributes.as_ref().unwrap().len() < 1000);
 }
+
+#[test]
+fn unidentified_span_has_null_run_type_and_cost() {
+    // No kind, model, provider or operation attributes: nothing identifies it, so a sparse post (e.g. an end
+    // post) never overwrites a run_type or cost set by an earlier post.
+    let attrs = vec![kv("gen_ai.usage.input_tokens", i(10)), kv("http.method", s("GET"))];
+    let n = normalize_request(req(vec![], vec![span(1, 1, None, 0, attrs)]), None, &cfg());
+    let r = &n.rows[0];
+    assert_eq!(r.run_type, None);
+    assert_eq!(r.cost_usd, None);
+    assert_eq!(r.prompt_tokens, Some(10));
+}
