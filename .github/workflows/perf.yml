@@ -1,0 +1,42 @@
+name: Perf (E3)
+# Manual only: the E3 `/v1/search` latency test (crates/forge-query/tests/fts_perf.rs), as run locally:
+#   cargo test -p forge-query --profile quick-release --test fts_perf -- --ignored --nocapture
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  e3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1   # reads rust-toolchain.toml
+        with:
+          cache: false
+      - name: Build quick-release
+        run: cargo test -p forge-query --profile quick-release --test fts_perf --locked --no-run
+      - name: E3
+        run: |
+          set -o pipefail
+          cargo test -p forge-query --profile quick-release --test fts_perf --locked -- --ignored --nocapture 2>&1 \
+            | tee e3.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## E3 (fts_perf, quick-release) on \`${GITHUB_SHA::7}\`"
+            echo
+            echo '```'
+            grep -E '^(generated|wrote|delay|[ a-z]+: effective)|test result|panicked|E3 at' e3.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
