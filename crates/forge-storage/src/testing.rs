@@ -110,7 +110,7 @@ impl SegmentStore for RecordingSegmentStore {
 }
 
 /// Models S3: every read request (`get_opts`, which `head` and `get_range` go through, and `get_ranges`) sleeps
-/// `delay` first; `get_ranges` counts as one request wave (its ranges go in parallel). Writes are not delayed.
+/// `delay` first; `get_ranges` counts as one request (its ranges go in parallel). Writes are not delayed.
 /// The delay can change at run time (0 while loading data).
 #[derive(Debug)]
 pub struct LatencyStore {
@@ -118,10 +118,14 @@ pub struct LatencyStore {
     delay_us: std::sync::atomic::AtomicU64,
     /// Read requests so far.
     pub gets: std::sync::atomic::AtomicU64,
-    in_flight: std::sync::atomic::AtomicU64,
-    /// Read requests that started while none was in flight: a lower bound on sequential round trips (exact for
-    /// one query).
-    pub waves: std::sync::atomic::AtomicU64,
+    /// Sequential round trips: a read's depth is 1 + the deepest read that had completed when it started, and
+    /// `rounds` is the deepest read so far (for calls run one after another, the difference across a call is that
+    /// call's longest chain of reads, each started after the previous one ended). Unlike counting reads that start
+    /// while none is in flight, an unrelated read still in flight does not hide a round trip, so the count does not
+    /// flip on a millisecond race.
+    pub rounds: std::sync::atomic::AtomicU64,
+    /// The depth of the deepest completed read.
+    done: std::sync::atomic::AtomicU64,
     /// `get_ranges` fails (a non-NotFound store error, like S3 throttling) while set.
     pub fail_ranges: std::sync::atomic::AtomicBool,
 }
@@ -132,8 +136,8 @@ impl LatencyStore {
             inner,
             delay_us: 0.into(),
             gets: 0.into(),
-            in_flight: 0.into(),
-            waves: 0.into(),
+            rounds: 0.into(),
+            done: 0.into(),
             fail_ranges: false.into(),
         }
     }
@@ -141,18 +145,17 @@ impl LatencyStore {
         self.delay_us
             .store(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
-    /// `call` after the delay, counted as in flight from start to end.
+    /// `call` after the delay, at depth 1 + the deepest completed read (`rounds`).
     async fn read<T>(&self, call: impl Future<Output = T>) -> T {
         self.gets.fetch_add(1, Ordering::Relaxed);
-        if self.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.waves.fetch_add(1, Ordering::SeqCst);
-        }
+        let depth = self.done.load(Ordering::SeqCst) + 1;
+        self.rounds.fetch_max(depth, Ordering::SeqCst);
         let us = self.delay_us.load(Ordering::Relaxed);
         if us > 0 {
             tokio::time::sleep(Duration::from_micros(us)).await;
         }
         let r = call.await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.done.fetch_max(depth, Ordering::SeqCst);
         r
     }
 }

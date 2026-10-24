@@ -234,12 +234,12 @@ struct Row {
     kind: Kind,
     cold: Duration,
     cold_gets: u64,
-    cold_waves: u64,
+    cold_rounds: u64,
     p50: Duration,
     p95: Duration,
     max: Duration,
     gets: f64,
-    waves: f64,
+    rounds: f64,
     seg_reads: u64,
 }
 
@@ -334,22 +334,22 @@ async fn e3_search_newest_50() {
                     d
                 }
             };
-            let (g0, w0) = (lat.gets.load(Ordering::SeqCst), lat.waves.load(Ordering::SeqCst));
+            let (g0, w0) = (lat.gets.load(Ordering::SeqCst), lat.rounds.load(Ordering::SeqCst));
             let cold = call(kind.term(0)).await;
             let cold_gets = lat.gets.load(Ordering::SeqCst) - g0;
-            let cold_waves = lat.waves.load(Ordering::SeqCst) - w0;
+            let cold_rounds = lat.rounds.load(Ordering::SeqCst) - w0;
             if kind == Kind::Needle {
                 table.push(Row {
                     delay,
                     kind,
                     cold,
                     cold_gets,
-                    cold_waves,
+                    cold_rounds,
                     p50: Duration::ZERO,
                     p95: Duration::ZERO,
                     max: Duration::ZERO,
                     gets: 0.0,
-                    waves: 0.0,
+                    rounds: 0.0,
                     seg_reads: 0,
                 });
             } else {
@@ -357,7 +357,7 @@ async fn e3_search_newest_50() {
                     call(kind.term(i)).await;
                 }
                 rec.take_projections();
-                let (g0, w0) = (lat.gets.load(Ordering::SeqCst), lat.waves.load(Ordering::SeqCst));
+                let (g0, w0) = (lat.gets.load(Ordering::SeqCst), lat.rounds.load(Ordering::SeqCst));
                 let mut ts = Vec::with_capacity(TIMED);
                 let mut seg_reads = 0;
                 for i in 0..TIMED {
@@ -369,7 +369,7 @@ async fn e3_search_newest_50() {
                     failed.push(format!("{}: {seg_reads} segments read in one call", kind.name()));
                 }
                 let gets = (lat.gets.load(Ordering::SeqCst) - g0) as f64 / TIMED as f64;
-                let waves = (lat.waves.load(Ordering::SeqCst) - w0) as f64 / TIMED as f64;
+                let rounds = (lat.rounds.load(Ordering::SeqCst) - w0) as f64 / TIMED as f64;
                 ts.sort();
                 let p = |x: f64| ts[((TIMED as f64 * x) as usize).min(TIMED - 1)];
                 if kind == Kind::Rare {
@@ -387,34 +387,42 @@ async fn e3_search_newest_50() {
                     kind,
                     cold,
                     cold_gets,
-                    cold_waves,
+                    cold_rounds,
                     p50: p(0.5),
                     p95: p(0.95),
                     max: ts[TIMED - 1],
                     gets,
-                    waves,
+                    rounds,
                     seg_reads,
                 });
             }
             let r = table.last().unwrap();
             eprintln!(
-                "delay {delay:>3} ms {:>6}: cold {:>9.1?} ({} GETs, {} waves)  p50 {:>9.1?} p95 {:>9.1?} max {:>9.1?}  \
-                 {:.1} GETs/call, {:.1} waves/call, max {} segments read",
+                "delay {delay:>3} ms {:>6}: cold {:>9.1?} ({} GETs, {} rounds)  p50 {:>9.1?} p95 {:>9.1?} max {:>9.1?}  \
+                 {:.1} GETs/call, {:.1} rounds/call, max {} segments read",
                 kind.name(),
                 r.cold,
                 r.cold_gets,
-                r.cold_waves,
+                r.cold_rounds,
                 r.p50,
                 r.p95,
                 r.max,
                 r.gets,
-                r.waves,
+                r.rounds,
                 r.seg_reads
             );
             if delay == 75 {
                 let name = kind.name();
-                if r.cold >= Duration::from_millis(1500) || r.cold_waves > 8 {
-                    failed.push(format!("{name}: cold {:?}, {} waves", r.cold, r.cold_waves));
+                // Cold round trips (`LatencyStore::rounds`): rare, common and absent at most 8. The needle's are
+                // fixed by its layout: the eager lookups (footer, dict blocks, postings: 3), the lookup of the one
+                // segment without null starts (3), then two rounds of segments and their verify reads in the newer
+                // segments that hold their end posts (footer + data each: 6) = 12, plus 1 for issue stagger.
+                let max_cold = if kind == Kind::Needle { 13 } else { 8 };
+                if r.cold >= Duration::from_millis(1500) || r.cold_rounds > max_cold {
+                    failed.push(format!(
+                        "{name}: cold {:?}, {} rounds > {max_cold}",
+                        r.cold, r.cold_rounds
+                    ));
                 }
                 if matches!(kind, Kind::Absent | Kind::Needle) && r.cold_gets == 0 {
                     failed.push(format!("{name}: cold call made no GETs"));
@@ -422,9 +430,9 @@ async fn e3_search_newest_50() {
                 if kind != Kind::Needle && r.p50 >= Duration::from_millis(500) {
                     failed.push(format!("{name}: p50 {:?}", r.p50));
                 }
-                let max_waves = if kind == Kind::Absent { 2.0 } else { 5.0 };
-                if kind != Kind::Needle && r.waves > max_waves {
-                    failed.push(format!("{name}: {:.1} waves/call > {max_waves}", r.waves));
+                let max_rounds = if kind == Kind::Absent { 2.0 } else { 5.0 };
+                if kind != Kind::Needle && r.rounds > max_rounds {
+                    failed.push(format!("{name}: {:.1} rounds/call > {max_rounds}", r.rounds));
                 }
             }
         }

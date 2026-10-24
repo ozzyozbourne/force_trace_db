@@ -128,8 +128,15 @@ warm-up (Vortex footers and `.fts` footers cached, dictionary blocks not); `cold
 | 75 ms | needle (10 oldest segments) | – | – | – | 968 ms | 7 |
 | 100 ms | rare / common / absent | 387 / 384 / 57 ms | 404 / 391 / 262 ms | 3.0 / 3.0 / 0.2 | 700 / 698 / 475 ms | 4 / 4 / 2 |
 
-Asserted at 75 ms: p50 < 500 ms (rare, common, absent), ≤ 5 waves per call (absent ≤ 2), cold < 1.5 s and ≤ 8
-waves, page 1 equal to the generator's newest 50, no payload column read for the rare term, ≤ 16 segments read.
+The waves columns above used the first counter (reads started while none was in flight). It hid round trips behind
+unrelated reads still in flight and could flip by one on a millisecond race (a cold needle counted 7 to 9 for the
+same reads). E3 now counts `rounds`, the longest chain of reads each started after the previous one ended:
+warm calls count the same (2 / 3 / 0.2); cold calls count rare 5, common 6, absent 4, needle 13 (debug).
+
+Asserted at 75 ms: p50 < 500 ms (rare, common, absent), ≤ 5 rounds per call (absent ≤ 2), cold < 1.5 s and ≤ 8
+rounds (needle ≤ 13: 3 eager lookup rounds, 3 for the segment without null starts, 6 for two segment rounds and
+their verify reads, plus 1), page 1 equal to the generator's newest 50, no payload column read for the rare term,
+≤ 16 segments read.
 Run: `cargo test -p forge-query --profile quick-release --test fts_perf -- --ignored --nocapture`.
 
 What E3 does not prove: 100 M spans and 1 TB (60× fewer spans, 8k-span L0s instead of 256 MiB L1s); real S3
