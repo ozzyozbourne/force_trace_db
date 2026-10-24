@@ -157,7 +157,7 @@ impl Footer {
             let n = c.u16()? as usize;
             let last_key = c.bytes(n)?.to_vec();
             let (offset, len, num_terms, crc) = (c.u64()?, c.u32()?, c.u32()?, c.u32()?);
-            if offset < dict.start || offset + u64::from(len) > dict.end {
+            if offset < dict.start || offset.checked_add(u64::from(len)).is_none_or(|e| e > dict.end) {
                 return Err("dict block out of bounds".into());
             }
             blocks.push(BlockMeta {

@@ -24,6 +24,9 @@ use forge_model::schema::{FTS_COLUMNS, JSON_COLUMNS};
 pub enum IndexError {
     #[error("corrupt .fts {path}: {msg}")]
     Corrupt { path: String, msg: String },
+    /// Fetching the file failed (a store error other than "not found": throttling, a timeout, a network error).
+    #[error("reading .fts {path}: {msg}")]
+    Io { path: String, msg: String },
     #[error("invalid search query: {0}")]
     Query(String),
     #[error("building .fts: {0}")]
@@ -38,6 +41,7 @@ impl Classify for IndexError {
         match self {
             Self::Query(_) => ErrorKind::InvalidInput,
             Self::Unimplemented(e) => e.kind(),
+            Self::Io { .. } => ErrorKind::Transient,
             Self::Corrupt { .. } | Self::Build(_) => ErrorKind::Internal,
         }
     }

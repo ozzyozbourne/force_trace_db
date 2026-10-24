@@ -2358,6 +2358,7 @@ dependencies = [
  "foldhash 0.2.0",
  "forge-model",
  "fst",
+ "futures",
  "proptest",
  "roaring",
  "serde_json",

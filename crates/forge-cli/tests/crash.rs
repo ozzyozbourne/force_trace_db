@@ -229,7 +229,7 @@ struct Replay {
 
 /// Restart without failpoints, read the replay line, post one `post-restart` span, SIGTERM, expect exit 0.
 async fn restart_and_post(dir: &Path, ledger: &Ledger) -> Replay {
-    let cfg = write_config(dir, "5s");
+    let cfg = write_config(dir, "30s"); // the restart's stop is not under test; give it room
     let (mut s, p) = spawn_ready(dir, Some(&cfg), &env(None, "300ms", &[])).await;
     let logs = s.logs();
     let f = |k| log_field(&logs, "wal replay done", k);
@@ -257,7 +257,11 @@ async fn restart_and_post(dir: &Path, ledger: &Ledger) -> Replay {
         acked: true,
         round: POST_RESTART_ROUND,
     });
-    s.stop_ok(Duration::from_secs(20)).await;
+    let logs = s.stop_ok(Duration::from_secs(45)).await;
+    assert!(
+        logs.contains("final flush done"),
+        "restart: the final flush did not finish within the grace (G/A would fail misleadingly)\n{logs}"
+    );
     replay
 }
 

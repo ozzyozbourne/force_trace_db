@@ -50,7 +50,8 @@ fn ref_search(reference: &[SpanRow], project: &str, q: &str) -> Vec<(i64, TraceI
     out
 }
 
-async fn pages(f: &Fixture, project: &str, q: &str, limit: usize) -> Vec<(i64, TraceId, SpanId)> {
+/// At most `max_pages` pages, the last without a cursor (a cursor bug fails instead of paging forever).
+async fn pages(f: &Fixture, project: &str, q: &str, limit: usize, max_pages: usize) -> Vec<(i64, TraceId, SpanId)> {
     let req = |cursor| {
         let body = SearchBody {
             q: q.into(),
@@ -61,7 +62,12 @@ async fn pages(f: &Fixture, project: &str, q: &str, limit: usize) -> Vec<(i64, T
         SearchRequest::parse(body, pid(project)).unwrap()
     };
     let mut out = Vec::new();
-    for p in search_pages(&f.engine, req, usize::MAX).await {
+    let ps = search_pages(&f.engine, req, max_pages).await;
+    assert!(
+        ps.last().is_some_and(|p| p.next_cursor.is_none()),
+        "no last page within {max_pages}"
+    );
+    for p in ps {
         out.extend(positions(&p.rows));
         assert!(p.rows.num_rows() <= limit);
     }
@@ -87,7 +93,7 @@ async fn search_pages_match_reference() {
             ] {
                 let want = ref_search(&reference, project, q);
                 for limit in [1, 3, 50] {
-                    let got = pages(&f, project, q, limit).await;
+                    let got = pages(&f, project, q, limit, want.len().div_ceil(limit) + 1).await;
                     assert_eq!(got, want, "seed {seed} project {project} q {q:?} limit {limit}");
                 }
             }

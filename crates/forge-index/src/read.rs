@@ -7,6 +7,9 @@ use crate::query::{Leaf, Query};
 use crate::{IndexError, IndexResult};
 use bytes::Bytes;
 use fst::{IntoStreamer, Map, Streamer};
+use futures::FutureExt;
+use futures::channel::oneshot;
+use futures::future::Shared;
 use roaring::{MultiOps, RoaringBitmap};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -33,7 +36,42 @@ pub struct Io {
 pub struct FtsFile {
     path: String,
     footer: Footer,
-    blocks: Mutex<HashMap<usize, Map<Bytes>>>,
+    blocks: Mutex<HashMap<usize, Block>>,
+}
+
+/// A dict block: decoded, or being fetched by another call (the receiver resolves when that call is done with it,
+/// fetched or not).
+enum Block {
+    Ready(Map<Bytes>),
+    Loading(Shared<oneshot::Receiver<()>>),
+}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ready(_) => "Ready",
+            Self::Loading(_) => "Loading",
+        })
+    }
+}
+
+/// The blocks one call is fetching. On drop (done, failed or cancelled) the ones not cached are released, then the
+/// calls waiting for them wake (the sender drops after `drop` ran) and fetch them themselves.
+struct Claim<'a> {
+    file: &'a FtsFile,
+    ids: Vec<usize>,
+    _done: oneshot::Sender<()>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut b = self.file.blocks.lock().expect("poisoned");
+        for i in &self.ids {
+            if matches!(b.get(i), Some(Block::Loading(_))) {
+                b.remove(i);
+            }
+        }
+    }
 }
 
 impl FtsFile {
@@ -53,7 +91,7 @@ impl FtsFile {
         }
         let mut io = Io::default();
         let start = file_len.saturating_sub(TAIL_READ);
-        let tail = get(fetch, vec![start..file_len], &mut io).await?.remove(0);
+        let tail = get(path, fetch, vec![start..file_len], &mut io).await?.remove(0);
         let n = tail.len();
         if n as u64 != file_len - start || &tail[n - 4..] != MAGIC {
             return Err(corrupt("bad trailer".into()));
@@ -67,7 +105,7 @@ impl FtsFile {
         let fbytes = if f_start >= start {
             tail.slice((f_start - start) as usize..n - TRAILER_LEN as usize)
         } else {
-            get(fetch, vec![f_start..file_len - TRAILER_LEN], &mut io)
+            get(path, fetch, vec![f_start..file_len - TRAILER_LEN], &mut io)
                 .await?
                 .remove(0)
         };
@@ -117,23 +155,53 @@ impl FtsFile {
     {
         let mut io = Io::default();
         let leaves: Vec<&Leaf> = qs.iter().flat_map(|q| q.groups.iter().flatten()).collect();
-        // Wave 1: the missing FST blocks of every leaf.
-        let need: Vec<usize> = {
-            let cached = self.blocks.lock().expect("poisoned");
-            let all: BTreeSet<usize> = leaves.iter().flat_map(|l| self.blocks_for(l)).collect();
-            all.into_iter().filter(|b| !cached.contains_key(b)).collect()
-        };
-        if !need.is_empty() {
-            let ranges = need
-                .iter()
-                .map(|&i| {
-                    let b = &self.footer.blocks[i];
-                    b.offset..b.offset + u64::from(b.len)
-                })
-                .collect();
-            for (i, buf) in need.iter().zip(wave(fetch, ranges, &mut io).await?) {
-                self.cache_block(*i, buf)?;
+        // Wave 1: the missing FST blocks of every leaf. A block another call is fetching is waited for, not fetched
+        // again; if that call fails, the next round fetches it here.
+        let want: BTreeSet<usize> = leaves.iter().flat_map(|l| self.blocks_for(l)).collect();
+        loop {
+            let (tx, rx) = oneshot::channel();
+            let rx = rx.shared();
+            let (mut mine, mut others) = (Vec::new(), Vec::new());
+            {
+                let mut cached = self.blocks.lock().expect("poisoned");
+                for &i in &want {
+                    match cached.get(&i) {
+                        Some(Block::Ready(_)) => {}
+                        Some(Block::Loading(w)) => others.push(w.clone()),
+                        None => {
+                            cached.insert(i, Block::Loading(rx.clone()));
+                            mine.push(i);
+                        }
+                    }
+                }
             }
+            if mine.is_empty() && others.is_empty() {
+                break;
+            }
+            let claim = Claim {
+                file: self,
+                ids: mine,
+                _done: tx,
+            };
+            let fetch_mine = async {
+                if !claim.ids.is_empty() {
+                    let ranges = claim
+                        .ids
+                        .iter()
+                        .map(|&i| {
+                            let b = &self.footer.blocks[i];
+                            b.offset..b.offset + u64::from(b.len)
+                        })
+                        .collect();
+                    for (i, buf) in claim.ids.iter().zip(wave(&self.path, fetch, ranges, &mut io).await?) {
+                        self.cache_block(*i, buf)?;
+                    }
+                }
+                drop(claim); // before waiting for the others: they may wait for these blocks
+                Ok::<_, IndexError>(())
+            };
+            let (r, _) = futures::join!(fetch_mine, futures::future::join_all(others));
+            r?;
         }
         let vals = leaves
             .iter()
@@ -162,10 +230,11 @@ impl FtsFile {
                         leaf_bm[li].insert(row);
                     }
                     TermValue::Postings { offset, len } => {
-                        let r = p0 + offset..p0 + offset + len;
-                        if r.end > self.footer.postings.end {
-                            return Err(self.corrupt("posting range out of bounds"));
-                        }
+                        let r = p0
+                            .checked_add(offset)
+                            .and_then(|s| Some(s..s.checked_add(len)?))
+                            .filter(|r| r.end <= self.footer.postings.end)
+                            .ok_or_else(|| self.corrupt("posting range out of bounds"))?;
                         ranges.push(r);
                         owners.push(li);
                     }
@@ -173,14 +242,18 @@ impl FtsFile {
             }
         }
         if !ranges.is_empty() {
-            for (li, buf) in owners.into_iter().zip(wave(fetch, ranges, &mut io).await?) {
+            for (li, buf) in owners.into_iter().zip(wave(&self.path, fetch, ranges, &mut io).await?) {
                 leaf_bm[li] |= decode_postings(&buf).map_err(|e| self.corrupt(&e))?;
             }
         }
-        let rows = live
+        let rows: Vec<RoaringBitmap> = live
             .into_iter()
             .map(|l| l.into_iter().map(|r| leaf_bm[r].iter().intersection()).union())
             .collect();
+        // A row id past the file's rows would make the hit scan fail as a bad request: it is corruption (D4).
+        if rows.iter().any(|r| r.max().is_some_and(|m| m >= self.footer.num_rows)) {
+            return Err(self.corrupt("posting row id out of range"));
+        }
         Ok((rows, io))
     }
 
@@ -196,7 +269,7 @@ impl FtsFile {
             return Err(self.corrupt(&format!("dict block {i} checksum")));
         }
         let m = Map::new(buf).map_err(|e| self.corrupt(&e.to_string()))?;
-        self.blocks.lock().expect("poisoned").insert(i, m);
+        self.blocks.lock().expect("poisoned").insert(i, Block::Ready(m));
         Ok(())
     }
 
@@ -229,7 +302,9 @@ impl FtsFile {
         let mut vals = Vec::new();
         let cached = self.blocks.lock().expect("poisoned");
         for b in self.blocks_for(leaf) {
-            let m = &cached[&b];
+            let Some(Block::Ready(m)) = cached.get(&b) else {
+                unreachable!("wave 1 fetched every block")
+            };
             match leaf {
                 Leaf::Exact(k) => vals.extend(m.get(k)),
                 Leaf::Prefix(p) => {
@@ -274,7 +349,7 @@ fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-async fn get<F, Fut>(fetch: &F, ranges: Vec<Range<u64>>, io: &mut Io) -> IndexResult<Vec<Bytes>>
+async fn get<F, Fut>(path: &str, fetch: &F, ranges: Vec<Range<u64>>, io: &mut Io) -> IndexResult<Vec<Bytes>>
 where
     F: Fn(Vec<Range<u64>>) -> Fut,
     Fut: Future<Output = IndexResult<Vec<Bytes>>>,
@@ -283,7 +358,7 @@ where
     let bufs = fetch(ranges).await?;
     if bufs.len() != want.len() || bufs.iter().zip(&want).any(|(b, w)| b.len() as u64 != *w) {
         return Err(IndexError::Corrupt {
-            path: String::new(),
+            path: path.to_string(),
             msg: "short range read".into(),
         });
     }
@@ -294,7 +369,7 @@ where
 }
 
 /// One round trip: coalesce, fetch, slice each requested range back out (zero-copy).
-async fn wave<F, Fut>(fetch: &F, ranges: Vec<Range<u64>>, io: &mut Io) -> IndexResult<Vec<Bytes>>
+async fn wave<F, Fut>(path: &str, fetch: &F, ranges: Vec<Range<u64>>, io: &mut Io) -> IndexResult<Vec<Bytes>>
 where
     F: Fn(Vec<Range<u64>>) -> Fut,
     Fut: Future<Output = IndexResult<Vec<Bytes>>>,
@@ -310,7 +385,7 @@ where
             _ => merged.push(r),
         }
     }
-    let bufs = get(fetch, merged.clone(), io).await?;
+    let bufs = get(path, fetch, merged.clone(), io).await?;
     Ok(ranges
         .iter()
         .map(|r| {

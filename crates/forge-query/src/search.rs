@@ -75,7 +75,10 @@ impl SearchRequest {
     pub fn parse(b: SearchBody, project: ProjectId) -> Result<Self, QueryError> {
         let limit = b.limit.unwrap_or(50);
         if !(1..=crate::runs::MAX_LIMIT).contains(&limit) {
-            return Err(bad(format!("limit must be 1..=1000, got {limit}")));
+            return Err(bad(format!(
+                "limit must be 1..={}, got {limit}",
+                crate::runs::MAX_LIMIT
+            )));
         }
         if b.q.trim().is_empty() || b.q.len() > MAX_Q {
             return Err(bad(format!("q must be non-blank and at most {MAX_Q} bytes")));
@@ -198,9 +201,9 @@ struct FtsSource<'a> {
     memo: Mutex<HashMap<SegmentId, Arc<Hits>>>,
     /// One index lookup per segment, shared by concurrent callers (`start`, `prefetch`, `segments`).
     lookups: moka::future::Cache<SegmentId, Arc<Hits>>,
-    /// Per segment: its hit rows (ascending) and their RUN_COLUMNS, when at most `MEMO_ROWS` (verify takes its
-    /// single-source rows from here instead of reading them again).
-    hit_rows: Mutex<HashMap<SegmentId, Arc<(RoaringTreemap, RecordBatch)>>>,
+    /// Per segment: its hit rows (ascending) and their RUN_COLUMNS, when at most a page of them (verify takes its
+    /// single-source rows from here instead of reading them again), charged to the call's pool.
+    hit_rows: Mutex<HashMap<SegmentId, Arc<(RoaringTreemap, RecordBatch, MemoryReservation)>>>,
     /// Traces with memtable rows in the snapshot (D11).
     mem_traces: Mutex<BTreeSet<TraceId>>,
     /// Segments brute-forced by this call (D4).
@@ -248,7 +251,9 @@ impl<'a> FtsSource<'a> {
         Ok(self.memo.lock().expect("poisoned").entry(seg.id).or_insert(h).clone())
     }
 
-    /// `lookup` for every segment of `segs` not looked up yet, concurrently.
+    /// `lookup` for every segment of `segs` not looked up yet, concurrently. Ahead of the reads, so a failed one
+    /// (a query error such as "prefix too broad") is not memoised and fails the call only if `part` reads that
+    /// segment; meanwhile its frontier stays conservative.
     async fn lookup_all(&self, segs: &[&SegmentMeta]) -> Result<(), QueryError> {
         let mut futs = Vec::with_capacity(segs.len());
         for s in segs {
@@ -256,8 +261,8 @@ impl<'a> FtsSource<'a> {
         }
         futures::stream::iter(futs)
             .buffer_unordered(EAGER_LOOKUPS)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .for_each(|_| async {})
+            .await;
         Ok(())
     }
 
@@ -265,9 +270,11 @@ impl<'a> FtsSource<'a> {
     async fn part(&self, q: &QueryCtx, view: &ReadView, part: &SegmentPart) -> Result<Vec<Candidate>, QueryError> {
         let hits = self.lookup(&part.seg).await?;
         let mut h = part_hits(view, &q.pool, &self.counters, part, &self.units, hits.per_unit.clone()).await?;
-        // Few hits: read what verify needs too (key, start and RUN_COLUMNS), saving its read of them.
+        // At most a page of hits: read what verify needs too (key, start and RUN_COLUMNS), saving its read of them.
+        // More (a common term): verify reads at most a page of them, so reading every hit row wide costs more than
+        // it saves.
         let all = h.rows();
-        let wide = all.len() <= MEMO_ROWS;
+        let wide = all.len() <= self.r.limit as u64;
         let cols = if wide {
             read_columns(&RUN_COLUMNS)
         } else {
@@ -276,10 +283,13 @@ impl<'a> FtsSource<'a> {
         scan_hits(view, &mut h, &cols).await?;
         if wide && !all.is_empty() {
             let b = concat_batches(&projected_schema(&cols), &h.batches)?;
-            self.hit_rows
-                .lock()
-                .expect("poisoned")
-                .insert(part.seg.id, Arc::new((all, b)));
+            // Past the memory limit, verify reads them again instead.
+            if let Ok(res) = q.reserve("search.hit_rows", std::slice::from_ref(&b)) {
+                self.hit_rows
+                    .lock()
+                    .expect("poisoned")
+                    .insert(part.seg.id, Arc::new((all, b, res)));
+            }
         }
         let mut out = Vec::new();
         for b in &h.batches {
@@ -306,9 +316,6 @@ impl<'a> FtsSource<'a> {
         Ok(out)
     }
 }
-
-/// Hit rows of one segment kept for verify (`FtsSource::hit_rows`).
-const MEMO_ROWS: u64 = 2048;
 
 /// Index lookups in flight for `start` and `prefetch`.
 const EAGER_LOOKUPS: usize = 256;
@@ -359,8 +366,10 @@ impl CandidateSource for FtsSource<'_> {
                 let mut out = Vec::new();
                 let mut traces = BTreeSet::new();
                 let mut unpositioned = 0;
-                let mut seen = forge_index::PrefixSeen::default();
+                // One prefix count per unit and predicate: the memtable is one source (D13).
+                let mut seen: Vec<Vec<forge_index::PrefixSeen>> = vec![Vec::new(); units.len()];
                 for b in mem_versions(&snap, &KeyFilters::project(&p, None), &projected_schema(&cols), cancel)? {
+                    cancel.check()?;
                     let s = b.schema_ref();
                     let ids = Ids::of(&b)?;
                     let cells: Vec<&StringArray> = units
@@ -371,8 +380,8 @@ impl CandidateSource for FtsSource<'_> {
                         let tid = TraceId::from_slice(ids.trace.value(i))?;
                         traces.insert(tid);
                         let mut hit = false;
-                        for (u, c) in units.iter().zip(&cells) {
-                            hit |= c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen)?;
+                        for ((u, c), seen) in units.iter().zip(&cells).zip(&mut seen) {
+                            hit |= c.is_valid(i) && u.matches_counting(&mut an, c.value(i), seen)?;
                         }
                         if !hit {
                             continue;
@@ -475,9 +484,11 @@ impl CandidateSource for FtsSource<'_> {
                 }
             }
         }
+        // As in runs: the wave's span ids pushed into the merge scan.
+        let filter = crate::runs::span_filter(&keys.iter().map(|k| k.1).collect());
         let (read, merged) = futures::try_join!(
             view.scan(&unread, &out_cols, None),
-            view.scan(&merge_parts, &wide, None)
+            view.scan(&merge_parts, &wide, filter)
         )?;
         exact.extend(read);
         let (snap, r, hi) = (view.mem().clone(), self.r.clone(), self.hi);
@@ -492,13 +503,20 @@ impl CandidateSource for FtsSource<'_> {
             let mut an = Analyzer::default();
             // Single-source rows: the index answer is the answer (tombstones still dropped).
             let ex: Vec<RecordBatch> = exact.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
-            let ex = merge_or_filter(&out_schema, &ex, false, cancel)?;
             // The rest: every version, merged, re-checked on the merged cells.
             let mut batches: Vec<RecordBatch> = merged.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
             let mem = mem_versions(&snap, &mk, &wide_schema, cancel)?;
             let merge = needs_merge(&merge_parts, !mem.is_empty());
             batches.extend(mem);
+            // Charged like runs: the inputs, then the merged rows, then the page.
+            let size = |bs: &[RecordBatch]| bs.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+            let kept = res.size();
+            res.try_grow(size(&ex) + size(&batches))?;
+            let ex = merge_or_filter(&out_schema, &ex, false, cancel)?;
             let m = merge_or_filter(&wide_schema, &batches, merge, cancel)?;
+            res.try_grow(ex.get_array_memory_size() + m.get_array_memory_size())?;
+            drop(batches);
+            res.resize(kept + ex.get_array_memory_size() + m.get_array_memory_size());
             let s = m.schema_ref();
             let cells: Vec<&StringArray> = units
                 .iter()
@@ -520,6 +538,8 @@ impl CandidateSource for FtsSource<'_> {
             let all = concat_batches(&out_schema, [&ex, &m])?;
             let out = filter_record_batch(&all, &row_mask(&r, hi, &all)?)?;
             res.try_grow(out.get_array_memory_size())?;
+            drop((ex, m, all));
+            res.resize(kept + out.get_array_memory_size());
             Ok((out, res))
         })
         .await

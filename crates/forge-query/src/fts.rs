@@ -14,6 +14,7 @@ use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TablePr
 use datafusion::common::{Result, plan_err};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDFImpl, Signature, TableType, Volatility,
@@ -25,7 +26,7 @@ use forge_index::{Analyzer, FtsColumn, FtsExpr, FtsPredicate, Matcher};
 use forge_meta::Metastore;
 use forge_model::MemtableView;
 use forge_model::ids::{ProjectId, TraceId};
-use forge_model::merge::Cancel;
+use forge_model::merge::{Cancel, CancelOnDrop};
 use forge_model::schema::{col, projected_schema};
 use forge_storage::SegmentStore;
 use std::collections::{BTreeSet, HashMap};
@@ -271,7 +272,7 @@ impl TableProvider for TraceTreeProvider {
     }
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -296,14 +297,25 @@ impl TableProvider for TraceTreeProvider {
         let cols = read_columns(&trace_columns(true));
         let schema = projected_schema(&cols);
         let parts = view.locate_versions(&k).await.map_err(ext)?;
-        let mut batches = view.scan(&parts, &cols, None).await.map_err(ext)?;
-        let mem = view.mem_versions(&k, &schema).map_err(ext)?;
-        let merge = crate::read::needs_merge(&parts, !mem.is_empty());
-        batches.extend(mem);
-        let out = tokio::task::spawn_blocking(move || tree_batch(&schema, &batches, merge))
-            .await
-            .map_err(ext)?
-            .map_err(ext)?;
+        let batches = view.scan(&parts, &cols, None).await.map_err(ext)?;
+        // As `trace_blocking` (D6): the memtable, merge and tree on the blocking pool under a `Cancel` that dropping
+        // the query sets, charged to the session's pool.
+        let res = crate::reserve(&state.runtime_env().memory_pool, "trace_tree", &batches).map_err(ext)?;
+        let snap = view.mem().clone();
+        drop(view);
+        let cancel = Cancel::new();
+        let _guard = CancelOnDrop(cancel.clone());
+        let out = tokio::task::spawn_blocking(move || -> Result<RecordBatch, QueryError> {
+            let mut batches = batches;
+            let mem = crate::read::mem_versions(&snap, &k, &schema, &cancel)?;
+            res.try_grow(mem.iter().map(|b| b.get_array_memory_size()).sum())?;
+            let merge = crate::read::needs_merge(&parts, !mem.is_empty());
+            batches.extend(mem);
+            tree_batch(&schema, batches, merge, &cancel, &res)
+        })
+        .await
+        .map_err(ext)?
+        .map_err(ext)?;
         let full = tree_schema();
         let order = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new(
             TREE_ORDER,
@@ -317,8 +329,16 @@ impl TableProvider for TraceTreeProvider {
 }
 
 /// The merged rows of one trace in pre-order, projected to `tree_schema()`.
-fn tree_batch(schema: &SchemaRef, batches: &[RecordBatch], merge: bool) -> Result<RecordBatch, QueryError> {
-    let m = merge_or_filter(schema, batches, merge, &Cancel::never())?;
+fn tree_batch(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    merge: bool,
+    cancel: &Cancel,
+    res: &MemoryReservation,
+) -> Result<RecordBatch, QueryError> {
+    let m = merge_or_filter(schema, &batches, merge, cancel)?;
+    res.try_grow(m.get_array_memory_size())?;
+    drop(batches);
     let projects: BTreeSet<&str> = {
         let p = m.column(m.schema().index_of(col::PROJECT_ID)?);
         let p = p.as_any().downcast_ref::<StringArray>().expect("utf8 project_id");
@@ -329,7 +349,8 @@ fn tree_batch(schema: &SchemaRef, batches: &[RecordBatch], merge: bool) -> Resul
             "trace_tree: the trace id is in several projects; pass the project as the second argument".into(),
         ));
     }
-    let tree = TraceTree::build(&m, &Cancel::never())?;
+    let tree = TraceTree::build(&m, cancel)?;
+    res.try_grow(tree.memory_size())?;
     let rows = UInt32Array::from_iter_values(tree.preorder.iter().map(|(r, _)| *r));
     let ordered = take_record_batch(&m, &rows)?;
     let out = tree_schema();

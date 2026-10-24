@@ -263,8 +263,16 @@ impl Writers {
             self.closing.push(w.sink);
         }
         let mut out = Vec::with_capacity(self.closing.len());
-        for sink in std::mem::take(&mut self.closing) {
-            out.push(sink.finish().await?);
+        let mut sinks = std::mem::take(&mut self.closing).into_iter();
+        while let Some(sink) = sinks.next() {
+            match sink.finish().await {
+                Ok(s) => out.push(s),
+                Err(e) => {
+                    // The rest stay for `abort`, which waits for them before the cleanup (no late upload).
+                    self.closing.extend(sinks);
+                    return Err(e);
+                }
+            }
         }
         Ok(out)
     }

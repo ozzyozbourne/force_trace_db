@@ -98,9 +98,11 @@ path (`$.messages[*].content`); a concrete index (`[0]`) and phrases are re-chec
 index). The first 1 MiB of each field per span is indexed; the cut can split a token, and every path (index,
 memtable, re-check) sees the same split. Payloads moved to blob storage are not searchable in v1.
 
-Limits: a prefix that expands to more than 10,000 distinct terms within one source (one segment's dictionary, one
-segment without a usable index, or the memtable) fails the query with 400 `prefix too broad`, so the same prefix can
-succeed on a small data set and fail on a larger one. A segment without a usable sidecar (none, corrupt, or
+Limits: a prefix that expands to more than 10,000 distinct terms fails the query with 400 `prefix too broad`. It is
+counted the same way everywhere: per prefix term, per column, per source, where a source is one segment (its
+dictionary, or every cell it holds when it has no usable index) or the whole memtable, and all of the source's terms
+count, whether or not the rest of the query matches there. So a query gets the same answer before and after a flush,
+and the same prefix can succeed on a small data set and fail on a larger one. A segment without a usable sidecar (none, corrupt, or
 unreadable) is scanned instead (counted, one warning per query); the answer is the same. A term on a row without a
 start (an end post or patch in a newer segment) makes that segment unboundable for the newest-first early stop until
 compaction merges it. SQL `search` has no early stop; `/v1/search` is the fast path.
@@ -131,6 +133,13 @@ What E3 does not prove: 100 M spans and 1 TB (60× fewer spans, 8k-span L0s inst
 variance and bandwidth (the in-memory store returns 1 MB as fast as 1 KB); needle terms over a 30-day window (about
 ⌈segments/64⌉ × 1–2 round trips cold); non-ASCII memtable payloads (the memtable scan's pre-filter is ASCII-only);
 many concurrent queries.
+
+Known issues:
+- On stores without their own `get_ranges` (S3, GCS, Azure, HTTP), `object_store` merges posting reads less than
+  1 MiB apart with no size cap, so one sidecar read can exceed the 16 MiB per-request bound (cost and peak memory
+  only; review K6, not fixed: the S3 phase was cancelled).
+- `search`/`json_key_search` choose text or JSON semantics from the argument's field name: on a column alias that is
+  not pushed down (`SELECT name AS x … WHERE NOT search(x, 'a')`) the cell is treated as JSON (review N6).
 
 ## Compaction, retention and GC
 

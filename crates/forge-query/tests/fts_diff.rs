@@ -101,6 +101,7 @@ const T_F1: u64 = 1006; // "order a refund": not the phrase "refund order"
 const T_F2: u64 = 1007; // refund only in $.messages[1]
 const T_G: u64 = 1008; // single-source: refund in inputs, user u2 in metadata
 const T_H: u64 = 1009; // the only `zanzibar` hit of its segment is a start-less patch row (flush 1)
+const T_I: u64 = 1010; // refund in inputs (flush 12); metadata user u1 only in a start-less patch (flush 14)
 
 fn fts_layout(seed: u64) -> Layout {
     let mut r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
@@ -172,6 +173,15 @@ fn fts_layout(seed: u64) -> Layout {
     flushes[11].push(SpanRow {
         metadata: Some(r#"{"user":"u2"}"#.into()),
         ..start_post(T_G, 0, 11, 7, "refund")
+    });
+    // (i): the /v1/search json filter holds only across versions.
+    flushes[12].push(SpanRow {
+        metadata: Some(r#"{"user":"u2"}"#.into()),
+        ..start_post(T_I, 0, 12, 7, "refund")
+    });
+    flushes[14].push(SpanRow {
+        metadata: Some(r#"{"user":"u1"}"#.into()),
+        ..end_post(T_I, 0, 14, "done")
     });
     // (h): the start row is the newest start of all (in the OLDEST segment, without the term); the hit is the patch
     // in flush 1, whose max_start is old. 60 other `zanzibar` hits sit in the 8 newest hours.
@@ -700,6 +710,13 @@ async fn run(seed: u64, light: bool) -> Outcome {
             && oracle_search(v, FtsColumn::Inputs, "refund")
             && oracle_search(v, FtsColumn::Outputs, "order")
     });
+    let json_req = reqs().into_iter().find(|r| r.json.is_some()).unwrap();
+    assert!(
+        oracle_hits(&merged, &json_req, Variant::None)
+            .iter()
+            .any(|p| p.1 == tid(T_I)),
+        "precondition: (i) is a json-filter hit"
+    );
     // The shared matcher equals the oracle on every merged row (once per layout: the rows do not change).
     let an = &mut Analyzer::default();
     for p in preds() {

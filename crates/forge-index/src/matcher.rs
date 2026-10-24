@@ -127,14 +127,18 @@ impl Matcher {
         self.matches_inner(an, value, None).expect("no prefix counting")
     }
 
-    /// `matches`, adding every distinct key a prefix leaf expands to into `seen`: more than `MAX_PREFIX_TERMS` in
-    /// one source is the index's "prefix too broad" error (plans/phase-5 D13).
+    /// `matches`, adding every distinct key a prefix leaf expands to into `seen` (one `PrefixSeen` per matcher and
+    /// source; call it on every non-null cell of the source): more than `MAX_PREFIX_TERMS` for one prefix leaf in
+    /// one source is the index's "prefix too broad" error. The index counts the same keys: those of its dictionary,
+    /// per leaf and segment (plans/phase-5 D13).
     pub fn matches_counting(&self, an: &mut Analyzer, value: &str, seen: &mut PrefixSeen) -> IndexResult<bool> {
         self.matches_inner(an, value, Some(seen))
     }
 
     fn matches_inner(&self, an: &mut Analyzer, value: &str, mut seen: Option<&mut PrefixSeen>) -> IndexResult<bool> {
-        if self.query.groups.is_empty() || !self.may_match(value) {
+        // Counting reads every cell, as the index's dictionary holds the keys of every cell.
+        let may = self.may_match(value);
+        if self.query.groups.is_empty() || !may && (seen.is_none() || self.prefixes.is_empty()) {
             return Ok(false);
         }
         let full: Vec<u64> = self.query.groups.iter().map(|g| mask(g.len())).collect();
@@ -145,17 +149,20 @@ impl Matcher {
                     sat[g] |= bit;
                 }
             }
-            for (p, g, bit) in &self.prefixes {
+            for (pi, (p, g, bit)) in self.prefixes.iter().enumerate() {
                 if k.starts_with(p) {
                     sat[*g] |= bit;
                     if let Some(s) = seen.as_deref_mut() {
-                        s.add(k);
+                        s.add(pi, k);
                     }
                 }
             }
         });
         if seen.is_some_and(|s| s.too_broad()) {
             return Err(prefix_too_broad());
+        }
+        if !may {
+            return Ok(false);
         }
         let live: Vec<usize> = (0..full.len()).filter(|&g| sat[g] == full[g]).collect();
         if live.is_empty() {
@@ -233,18 +240,23 @@ impl Matcher {
     }
 }
 
-/// Distinct keys that prefix leaves expanded to in one source (a brute-forced segment, the memtable), capped.
-#[derive(Debug, Default)]
-pub struct PrefixSeen(std::collections::HashSet<Vec<u8>>);
+/// Per prefix leaf of one matcher: the distinct keys it expanded to in one source (a brute-forced segment, the
+/// memtable), capped.
+#[derive(Clone, Debug, Default)]
+pub struct PrefixSeen(Vec<std::collections::HashSet<Vec<u8>>>);
 
 impl PrefixSeen {
-    fn add(&mut self, k: &[u8]) {
-        if !self.too_broad() && !self.0.contains(k) {
-            self.0.insert(k.to_vec());
+    fn add(&mut self, leaf: usize, k: &[u8]) {
+        if self.0.len() <= leaf {
+            self.0.resize_with(leaf + 1, Default::default);
+        }
+        let s = &mut self.0[leaf];
+        if s.len() <= crate::read::MAX_PREFIX_TERMS && !s.contains(k) {
+            s.insert(k.to_vec());
         }
     }
     fn too_broad(&self) -> bool {
-        self.0.len() > crate::read::MAX_PREFIX_TERMS
+        self.0.iter().any(|s| s.len() > crate::read::MAX_PREFIX_TERMS)
     }
 }
 
@@ -650,6 +662,13 @@ mod tests {
                     } else {
                         prop_assert_eq!(&hits, &brute, "{:?}", p);
                     }
+                }
+                // The batched lookup answers each query as alone.
+                let ms: Vec<Matcher> = preds.iter().map(|p| Matcher::new(an, p).unwrap()).collect();
+                let qs: Vec<&crate::query::Query> = ms.iter().map(Matcher::query).collect();
+                let (many, _) = rt.block_on(f.execute_many(&qs, &fetch)).unwrap();
+                for (q, got) in qs.iter().zip(&many) {
+                    prop_assert_eq!(got, &rt.block_on(f.execute(q, &fetch)).unwrap().0);
                 }
             }
         }

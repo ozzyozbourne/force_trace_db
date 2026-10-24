@@ -246,7 +246,7 @@ fn roots_filter() -> vortex::expr::Expression {
 }
 
 /// `span_id IN spans` (a key column: allowed below the merge, invariant 4), for at most MAX_FILTER_SPANS ids.
-fn span_filter(spans: &BTreeSet<SpanId>) -> Option<vortex::expr::Expression> {
+pub(crate) fn span_filter(spans: &BTreeSet<SpanId>) -> Option<vortex::expr::Expression> {
     use vortex::buffer::ByteBuffer;
     use vortex::dtype::Nullability;
     use vortex::expr::{eq, lit, or};

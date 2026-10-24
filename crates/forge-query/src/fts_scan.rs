@@ -17,7 +17,7 @@ use forge_index::{
 };
 use forge_model::catalog::{SegmentId, SegmentMeta};
 use forge_model::ids::{ProjectId, SpanId, TraceId};
-use forge_model::merge::Cancel;
+use forge_model::merge::{Cancel, CancelOnDrop};
 use forge_model::row::span_keys;
 use forge_model::schema::{col, projected_schema};
 use forge_storage::RowSelection;
@@ -67,21 +67,29 @@ impl Unit {
         self.eval(an, cell, None).expect("no prefix counting")
     }
 
-    /// `matches` on a brute-forced source, counting prefix expansions (D13).
-    pub fn matches_counting(&self, an: &mut Analyzer, cell: &str, seen: &mut PrefixSeen) -> Result<bool, QueryError> {
+    /// `matches` on a brute-forced source, counting prefix expansions per predicate and leaf (D13): `seen` is this
+    /// unit's state for one source (one segment, or the memtable), fed every non-null cell of it.
+    pub fn matches_counting(
+        &self,
+        an: &mut Analyzer,
+        cell: &str,
+        seen: &mut Vec<PrefixSeen>,
+    ) -> Result<bool, QueryError> {
+        seen.resize_with(self.matchers.len(), Default::default);
         self.eval(an, cell, Some(seen))
     }
 
     /// Every predicate (no short-circuit: each one counts its prefix expansions), then the expression on them.
-    fn eval(&self, an: &mut Analyzer, cell: &str, mut seen: Option<&mut PrefixSeen>) -> Result<bool, QueryError> {
-        let bs = self
-            .matchers
-            .iter()
-            .map(|m| match seen.as_deref_mut() {
-                Some(s) => m.matches_counting(an, cell, s),
-                None => Ok(m.matches(an, cell)),
-            })
-            .collect::<Result<Vec<bool>, _>>()?;
+    fn eval(&self, an: &mut Analyzer, cell: &str, seen: Option<&mut Vec<PrefixSeen>>) -> Result<bool, QueryError> {
+        let bs = match seen {
+            Some(seen) => self
+                .matchers
+                .iter()
+                .zip(seen.iter_mut())
+                .map(|(m, s)| m.matches_counting(an, cell, s))
+                .collect::<Result<Vec<bool>, _>>()?,
+            None => self.matchers.iter().map(|m| m.matches(an, cell)).collect(),
+        };
         let mut bs = bs.into_iter();
         Ok(self.expr.fold(
             &mut |_| bs.next().expect("one per predicate"),
@@ -174,7 +182,7 @@ pub(crate) async fn brute(
     let req = scan_request(part, &cols.into_iter().collect::<Vec<_>>(), None);
     let mut stream = view.store().scan(&part.seg, req).await?;
     let res = MemoryConsumer::new("fts.brute").register(pool);
-    let mut state: Vec<(PrefixSeen, RoaringTreemap)> = which.iter().map(|_| Default::default()).collect();
+    let mut state: Vec<(Vec<PrefixSeen>, RoaringTreemap)> = which.iter().map(|_| Default::default()).collect();
     let mut row = part.rows.first_row();
     while let Some(b) = stream.try_next().await? {
         let (size, n) = (b.get_array_memory_size(), b.num_rows() as u64);
@@ -213,7 +221,7 @@ pub(crate) async fn lookup(
         Ok(FtsHits::NoIndex) => Ok((vec![None; units.len()], false)),
         Err(e @ IndexError::Query(_)) => Err(e),
         Err(e) => {
-            tracing::debug!(segment = %seg.id, error = %e, ".fts unusable; brute force");
+            tracing::warn!(segment = %seg.id, error = %e, ".fts unusable; brute force");
             Ok((vec![None; units.len()], false))
         }
     }
@@ -363,18 +371,23 @@ pub(crate) async fn select(
     let mem_cols: Vec<&'static str> = mem_cols.into_iter().collect();
     let (snap, mem_units) = (view.mem().clone(), units.clone());
     let mem = async {
+        // Dropping the query (timeout, error) stops the pass.
+        let cancel = Cancel::new();
+        let _guard = CancelOnDrop(cancel.clone());
         tokio::task::spawn_blocking(move || -> Result<_, QueryError> {
             let mut an = Analyzer::default();
             let mut per_unit: Vec<BTreeSet<Key>> = vec![BTreeSet::new(); mem_units.len()];
             let mut mem_traces: BTreeSet<TraceId> = BTreeSet::new();
-            let mut seen = PrefixSeen::default();
-            for b in mem_versions(&snap, &mk, &projected_schema(&mem_cols), &Cancel::never())? {
+            // One prefix count per unit and predicate: the memtable is one source (D13).
+            let mut seen: Vec<Vec<PrefixSeen>> = vec![Vec::new(); mem_units.len()];
+            for b in mem_versions(&snap, &mk, &projected_schema(&mem_cols), &cancel)? {
+                cancel.check()?;
                 let keys = span_keys(&b)?;
                 mem_traces.extend(keys.iter().map(|k| k.0));
                 for (ui, u) in mem_units.iter().enumerate() {
                     let c = b.column(b.schema().index_of(u.col.name())?).as_string::<i32>();
                     for (i, key) in keys.iter().enumerate() {
-                        if c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen)? {
+                        if c.is_valid(i) && u.matches_counting(&mut an, c.value(i), &mut seen[ui])? {
                             per_unit[ui].insert(*key);
                         }
                     }
@@ -387,21 +400,36 @@ pub(crate) async fn select(
 
     // Segments: index (or brute force) per unit; then, unless that already rules the index out, the keys of the
     // hit rows. A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
-    let bruted0 = counters.get().brute_parts;
-    let mut futs = Vec::with_capacity(parts.len());
-    for part in parts {
-        let units = &units;
-        futs.push(async move {
-            let (looked, _) = lookup(index, &part.seg, units).await?;
-            part_hits(view, pool, counters, part, units, looked).await
-        });
-    }
-    let segs = futures::stream::iter(futs)
-        .buffer_unordered(INDEX_CONCURRENCY)
-        .try_collect::<Vec<PartHits>>();
+    // One lookup per segment, however many parts of it there are.
+    let segs = async {
+        let mut seen = BTreeSet::new();
+        let mut futs = Vec::new();
+        for seg in parts.iter().map(|p| &p.seg).filter(|s| seen.insert(s.id)) {
+            let units = &units;
+            futs.push(async move { Ok::<_, QueryError>((seg.id, lookup(index, seg, units).await?.0)) });
+        }
+        let looked: HashMap<SegmentId, Vec<Option<RoaringTreemap>>> = futures::stream::iter(futs)
+            .buffer_unordered(INDEX_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut futs = Vec::with_capacity(parts.len());
+        for part in parts {
+            futs.push(part_hits(
+                view,
+                pool,
+                counters,
+                part,
+                &units,
+                looked[&part.seg.id].clone(),
+            ));
+        }
+        futures::stream::iter(futs)
+            .buffer_unordered(INDEX_CONCURRENCY)
+            .try_collect::<Vec<PartHits>>()
+            .await
+    };
     let ((mut per_unit, mem_traces), mut hits) = futures::try_join!(mem, segs)?;
-    // Other queries add to the counter too: the count is approximate when they overlap.
-    let n = counters.get().brute_parts.saturating_sub(bruted0);
+    let n = hits.iter().filter(|h| h.bruted).count();
     if n > 0 {
         tracing::warn!(project = %p, segments = n, "search: segments without a usable .fts were scanned by brute force");
     }
@@ -519,26 +547,34 @@ impl IndexReader for FtsIndexReader {
         let fetch = move |rs: Vec<std::ops::Range<u64>>| -> Fetch {
             let (store, loc, p) = (store.clone(), loc.clone(), loc.to_string());
             Box::pin(async move {
-                store.get_ranges(&loc, &rs).await.map_err(|e| IndexError::Corrupt {
-                    path: p,
-                    msg: e.to_string(),
+                // A missing file is a broken sidecar; anything else may be transient (both fall back, D4).
+                store.get_ranges(&loc, &rs).await.map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => IndexError::Corrupt {
+                        path: p,
+                        msg: e.to_string(),
+                    },
+                    e => IndexError::Io {
+                        path: p,
+                        msg: e.to_string(),
+                    },
                 })
             })
         };
-        // One open per segment, shared by concurrent lookups.
+        // One open per segment, shared by concurrent lookups; a file for another row count is not cached.
         let file = self
             .files
             .try_get_with(seg.id, async {
-                Ok::<_, IndexError>(Arc::new(FtsFile::open(&path, len, &fetch).await?.0))
+                let f = FtsFile::open(&path, len, &fetch).await?.0;
+                if u64::from(f.footer().num_rows) != seg.row_count {
+                    return Err(IndexError::Corrupt {
+                        path: path.clone(),
+                        msg: format!("{} rows, the segment has {}", f.footer().num_rows, seg.row_count),
+                    });
+                }
+                Ok(Arc::new(f))
             })
             .await
             .map_err(|e| (*e).clone())?;
-        if u64::from(file.footer().num_rows) != seg.row_count {
-            return Err(IndexError::Corrupt {
-                path,
-                msg: format!("{} rows, the segment has {}", file.footer().num_rows, seg.row_count),
-            });
-        }
         // Every predicate of every expression at once: one wave of FST blocks, one of postings (D1).
         let mut an = Analyzer::default();
         let ms: Vec<Vec<Matcher>> = exprs
@@ -565,5 +601,19 @@ impl IndexReader for FtsIndexReader {
                 .collect(),
             start_less,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tree;
+
+    /// The >100k fallback bound: AND has no lower bound, OR the largest child's.
+    #[test]
+    fn min_keys_is_a_lower_bound() {
+        let or = || Tree::Or(vec![Tree::Unit(0), Tree::Unit(1)]);
+        assert_eq!(Tree::And(vec![Tree::Unit(0), Tree::Unit(1)]).min_keys(&[200_000, 3]), 0);
+        assert_eq!(or().min_keys(&[200_000, 3]), 200_000);
+        assert_eq!(Tree::And(vec![or(), Tree::Unit(2)]).min_keys(&[200_000, 3, 1]), 0);
     }
 }

@@ -443,3 +443,72 @@ async fn search_single_source_reads_no_payload() {
     );
     assert_eq!(fx.engine.fts_counters().exact_rows, 1);
 }
+
+/// D13 counts per prefix term, column and source, over every term of the source: `w* x*` (6,000 terms each, 12,000
+/// together) passes and `w* zebracorn` (10,100 `w` terms, no `zebracorn` anywhere) fails, the same way on an
+/// indexed segment, a brute-forced one and the memtable (so a flush does not change the answer).
+#[tokio::test]
+async fn prefix_limit_counts_the_same_in_every_source() {
+    use forge_model::error::{Classify, ErrorKind};
+    let rows = |prefixes: &[&str], n: u64| -> Vec<SpanRow> {
+        (0..n)
+            .map(|i| {
+                let words: Vec<String> = prefixes
+                    .iter()
+                    .flat_map(|p| (0..100).map(move |j| format!("{p}{}", i * 100 + j)))
+                    .collect();
+                row(1, i, Some(&serde_json::json!({ "q": words.join(" ") }).to_string()))
+            })
+            .collect()
+    };
+    for (what, q, rs, ok) in [
+        ("two prefixes", "w* x*", rows(&["w", "x"], 60), true),
+        ("dead group", "w* zebracorn", rows(&["w"], 101), false),
+    ] {
+        for (source, seg, mem, hide) in [
+            ("indexed segment", rs.clone(), vec![], false),
+            ("brute-forced segment", rs.clone(), vec![], true),
+            ("memtable", vec![], rs.clone(), false),
+        ] {
+            let e = small_engine(seg, mem, hide, QueryConfig::default()).await;
+            let sql = format!("SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, '{q}')");
+            let (a, b) = (e.sql_batches(&sql).await, e.search(&search_req(q)).await);
+            if ok {
+                assert!(
+                    a.is_ok() && b.is_ok(),
+                    "{what} on {source}: {:?} {:?}",
+                    a.err(),
+                    b.err()
+                );
+            } else {
+                for err in [a.expect_err("SQL 400"), b.err().expect("search 400")] {
+                    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{what} on {source}: {err}");
+                    assert!(
+                        err.to_string().contains("prefix too broad"),
+                        "{what} on {source}: {err}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `/v1/search` with more single-source hits in one segment than a page: verify reads those rows itself.
+#[tokio::test]
+async fn search_many_single_source_hits_in_one_segment() {
+    let rows: Vec<SpanRow> = (1..=2_100u64).map(|i| row(i, i, Some(r#"{"q":"needle"}"#))).collect();
+    let e = small_engine(rows, vec![], false, QueryConfig::default()).await;
+    let req = |cursor| {
+        let body = forge_query::search::SearchBody {
+            q: "needle".into(),
+            columns: Some(vec!["inputs".into()]),
+            limit: Some(1000),
+            cursor,
+            ..Default::default()
+        };
+        forge_query::search::SearchRequest::parse(body, pid("p")).unwrap()
+    };
+    let pages = forge_query::testing::search_pages(&e, req, 4).await;
+    assert_eq!(pages.iter().map(|p| p.rows.num_rows()).sum::<usize>(), 2_100);
+    assert_eq!(e.fts_counters().brute_parts, 0);
+}
