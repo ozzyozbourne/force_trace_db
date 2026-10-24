@@ -144,7 +144,8 @@ impl Classify for QueryError {
 }
 
 /// Test hook: runs on the blocking pool with the task's label and `Cancel`, before the blocking work. Labels:
-/// `trace.mem`, `trace` (merge, tree, finish), `runs.mem`, `runs.candidates`, `runs.verify`, `runs.json`.
+/// `trace.mem`, `trace` (merge, tree, finish), `runs.mem`, `runs.candidates`, `runs.verify`, `runs.json`,
+/// `trace_tree`.
 #[cfg(any(test, feature = "test-util"))]
 pub type BlockingHook = Arc<dyn Fn(&str, &Cancel) + Send + Sync>;
 

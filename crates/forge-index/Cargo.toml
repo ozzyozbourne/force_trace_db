@@ -21,7 +21,7 @@ tantivy.workspace = true
 bytes.workspace = true
 crc32fast.workspace = true
 foldhash.workspace = true
-aho-corasick.workspace = true
+memchr.workspace = true
 futures.workspace = true
 
 [dev-dependencies]

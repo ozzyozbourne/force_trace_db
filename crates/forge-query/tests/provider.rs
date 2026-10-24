@@ -531,7 +531,7 @@ async fn dropped_trace_future_cancels() {
     let mut fx = Fixture::build(big_trace(300, 2, 50, 64, 3), Traps::default(), QueryConfig::default()).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Cancel)>();
     fx.engine.blocking_hook = Some(Arc::new(move |label: &str, c: &Cancel| {
-        if label != "trace" && label != "runs.json" {
+        if !["trace", "runs.json", "trace_tree"].contains(&label) {
             return;
         }
         tx.send((label.to_string(), c.clone())).unwrap();
@@ -542,11 +542,13 @@ async fn dropped_trace_future_cancels() {
     }));
     let req = treq("big", tid(999), true, TraceFormat::Tree);
     let runs = runs_request("big");
-    let futs: [std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, QueryError>> + Send + '_>>; 2] = [
+    let tree_sql = format!("SELECT span_id FROM trace_tree('{}')", tid(999));
+    let futs: [std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, QueryError>> + Send + '_>>; 3] = [
         Box::pin(fx.engine.trace_json(&req)),
         Box::pin(fx.engine.runs_json(&runs)),
+        Box::pin(async { fx.engine.sql_batches(&tree_sql).await.map(|_| Vec::new()) }),
     ];
-    for (want, mut fut) in ["trace", "runs.json"].into_iter().zip(futs) {
+    for (want, mut fut) in ["trace", "runs.json", "trace_tree"].into_iter().zip(futs) {
         let (label, c) = tokio::select! {
             r = &mut fut => panic!("{want}: finished before the blocking phase: {:?}", r.map(|b| b.len())),
             c = rx.recv() => c.unwrap(),
@@ -675,6 +677,23 @@ async fn fast_path_memory_covers_merged_output() {
     let ok = engine(None);
     assert!(ok.trace_json(&trace).await.unwrap().len() > 60_000);
     assert_eq!(ok.list_runs(&runs).await.unwrap().rows.num_rows(), 300);
+    // trace_tree (SQL) charges the same pool: its merged rows do not fit either.
+    let tree_sql = format!("SELECT span_id FROM trace_tree('{}', 'm')", tid(7));
+    let tight = engine(Some(input(&trace_cols(true)) as u64 + 1024));
+    let e = tight
+        .sql_batches(&tree_sql)
+        .await
+        .expect_err("trace_tree over the limit");
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+    assert!(e.message().contains("memory limit"), "{}", e.message());
+    let n: usize = engine(None)
+        .sql_batches(&tree_sql)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n, 300);
 }
 
 /// `max_response_bytes` with large rows (~4 KB of `inputs` each): the body passes the cap by at most one row

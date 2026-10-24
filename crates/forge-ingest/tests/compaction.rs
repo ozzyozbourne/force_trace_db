@@ -511,6 +511,8 @@ async fn time_ordered_disjoint_l0s_keep_hours_bounded() {
 struct DetachedPuts {
     inner: Arc<dyn object_store::ObjectStore>,
     delay: std::time::Duration,
+    /// The next `.vortex` put fails (after 50 ms) instead.
+    fail_next: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Display for DetachedPuts {
@@ -527,6 +529,13 @@ impl object_store::ObjectStore for DetachedPuts {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
+        if location.as_ref().ends_with(".vortex") && self.fail_next.swap(false, Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "injected put failure".into(),
+            });
+        }
         let (inner, location, delay) = (self.inner.clone(), location.clone(), self.delay);
         let write = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -583,6 +592,7 @@ async fn failed_job_leaves_no_late_upload() {
     let os: Arc<dyn object_store::ObjectStore> = Arc::new(DetachedPuts {
         inner: Arc::new(object_store::memory::InMemory::new()),
         delay: std::time::Duration::from_millis(300),
+        fail_next: Default::default(),
     });
     let mut w = W {
         meta: Arc::new(SqliteMetastore::open_in_memory().unwrap()),
@@ -629,6 +639,49 @@ async fn failed_job_leaves_no_late_upload() {
     assert!(writes.load(Ordering::SeqCst) >= 2);
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let l1_objects: Vec<_> = os
+        .list(Some(&object_store::path::Path::from("segments/p/L1")))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(l1_objects.is_empty(), "uploads left: {l1_objects:?}");
+}
+
+/// N4: the first output's upload fails in `finish` while the later outputs still upload; the job waits for them
+/// before deleting, so none lands afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_finish_leaves_no_late_upload() {
+    let os = Arc::new(DetachedPuts {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        delay: std::time::Duration::from_millis(300),
+        fail_next: Default::default(),
+    });
+    let mut w = W {
+        meta: Arc::new(SqliteMetastore::open_in_memory().unwrap()),
+        store: Arc::new(forge_storage::VortexSegmentStore::new(forge_storage::BuiltStore {
+            store: os.clone(),
+            local_root: None,
+        })),
+        seq: 0,
+    };
+    let rows: Vec<SpanRow> = (0..20)
+        .map(|t| SpanRow {
+            start_time_ns: Some(at(0, t as i64)),
+            inputs: Some("z".repeat(3000)),
+            ..row(t, 1, t + 1)
+        })
+        .collect();
+    let l0 = w.flush(&rows).await;
+    os.fail_next.store(true, Ordering::SeqCst);
+    let cx = w.cx(CompactionConfig {
+        target_segment: bytesize::ByteSize::kib(8),
+        slice_bytes: bytesize::ByteSize::kib(1),
+        ..Default::default()
+    });
+    let j = w.begin(JobKind::L0, vec![l0]).await;
+    let err = job::run_job(&cx, j).await.unwrap_err();
+    assert!(err.to_string().contains("injected put failure"), "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let l1_objects: Vec<_> = (os as Arc<dyn object_store::ObjectStore>)
         .list(Some(&object_store::path::Path::from("segments/p/L1")))
         .try_collect()
         .await

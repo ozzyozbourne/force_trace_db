@@ -2350,7 +2350,6 @@ dependencies = [
 name = "forge-index"
 version = "0.1.0"
 dependencies = [
- "aho-corasick",
  "arrow",
  "async-trait",
  "bytes",
@@ -2359,6 +2358,7 @@ dependencies = [
  "forge-model",
  "fst",
  "futures",
+ "memchr",
  "proptest",
  "roaring",
  "serde_json",

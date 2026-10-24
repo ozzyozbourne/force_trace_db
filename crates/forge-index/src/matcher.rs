@@ -6,10 +6,8 @@
 use crate::analyzer::{Analyzer, Cell, Node, key_token, normalize_path};
 use crate::query::{GroupSpec, Leaf, Query, compile, json_path, json_query, parse};
 use crate::{FtsColumn, FtsExpr, FtsPredicate, IndexError, IndexResult};
+use memchr::memmem::Finder;
 use std::collections::HashMap;
-
-/// A `must` token that never occurs (see `Matcher::must`).
-const NEVER: usize = usize::MAX;
 
 /// Leaves per AND group (a u64 mask per group).
 pub(crate) const MAX_GROUP_TERMS: usize = 64;
@@ -26,11 +24,11 @@ pub struct Matcher {
     /// json_key_search: the `[*]` path and one step per `[*]` (Some(n) = concrete index). Empty text: `exists`.
     path: Option<(String, Vec<Option<u32>>)>,
     exists: bool,
-    /// Per group: ids (in `must_ac`) of tokens that must occur in an ASCII cell lowercased (sound pre-filter, see
-    /// `may_match`). `NEVER`: a token with an ASCII uppercase letter, never a substring of a lowercased cell.
-    must: Vec<Vec<usize>>,
-    /// Case-insensitive search for the `must` tokens (None: no token to look for).
-    must_ac: Option<aho_corasick::AhoCorasick>,
+    /// Per group: tokens that must occur in an ASCII cell lowercased (sound pre-filter, see `may_match`).
+    must: Vec<Vec<Finder<'static>>>,
+    /// The prefix terms' texts, one of which a cell must contain for a prefix leaf to expand there (`may_expand`;
+    /// None: some prefix text cannot be pre-filtered).
+    prefix_texts: Option<Vec<Finder<'static>>>,
 }
 
 impl Matcher {
@@ -67,33 +65,22 @@ impl Matcher {
                 }
             }
         }
-        let mut patterns: Vec<&str> = Vec::new();
+        let filterable = |t: &str| t.is_ascii() && t.bytes().any(|b| !b.is_ascii_digit() && b != b'e');
         let must = groups
             .iter()
             .map(|g| {
                 g.terms
                     .iter()
-                    .filter(|(t, _)| t.is_ascii() && t.bytes().any(|b| !b.is_ascii_digit() && b != b'e'))
-                    .map(|(t, _)| {
-                        if t.bytes().any(|b| b.is_ascii_uppercase()) {
-                            return NEVER;
-                        }
-                        patterns.iter().position(|p| p == t).unwrap_or_else(|| {
-                            patterns.push(t);
-                            patterns.len() - 1
-                        })
-                    })
+                    .filter(|(t, _)| filterable(t))
+                    .map(|(t, _)| Finder::new(t).into_owned())
                     .collect()
             })
             .collect();
-        let must_ac = (!patterns.is_empty())
-            .then(|| {
-                aho_corasick::AhoCorasick::builder()
-                    .ascii_case_insensitive(true)
-                    .build(&patterns)
-            })
-            .transpose()
-            .map_err(|e| IndexError::Query(e.to_string()))?;
+        let prefix_texts = groups
+            .iter()
+            .flat_map(|g| g.terms.iter().filter(|(_, prefix)| *prefix))
+            .map(|(t, _)| filterable(t).then(|| Finder::new(t).into_owned()))
+            .collect();
         Ok(Self {
             col,
             query,
@@ -103,7 +90,7 @@ impl Matcher {
             path,
             exists,
             must,
-            must_ac,
+            prefix_texts,
         })
     }
 
@@ -136,9 +123,12 @@ impl Matcher {
     }
 
     fn matches_inner(&self, an: &mut Analyzer, value: &str, mut seen: Option<&mut PrefixSeen>) -> IndexResult<bool> {
-        // Counting reads every cell, as the index's dictionary holds the keys of every cell.
+        // Counting reads every cell a prefix leaf may expand in, as the index's dictionary holds the keys of every
+        // cell.
         let may = self.may_match(value);
-        if self.query.groups.is_empty() || !may && (seen.is_none() || self.prefixes.is_empty()) {
+        if self.query.groups.is_empty()
+            || !may && (seen.is_none() || self.prefixes.is_empty() || !self.may_expand(value))
+        {
             return Ok(false);
         }
         let full: Vec<u64> = self.query.groups.iter().map(|g| mask(g.len())).collect();
@@ -179,21 +169,19 @@ impl Matcher {
     /// (escapes decode to non-alphanumerics, lowercasing and folding are ASCII-only). So a group with a term holding
     /// any other character, missing from the cell, cannot match.
     fn may_match(&self, value: &str) -> bool {
-        if !value.is_ascii() || value.contains("\\u") || self.must.iter().any(Vec::is_empty) {
-            return true;
-        }
-        // One pass over the cell, without a lowercased copy: a lowercase token occurs in the lowercased ASCII cell
-        // exactly when it occurs in the cell ignoring ASCII case.
-        let mut found = Vec::new();
-        if let Some(ac) = &self.must_ac {
-            found.resize(ac.patterns_len(), false);
-            for m in ac.find_overlapping_iter(value) {
-                found[m.pattern().as_usize()] = true;
-            }
-        }
-        self.must
-            .iter()
-            .any(|ids| ids.iter().all(|&i| found.get(i).copied().unwrap_or(false)))
+        self.must.iter().any(Vec::is_empty)
+            || in_lowercase(value, |l| {
+                self.must.iter().any(|terms| terms.iter().all(|t| t.find(l).is_some()))
+            })
+    }
+
+    /// Sound pre-filter for prefix counting, by the same argument: a key a prefix leaf expands to comes from a
+    /// token that starts with the prefix's text, so an ASCII cell without `\u` that contains none of the texts adds
+    /// no key.
+    fn may_expand(&self, value: &str) -> bool {
+        self.prefix_texts
+            .as_ref()
+            .is_none_or(|ts| in_lowercase(value, |l| ts.iter().any(|t| t.find(l).is_some())))
     }
 
     /// Re-checks the key-level survivors on the cell's token runs (one per leaf, or the text).
@@ -238,6 +226,15 @@ impl Matcher {
                 .all(|ph| runs.iter().any(|r| r.windows(ph.len()).any(|w| w == ph.as_slice())))
         })
     }
+}
+
+/// `f` on the lowercased cell, or true when the cell is not pre-filterable (non-ASCII, or `\u` escapes). Substring
+/// search with `memmem` (a case-insensitive aho-corasick was several times slower on tokens of common letters).
+fn in_lowercase(value: &str, f: impl FnOnce(&[u8]) -> bool) -> bool {
+    if !value.is_ascii() || memchr::memmem::find(value.as_bytes(), b"\\u").is_some() {
+        return true;
+    }
+    f(value.to_ascii_lowercase().as_bytes())
 }
 
 /// Per prefix leaf of one matcher: the distinct keys it expanded to in one source (a brute-forced segment, the

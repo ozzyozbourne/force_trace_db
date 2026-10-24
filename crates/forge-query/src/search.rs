@@ -202,7 +202,8 @@ struct FtsSource<'a> {
     /// One index lookup per segment, shared by concurrent callers (`start`, `prefetch`, `segments`).
     lookups: moka::future::Cache<SegmentId, Arc<Hits>>,
     /// Per segment: its hit rows (ascending) and their RUN_COLUMNS, when at most a page of them (verify takes its
-    /// single-source rows from here instead of reading them again), charged to the call's pool.
+    /// single-source rows from here instead of reading them again), charged to the call's pool until verify takes
+    /// them.
     hit_rows: Mutex<HashMap<SegmentId, Arc<(RoaringTreemap, RecordBatch, MemoryReservation)>>>,
     /// Traces with memtable rows in the snapshot (D11).
     mem_traces: Mutex<BTreeSet<TraceId>>,
@@ -467,15 +468,16 @@ impl CandidateSource for FtsSource<'_> {
             .copied()
             .filter(|c| wide.contains(c))
             .collect();
-        // Single-source rows already read by `part` are taken from there; the others are read now.
+        // Single-source rows already read by `part` are taken from there (and the entry freed: a later wave reads
+        // its rows again); the others are read now.
         let (mut exact, mut unread) = (Vec::new(), Vec::new());
         {
-            let memo = self.hit_rows.lock().expect("poisoned");
+            let mut memo = self.hit_rows.lock().expect("poisoned");
             for p in exact_parts {
                 let RowSelection::Rows(rows) = &p.rows else {
                     unreachable!("exact parts are Rows")
                 };
-                match memo.get(&p.seg.id) {
+                match memo.remove(&p.seg.id) {
                     Some(m) if rows.is_subset(&m.0) => {
                         let idx: UInt32Array = rows.iter().map(|r| (m.0.rank(r) - 1) as u32).collect();
                         exact.push(take_record_batch(&m.1, &idx)?);
@@ -502,7 +504,7 @@ impl CandidateSource for FtsSource<'_> {
             let wide_schema = projected_schema(&wide);
             let mut an = Analyzer::default();
             // Single-source rows: the index answer is the answer (tombstones still dropped).
-            let ex: Vec<RecordBatch> = exact.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
+            let ex_in: Vec<RecordBatch> = exact.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
             // The rest: every version, merged, re-checked on the merged cells.
             let mut batches: Vec<RecordBatch> = merged.into_iter().map(|b| kf.apply(b)).collect::<Result<_, _>>()?;
             let mem = mem_versions(&snap, &mk, &wide_schema, cancel)?;
@@ -511,11 +513,11 @@ impl CandidateSource for FtsSource<'_> {
             // Charged like runs: the inputs, then the merged rows, then the page.
             let size = |bs: &[RecordBatch]| bs.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
             let kept = res.size();
-            res.try_grow(size(&ex) + size(&batches))?;
-            let ex = merge_or_filter(&out_schema, &ex, false, cancel)?;
+            res.try_grow(size(&ex_in) + size(&batches))?;
+            let ex = merge_or_filter(&out_schema, &ex_in, false, cancel)?;
             let m = merge_or_filter(&wide_schema, &batches, merge, cancel)?;
             res.try_grow(ex.get_array_memory_size() + m.get_array_memory_size())?;
-            drop(batches);
+            drop((ex_in, batches));
             res.resize(kept + ex.get_array_memory_size() + m.get_array_memory_size());
             let s = m.schema_ref();
             let cells: Vec<&StringArray> = units

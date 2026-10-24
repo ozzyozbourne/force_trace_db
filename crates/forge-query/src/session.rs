@@ -47,6 +47,8 @@ impl QueryEngine {
                 meta: self.meta.clone(),
                 store: self.store.clone(),
                 mem: self.mem.clone(),
+                #[cfg(any(test, feature = "test-util"))]
+                hook: fts::TreeHook(self.blocking_hook.clone()),
             }),
         );
         Ok(ctx)

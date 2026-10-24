@@ -512,3 +512,157 @@ async fn search_many_single_source_hits_in_one_segment() {
     assert_eq!(pages.iter().map(|p| p.rows.num_rows()).sum::<usize>(), 2_100);
     assert_eq!(e.fts_counters().brute_parts, 0);
 }
+
+/// D15 on `/v1/search`: verify charges its inputs, the merged rows and the page to the call's pool. Under a limit
+/// the page fits (3 x the hits' run columns) but their merged rows (~4 KB of `inputs` each) do not: the search is a
+/// 400 "memory limit"; the default limit returns every hit.
+#[tokio::test]
+async fn search_verify_is_charged_to_the_pool() {
+    use forge_model::error::{Classify, ErrorKind};
+    use forge_model::schema::{project_to, projected_schema};
+    let rows: Vec<SpanRow> = (0..300u64)
+        .map(|i| row(i, i, Some(&format!("{{\"q\":\"needle {}\"}}", "y".repeat(4000)))))
+        .collect();
+    let run_cols = project_to(
+        &batch_from_rows(&rows),
+        &projected_schema(&forge_query::runs::RUN_COLUMNS),
+    )
+    .unwrap()
+    .get_array_memory_size();
+    let req = || {
+        let body = forge_query::search::SearchBody {
+            q: "needle".into(),
+            columns: Some(vec!["inputs".into()]),
+            limit: Some(300),
+            ..Default::default()
+        };
+        forge_query::search::SearchRequest::parse(body, pid("p")).unwrap()
+    };
+    let tight = QueryConfig {
+        memory_limit: bytesize::ByteSize::b(3 * run_cols as u64),
+        ..QueryConfig::default()
+    };
+    let e = small_engine(vec![], rows.clone(), false, tight).await;
+    let err = e.search(&req()).await.err().expect("over the limit");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    assert!(err.message().contains("memory limit"), "{}", err.message());
+    let e = small_engine(vec![], rows, false, QueryConfig::default()).await;
+    assert_eq!(e.search(&req()).await.unwrap().rows.num_rows(), 300);
+}
+
+/// K3 / D4: a `.fts` read that fails with a store error other than NotFound (throttling, a timeout) falls back to
+/// brute force like a corrupt sidecar: same answer, no error.
+#[tokio::test]
+async fn fts_read_error_falls_back_to_brute_force() {
+    let fx = fixture().await;
+    let os = Arc::new(forge_storage::testing::LatencyStore::new(fx.store.object_store()));
+    os.fail_ranges.store(true, std::sync::atomic::Ordering::Relaxed);
+    let e = QueryEngine::new(
+        fx.meta.clone(),
+        fx.store.clone(),
+        fx.mem.clone(),
+        QueryConfig::default(),
+    )
+    .with_index(Arc::new(HidingIndexReader::new(os)));
+    let q = "SELECT name FROM spans WHERE project_id = 'p' AND search(inputs, 'refund')";
+    assert_eq!(names(&e, q).await, names(&fx.engine, q).await);
+    let (got, want) = (
+        e.search(&search_req("refund")).await,
+        fx.engine.search(&search_req("refund")).await,
+    );
+    assert_eq!(got.unwrap().rows, want.unwrap().rows);
+    assert_eq!(e.fts_counters().index_parts, 0);
+}
+
+/// D13 counts per column: `w*` with the same 6,000 terms in `inputs` and in `outputs` (12,000 keys together) passes
+/// on every source, through SQL and `/v1/search` over both columns.
+#[tokio::test]
+async fn prefix_limit_counts_per_column() {
+    let rows: Vec<SpanRow> = (0..60u64)
+        .map(|i| {
+            let words: Vec<String> = (0..100).map(|j| format!("w{}", i * 100 + j)).collect();
+            let text = serde_json::json!({ "q": words.join(" ") }).to_string();
+            SpanRow {
+                outputs: Some(text.clone()),
+                ..row(1, i, Some(&text))
+            }
+        })
+        .collect();
+    for (source, seg, mem, hide) in [
+        ("indexed segment", rows.clone(), vec![], false),
+        ("brute-forced segment", rows.clone(), vec![], true),
+        ("memtable", vec![], rows.clone(), false),
+    ] {
+        let e = small_engine(seg, mem, hide, QueryConfig::default()).await;
+        let sql = "SELECT name FROM spans WHERE project_id = 'p' AND (search(inputs, 'w*') OR search(outputs, 'w*'))";
+        let body = forge_query::search::SearchBody {
+            q: "w*".into(),
+            columns: Some(vec!["inputs".into(), "outputs".into()]),
+            ..Default::default()
+        };
+        let req = forge_query::search::SearchRequest::parse(body, pid("p")).unwrap();
+        let (a, b) = (e.sql_batches(sql).await, e.search(&req).await);
+        assert!(a.is_ok() && b.is_ok(), "{source}: {:?} {:?}", a.err(), b.err());
+    }
+}
+
+/// N2: a lookahead lookup that fails (an older segment where `w*` is too broad) fails the call only if the page
+/// reads that segment: limit 1 is answered by the newest segment; limit 1000 reads the old one (400).
+#[tokio::test]
+async fn failed_lookahead_lookup_fails_only_a_page_that_reads_it() {
+    use forge_model::error::{Classify, ErrorKind};
+    let meta: Arc<dyn Metastore> = Arc::new(forge_meta::SqliteMetastore::open_in_memory().unwrap());
+    let store = memory_store();
+    let mut old: Vec<SpanRow> = (0..101u64)
+        .map(|i| {
+            let words: Vec<String> = (0..100).map(|j| format!("w{}", i * 100 + j)).collect();
+            row(1, i, Some(&serde_json::json!({ "q": words.join(" ") }).to_string()))
+        })
+        .collect();
+    let mut new: Vec<SpanRow> = (0..5u64).map(|i| row(2, 1_000 + i, Some(r#"{"q":"w1 w2"}"#))).collect();
+    stamp_versions(old.iter_mut().chain(&mut new));
+    let hour = |i: usize| HourBucket::from_nanos(BASE + i as i64 * 3_600_000_000_000);
+    write_flushes(&*meta, store.clone(), &[old, new], hour, "t", 1 << 20).await;
+    let mem: Arc<dyn MemtableView> = Arc::new(FixedMemtable(vec![]));
+    let idx = Arc::new(HidingIndexReader::new(store.object_store()));
+    let e = QueryEngine::new(meta, store, mem, QueryConfig::default())
+        .with_index(idx)
+        .with_search_sizes(1, 8);
+    let req = |limit| {
+        let body = forge_query::search::SearchBody {
+            q: "w*".into(),
+            columns: Some(vec!["inputs".into()]),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        forge_query::search::SearchRequest::parse(body, pid("p")).unwrap()
+    };
+    assert_eq!(e.search(&req(1)).await.unwrap().rows.num_rows(), 1);
+    let err = e.search(&req(1000)).await.err().expect("reads the broad segment");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+}
+
+/// `part` reads a segment's hit rows wide (RUN_COLUMNS, reused by verify) exactly when it has at most `limit` of
+/// them (100 single-source `filler` hits in one segment); more is a narrow read (key and start only).
+#[tokio::test]
+async fn search_reads_hits_wide_up_to_a_page() {
+    let fx = fixture().await;
+    let narrow = ["trace_id", "span_id", "start_time"];
+    for (limit, wide) in [(100, true), (99, false)] {
+        let body = forge_query::search::SearchBody {
+            q: "filler".into(),
+            columns: Some(vec!["inputs".into()]),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        let req = forge_query::search::SearchRequest::parse(body, pid("p")).unwrap();
+        fx.store.take_projections();
+        assert_eq!(fx.engine.search(&req).await.unwrap().rows.num_rows(), limit);
+        let read = fx.store.take_projections();
+        assert_eq!(
+            read.iter().any(|p| p[..] == narrow[..]),
+            !wide,
+            "limit {limit}: {read:?}"
+        );
+    }
+}

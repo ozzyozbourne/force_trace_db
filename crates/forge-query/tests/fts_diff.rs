@@ -479,7 +479,9 @@ impl Fx {
         if hidden { e.with_index(self.hide.clone()) } else { e }
     }
 
-    async fn compact(&self) {
+    /// Whether the posting cap rotated an output (it trips at batch boundaries on a count that lags up to 4 batches,
+    /// so a layout near the cap rotates on some runs only: a coverage fact, not a per-run precondition).
+    async fn compact(&self) -> bool {
         let mut cx = CompactCtx::new(
             self.meta.clone(),
             self.store.clone(),
@@ -492,7 +494,6 @@ impl Fx {
         let s = compact_project(&cx, &pid("s")).await.unwrap();
         assert!(s.failed.is_empty() && !s.capped, "{s:?}");
         let rotated: u32 = s.jobs.iter().map(|j| j.stats.rotated).sum();
-        assert!(rotated > 0, "precondition: the posting cap rotated outputs");
         let o = GcOptions {
             gc_grace: Duration::ZERO,
             orphan_grace: Duration::ZERO,
@@ -519,6 +520,7 @@ impl Fx {
             per_hour.values().any(|n| *n > 1),
             "precondition: several L1s in one hour"
         );
+        rotated > 0
     }
 }
 
@@ -682,6 +684,7 @@ struct Outcome {
     cover: Vec<(bool, bool)>,
     counters: FtsCountersSnapshot,
     cross_source_and: bool,
+    rotated: bool,
 }
 
 /// One layout: SQL and search checks before and after compact + gc. `light` (the random cases): one engine size,
@@ -728,9 +731,10 @@ async fn run(seed: u64, light: bool) -> Outcome {
     }
     let mut cover = vec![(false, false); preds().len()];
     let mut counters = FtsCountersSnapshot::default();
+    let mut rotated = false;
     for phase in ["L0", "L1"] {
         if phase == "L1" {
-            fx.compact().await;
+            rotated = fx.compact().await;
         }
         fx.hide_third(seed).await;
         let ctx = format!("seed {seed} {phase}");
@@ -820,6 +824,7 @@ async fn run(seed: u64, light: bool) -> Outcome {
         cover,
         counters,
         cross_source_and,
+        rotated,
     }
 }
 
@@ -830,6 +835,10 @@ fn assert_coverage(outs: &[Outcome]) {
         "{total:?}"
     );
     assert!(outs.iter().any(|o| o.cross_source_and), "(e) holds for some seed");
+    assert!(
+        outs.iter().any(|o| o.rotated),
+        "precondition: the posting cap rotated outputs"
+    );
     for (i, p) in preds().iter().enumerate() {
         assert!(outs.iter().any(|o| o.cover[i].0), "{p:?} is empty for every seed");
         assert!(outs.iter().any(|o| o.cover[i].1), "{p:?} holds on every row");

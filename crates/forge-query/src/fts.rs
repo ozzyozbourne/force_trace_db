@@ -210,6 +210,20 @@ pub(crate) struct TraceTreeFunc {
     pub meta: Arc<dyn Metastore>,
     pub store: Arc<dyn SegmentStore>,
     pub mem: Arc<dyn MemtableView>,
+    #[cfg(any(test, feature = "test-util"))]
+    pub hook: TreeHook,
+}
+
+/// The engine's blocking hook, for trace_tree's blocking task (label `trace_tree`).
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Default)]
+pub(crate) struct TreeHook(pub Option<crate::BlockingHook>);
+
+#[cfg(any(test, feature = "test-util"))]
+impl std::fmt::Debug for TreeHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TreeHook")
+    }
 }
 
 fn tree_schema() -> SchemaRef {
@@ -249,6 +263,8 @@ impl TableFunctionImpl for TraceTreeFunc {
             mem: self.mem.clone(),
             trace,
             project,
+            #[cfg(any(test, feature = "test-util"))]
+            hook: self.hook.clone(),
         }))
     }
 }
@@ -260,6 +276,8 @@ struct TraceTreeProvider {
     mem: Arc<dyn MemtableView>,
     trace: TraceId,
     project: Option<ProjectId>,
+    #[cfg(any(test, feature = "test-util"))]
+    hook: TreeHook,
 }
 
 #[async_trait]
@@ -305,7 +323,13 @@ impl TableProvider for TraceTreeProvider {
         drop(view);
         let cancel = Cancel::new();
         let _guard = CancelOnDrop(cancel.clone());
+        #[cfg(any(test, feature = "test-util"))]
+        let hook = self.hook.0.clone();
         let out = tokio::task::spawn_blocking(move || -> Result<RecordBatch, QueryError> {
+            #[cfg(any(test, feature = "test-util"))]
+            if let Some(h) = hook {
+                h("trace_tree", &cancel);
+            }
             let mut batches = batches;
             let mem = crate::read::mem_versions(&snap, &k, &schema, &cancel)?;
             res.try_grow(mem.iter().map(|b| b.get_array_memory_size()).sum())?;
@@ -339,6 +363,7 @@ fn tree_batch(
     let m = merge_or_filter(schema, &batches, merge, cancel)?;
     res.try_grow(m.get_array_memory_size())?;
     drop(batches);
+    res.resize(m.get_array_memory_size());
     let projects: BTreeSet<&str> = {
         let p = m.column(m.schema().index_of(col::PROJECT_ID)?);
         let p = p.as_any().downcast_ref::<StringArray>().expect("utf8 project_id");

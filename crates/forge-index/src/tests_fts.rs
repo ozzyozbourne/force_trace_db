@@ -347,3 +347,116 @@ async fn postings_crc_mismatch_is_corrupt() {
     }
     assert!(corrupt > 0);
 }
+
+/// K10: two concurrent lookups on one file fetch the dict block once (the second waits for the first), and when the
+/// first fetch fails the waiter fetches the block itself. Bounded: a waiter that never wakes fails, not hangs.
+#[tokio::test]
+async fn concurrent_lookups_share_block_fetches() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // Enough terms that the first dict block is not in the tail `open` reads.
+    let mut b = FtsBuilder::default();
+    let mut x = 1u64;
+    for row in 0..5_000u32 {
+        let words: Vec<String> = (0..4)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                format!("k{x:016x}")
+            })
+            .collect();
+        let first = if row == 0 { "a00000 " } else { "" };
+        b.add(row, FtsColumn::Name, &format!("{first}{}", words.join(" ")))
+            .unwrap();
+    }
+    let file = Bytes::from(b.finish().unwrap().0);
+    let q = Query {
+        groups: vec![vec![Leaf::Exact(key_token(FtsColumn::Name, "a00000"))]],
+        needs_recheck: false,
+    };
+    for fail_first in [false, true] {
+        let (f, _) = FtsFile::open("t.fts", file.len() as u64, &bytes_fetch(file.clone()))
+            .await
+            .unwrap();
+        let gets = AtomicUsize::new(0);
+        let fetch = |rs: Vec<std::ops::Range<u64>>| {
+            let n = gets.fetch_add(1, SeqCst);
+            let file = file.clone();
+            async move {
+                tokio::task::yield_now().await; // the other call starts while this fetch is in flight
+                if fail_first && n == 0 {
+                    return Err(crate::IndexError::Io {
+                        path: "t.fts".into(),
+                        msg: "injected".into(),
+                    });
+                }
+                Ok(rs
+                    .into_iter()
+                    .map(|r| file.slice(r.start as usize..r.end as usize))
+                    .collect())
+            }
+        };
+        let both = async { futures::join!(f.execute(&q, &fetch), f.execute(&q, &fetch)) };
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), both)
+            .await
+            .expect("a waiter never woke");
+        assert_eq!(a.is_err(), fail_first, "{a:?}");
+        assert_eq!(b.unwrap().0, set(&[0]));
+        assert_eq!(gets.load(SeqCst), 1 + usize::from(fail_first));
+    }
+}
+
+/// `file` with its footer edited by `edit` (re-encoded, valid checksum): a corrupt file only the bounds checks see.
+fn refooter(file: &[u8], edit: impl FnOnce(&mut Footer)) -> Bytes {
+    let n = file.len();
+    let flen = u32::from_le_bytes(file[n - 12..n - 8].try_into().unwrap()) as usize;
+    let f_start = n - 12 - flen;
+    let mut f = Footer::decode(&file[f_start..n - 12], f_start as u64).unwrap();
+    edit(&mut f);
+    let mut out = file[..f_start].to_vec();
+    let mut fb = Vec::new();
+    f.encode(&mut fb);
+    out.extend_from_slice(&fb);
+    out.extend_from_slice(&(fb.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32fast::hash(&fb).to_le_bytes());
+    out.extend_from_slice(b"FTS1");
+    Bytes::from(out)
+}
+
+/// K4 / N3: footer and posting bounds that only checked math catches are `Corrupt`: a dict block past the dict
+/// (or overflowing u64), a posting range past the postings section, a posting row id at or past `num_rows`.
+#[tokio::test]
+async fn out_of_bounds_footers_are_corrupt() {
+    let mut b = FtsBuilder::default();
+    for row in 0..40 {
+        b.add(row, FtsColumn::Name, "hello world").unwrap();
+    }
+    let file = b.finish().unwrap().0;
+    let q = Query {
+        groups: vec![vec![Leaf::Exact(key_token(FtsColumn::Name, "hello"))]],
+        needs_recheck: false,
+    };
+    let q = &q;
+    let exec = |bytes: Bytes| async move {
+        let fetch = bytes_fetch(bytes.clone());
+        let (f, _) = FtsFile::open("t.fts", bytes.len() as u64, &fetch).await?;
+        f.execute(q, &fetch).await
+    };
+    assert_eq!(exec(refooter(&file, |_| {})).await.unwrap().0, (0..40).collect());
+    type Edit = Box<dyn FnOnce(&mut Footer)>;
+    let bad: [(&str, Edit); 5] = [
+        ("block end past the dict", Box::new(|f| f.blocks[0].len += 1)),
+        (
+            "block offset overflows",
+            Box::new(|f| f.blocks[0].offset = u64::MAX - 1),
+        ),
+        (
+            "posting range past the section",
+            Box::new(|f| f.postings.end = f.postings.start),
+        ),
+        ("row id == num_rows", Box::new(|f| f.num_rows = 39)),
+        ("row id > num_rows", Box::new(|f| f.num_rows = 20)),
+    ];
+    for (what, edit) in bad {
+        let r = exec(refooter(&file, edit)).await;
+        assert!(matches!(r, Err(crate::IndexError::Corrupt { .. })), "{what}: {r:?}");
+    }
+}

@@ -29,7 +29,7 @@ prost               = "0.14.4"
 opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic", "trace", "with-serde"] }
 
 # ---- runtime / server ----
-aho-corasick = "1.1"      # forge-index: the brute-force pre-filter (already in the tree via regex)
+memchr       = "2.7"      # forge-index: the brute-force pre-filter (already in the tree)
 foldhash     = "0.2"      # the dotted walk's maps (no DoS exposure: keys come from our own rows)
 mimalloc     = "0.1.52"   # the binary's global allocator (and the soak test's); libraries never set one
 tokio        = { version = "1.54", features = ["full"] }

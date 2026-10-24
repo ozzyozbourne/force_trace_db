@@ -122,6 +122,8 @@ pub struct LatencyStore {
     /// Read requests that started while none was in flight: a lower bound on sequential round trips (exact for
     /// one query).
     pub waves: std::sync::atomic::AtomicU64,
+    /// `get_ranges` fails (a non-NotFound store error, like S3 throttling) while set.
+    pub fail_ranges: std::sync::atomic::AtomicBool,
 }
 
 impl LatencyStore {
@@ -132,6 +134,7 @@ impl LatencyStore {
             gets: 0.into(),
             in_flight: 0.into(),
             waves: 0.into(),
+            fail_ranges: false.into(),
         }
     }
     pub fn set_delay(&self, d: Duration) {
@@ -186,6 +189,12 @@ impl ObjectStore for LatencyStore {
         location: &Path,
         ranges: &[std::ops::Range<u64>],
     ) -> object_store::Result<Vec<bytes::Bytes>> {
+        if self.fail_ranges.load(Ordering::Relaxed) {
+            return Err(object_store::Error::Generic {
+                store: "LatencyStore",
+                source: "injected read failure".into(),
+            });
+        }
         self.read(self.inner.get_ranges(location, ranges)).await
     }
     fn delete_stream(

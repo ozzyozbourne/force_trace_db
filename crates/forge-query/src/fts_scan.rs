@@ -400,36 +400,31 @@ pub(crate) async fn select(
 
     // Segments: index (or brute force) per unit; then, unless that already rules the index out, the keys of the
     // hit rows. A loop, not a closure: a closure over `&SegmentPart` trips the async_trait Send check (HRTB).
-    // One lookup per segment, however many parts of it there are.
-    let segs = async {
-        let mut seen = BTreeSet::new();
-        let mut futs = Vec::new();
-        for seg in parts.iter().map(|p| &p.seg).filter(|s| seen.insert(s.id)) {
-            let units = &units;
-            futs.push(async move { Ok::<_, QueryError>((seg.id, lookup(index, seg, units).await?.0)) });
-        }
-        let looked: HashMap<SegmentId, Vec<Option<RoaringTreemap>>> = futures::stream::iter(futs)
-            .buffer_unordered(INDEX_CONCURRENCY)
-            .try_collect()
-            .await?;
-        let mut futs = Vec::with_capacity(parts.len());
-        for part in parts {
-            futs.push(part_hits(
-                view,
-                pool,
-                counters,
-                part,
-                &units,
-                looked[&part.seg.id].clone(),
-            ));
-        }
-        futures::stream::iter(futs)
-            .buffer_unordered(INDEX_CONCURRENCY)
-            .try_collect::<Vec<PartHits>>()
-            .await
-    };
+    // One lookup per segment, however many parts of it there are; each part's scan starts when its lookup is done.
+    let looked: moka::future::Cache<SegmentId, Arc<Vec<Option<RoaringTreemap>>>> = moka::future::Cache::new(u64::MAX);
+    let mut futs = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (units, looked) = (&units, &looked);
+        futs.push(async move {
+            let l = looked
+                .try_get_with(part.seg.id, async {
+                    Ok::<_, IndexError>(Arc::new(lookup(index, &part.seg, units).await?.0))
+                })
+                .await
+                .map_err(|e| QueryError::from((*e).clone()))?;
+            part_hits(view, pool, counters, part, units, (*l).clone()).await
+        });
+    }
+    let segs = futures::stream::iter(futs)
+        .buffer_unordered(INDEX_CONCURRENCY)
+        .try_collect::<Vec<PartHits>>();
     let ((mut per_unit, mem_traces), mut hits) = futures::try_join!(mem, segs)?;
-    let n = hits.iter().filter(|h| h.bruted).count();
+    let n = hits
+        .iter()
+        .filter(|h| h.bruted)
+        .map(|h| h.seg.id)
+        .collect::<BTreeSet<_>>()
+        .len();
     if n > 0 {
         tracing::warn!(project = %p, segments = n, "search: segments without a usable .fts were scanned by brute force");
     }
@@ -517,6 +512,9 @@ pub(crate) async fn select(
 pub struct FtsIndexReader {
     store: Arc<dyn object_store::ObjectStore>,
     files: moka::future::Cache<SegmentId, Arc<FtsFile>>,
+    /// Segments whose sidecar was corrupt (not unreadable: `Io` is retried): `NoIndex` from then on, without I/O or
+    /// another warning (segment ids are never reused).
+    broken: moka::future::Cache<SegmentId, ()>,
 }
 
 impl FtsIndexReader {
@@ -530,6 +528,7 @@ impl FtsIndexReader {
                     u32::try_from(d.end - d.start + 4096).unwrap_or(u32::MAX)
                 })
                 .build(),
+            broken: moka::future::Cache::new(100_000),
         }
     }
 }
@@ -539,6 +538,19 @@ type Fetch = futures::future::BoxFuture<'static, IndexResult<Vec<bytes::Bytes>>>
 #[async_trait::async_trait]
 impl IndexReader for FtsIndexReader {
     async fn search(&self, seg: &SegmentMeta, exprs: &[FtsExpr]) -> IndexResult<FtsHits> {
+        if self.broken.contains_key(&seg.id) {
+            return Ok(FtsHits::NoIndex);
+        }
+        let r = self.search_file(seg, exprs).await;
+        if let Err(IndexError::Corrupt { .. }) = &r {
+            self.broken.insert(seg.id, ()).await;
+        }
+        r
+    }
+}
+
+impl FtsIndexReader {
+    async fn search_file(&self, seg: &SegmentMeta, exprs: &[FtsExpr]) -> IndexResult<FtsHits> {
         let Some(len) = seg.fts_byte_size else {
             return Ok(FtsHits::NoIndex);
         };
